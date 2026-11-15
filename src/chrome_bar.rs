@@ -47,21 +47,27 @@ pub(super) fn draw_bottom(c: &mut Canvas, _t: Option<&mut Text>, s: &State, hits
     let (sx, sy, sw, sh) = slider_rect(c.w as f32, c.h as f32, sf);
     // progress bar: a faint track, filled up to the position; no handle.
     // The fill brightens with the slider's hover fade.
-    c.fill_rrect(sx, sy, sw, sh, sh / 2.0, 0xFFFFFF, 0.14);
+    // drawn 8 px tall, centred in the 12 px layout slot; the grab area keeps the slot + 8 px
+    let vh = (8.0 * sf).round();
+    let vy = sy + ((sh - vh) / 2.0).round();
+    c.fill_rrect(sx, vy, sw, vh, vh / 2.0, 0xFFFFFF, 0.14);
     let frac = if s.len > 1 { (s.index + 1) as f32 / s.len as f32 } else { 1.0 };
-    let fw = (frac * sw).max(sh);
+    let fw = (frac * sw).max(vh);
     // 40% at rest, 56% under the cursor (was 62 / 82: too bright)
     let a = 0.40 + 0.16 * s.hover_amt("bar_slider");
-    c.fill_rrect(sx, sy, fw, sh, sh / 2.0, 0xFFFFFF, a);
+    c.fill_rrect(sx, vy, fw, vh, vh / 2.0, 0xFFFFFF, a);
     hits.push(Hit { x0: sx - 8.0 * sf, y0: sy - 8.0 * sf, x1: sx + sw + 8.0 * sf, y1: sy + sh + 8.0 * sf, id: "bar_slider" });
 
     // animation scrub bar: a bare track BAR_GAP above the bar, same style as the page slider
     if let Some((f, n)) = s.anim {
         let (tx, ty, tw, th) = anim_track(c.w as f32, c.h as f32, sf);
-        c.fill_rrect(tx, ty, tw, th, th / 2.0, 0xFFFFFF, 0.14);
+        // drawn 4 px tall, centred in the 8 px slot; the grab area keeps the slot + 8 px
+        let vh = (4.0 * sf).round();
+        let vy = ty + ((th - vh) / 2.0).round();
+        c.fill_rrect(tx, vy, tw, vh, vh / 2.0, 0xFFFFFF, 0.14);
         let frac = (f + 1) as f32 / n.max(1) as f32;
         let a = 0.40 + 0.16 * s.hover_amt("anim_slider");
-        c.fill_rrect(tx, ty, (frac * tw).max(th), th, th / 2.0, 0xFFFFFF, a);
+        c.fill_rrect(tx, vy, (frac * tw).max(vh), vh, vh / 2.0, 0xFFFFFF, a);
         hits.push(Hit { x0: tx - 8.0 * sf, y0: ty - 8.0 * sf, x1: tx + tw + 8.0 * sf, y1: ty + th + 8.0 * sf, id: "anim_slider" });
     }
 

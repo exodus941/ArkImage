@@ -3,7 +3,11 @@
 //! the app's own fonts and colours. Design px, 4 px grid.
 
 use super::*;
+use crate::icons::Icon;
 use crate::render::sd_circle;
+
+/// "Up to date" check: emerald-400. A status colour, so it is outside the icon's palette.
+const GREEN: u32 = 0x34D399;
 
 /// Navigation pane width; header and footer heights; card height, gap and padding.
 const NAV_W: f32 = 232.0;
@@ -43,6 +47,43 @@ pub(super) struct DrawState<'a> {
     pub renaming: bool,
     pub num_edit: Option<(NumF, &'a str)>,
     pub scroll: f32,
+    /// Version row: (now, before, fade 0-1, seconds since the change).
+    pub upd: (&'a Upd, &'a Upd, f32, f32),
+}
+
+/// One state of the Version row, drawn at `a` opacity (0-1) from x, centred on `mid`.
+fn upd_status(c: &mut Canvas, t: &mut Text, x: f32, mid: f32, sf: f32, u: &Upd, a: f32, secs: f32, max_x: f32) {
+    if a <= 0.0 {
+        return;
+    }
+    let d = |v: f32| v * sf;
+    let body = (d(BODY.0), d(BODY.1));
+    let col = |k: u32| lerp(PANEL2, k, a);
+    // icon 20 px, then 8 px, then the text
+    let (icon, icol, deg, msg, tcol): (Option<Icon>, u32, u16, String, u32) = match u {
+        Upd::Idle => (None, 0, 0, format!("Version {}", env!("CARGO_PKG_VERSION")), SLATE200),
+        // one turn every 0.9 s, in 10 degree steps (36 cached masks)
+        Upd::Checking => (Some(Icon::Loader), SLATE300, (((secs / 0.9).fract() * 36.0) as u16) * 10, "Checking for updates...".into(), SLATE200),
+        Upd::Found(v) => (Some(Icon::Download), ACCENT, 0, format!("Update found, downloading version {v}"), SLATE200),
+        Upd::Latest => (Some(Icon::CircleCheck), GREEN, 0, "You are already on the latest version.".into(), SLATE200),
+        Upd::Failed(e) => (None, 0, 0, format!("Update check failed: {e}"), u::ROSE400),
+    };
+    let mut tx = x;
+    if let Some(i) = icon {
+        let s = d(20.0);
+        crate::icons::draw_ex(c, i, x + s / 2.0, mid, s, icol, deg, a);
+        tx += s + d(8.0);
+    }
+    // end with an ellipsis rather than run under the button
+    let room = max_x - tx;
+    let mut msg = msg;
+    if u::width(t, Face::Regular, &msg, body.0) > room {
+        while !msg.is_empty() && u::width(t, Face::Regular, &format!("{msg}…"), body.0) > room {
+            msg.pop();
+        }
+        msg = format!("{}…", msg.trim_end());
+    }
+    text(c, t, Face::Regular, tx, mid, &msg, body, col(tcol));
 }
 
 /// The page panel's rectangle (x, y, w, h), physical px.
@@ -302,6 +343,22 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                 let bw = button_w(t, sf, verb);
                 button(c, t, right - bw, mid, bw, sf, verb, false, true, st.amt(act));
                 hit(right - bw, ctrl_y(mid), right, ctrl_y(mid) + d(CTRL_H), act);
+                y += d(CARD_H + CARD_GAP);
+            }
+            Ctl::Version => {
+                card(c, y);
+                let (now, before, m, secs) = st.upd;
+                // no second check while one runs or an update downloads
+                let on = !matches!(now, Upd::Checking | Upd::Found(_));
+                let verb = "Check for Updates";
+                let bw = button_w(t, sf, verb);
+                let max_x = right - bw - d(16.0);
+                upd_status(c, t, x0 + d(CARD_PAD), mid, sf, before, 1.0 - m, secs, max_x);
+                upd_status(c, t, x0 + d(CARD_PAD), mid, sf, now, m, secs, max_x);
+                button(c, t, right - bw, mid, bw, sf, verb, false, on, if on { st.amt(Act::CheckUpdate) } else { 0.0 });
+                if on {
+                    hit(right - bw, ctrl_y(mid), right, ctrl_y(mid) + d(CTRL_H), Act::CheckUpdate);
+                }
                 y += d(CARD_H + CARD_GAP);
             }
             Ctl::Buttons(l1, a1, l2, a2) => {

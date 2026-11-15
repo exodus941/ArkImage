@@ -24,6 +24,9 @@ pub enum Icon {
     Maximize,
     ArrowsMaximize,
     Camera,
+    Download,
+    CircleCheck,
+    Loader,
 }
 
 fn svg(i: Icon) -> &'static str {
@@ -45,6 +48,9 @@ fn svg(i: Icon) -> &'static str {
         Icon::Maximize => include_str!("../assets/icons/maximize.svg"),
         Icon::ArrowsMaximize => include_str!("../assets/icons/arrows-maximize.svg"),
         Icon::Camera => include_str!("../assets/icons/camera.svg"),
+        Icon::Download => include_str!("../assets/icons/download.svg"),
+        Icon::CircleCheck => include_str!("../assets/icons/circle-check.svg"),
+        Icon::Loader => include_str!("../assets/icons/loader-2.svg"),
     }
 }
 
@@ -52,30 +58,37 @@ fn svg(i: Icon) -> &'static str {
 const STROKE: f32 = 1.5;
 
 thread_local! {
-    /// Coverage masks by (icon, size px).
-    static CACHE: RefCell<HashMap<(Icon, u32), (u32, Vec<u8>)>> = RefCell::new(HashMap::new());
+    /// Coverage masks by (icon, size px, rotation in degrees).
+    static CACHE: RefCell<HashMap<(Icon, u32, u16), (u32, Vec<u8>)>> = RefCell::new(HashMap::new());
 }
 
-/// Coverage mask of `i` at `size` x `size` px.
-fn mask(i: Icon, size: u32) -> Option<(u32, Vec<u8>)> {
-    if let Some(m) = CACHE.with(|c| c.borrow().get(&(i, size)).cloned()) {
+/// Coverage mask of `i` at `size` x `size` px, turned `deg` degrees clockwise.
+fn mask(i: Icon, size: u32, deg: u16) -> Option<(u32, Vec<u8>)> {
+    if let Some(m) = CACHE.with(|c| c.borrow().get(&(i, size, deg)).cloned()) {
         return Some(m);
     }
     let src = svg(i).replace("stroke-width=\"2\"", &format!("stroke-width=\"{STROKE}\"")).replace("currentColor", "#000");
     let tree = resvg::usvg::Tree::from_str(&src, &resvg::usvg::Options::default()).ok()?;
     let mut pm = resvg::tiny_skia::Pixmap::new(size, size)?;
     let s = size as f32 / 24.0;
-    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(s, s), &mut pm.as_mut());
+    let tf = resvg::tiny_skia::Transform::from_scale(s, s).pre_rotate_at(deg as f32, 12.0, 12.0);
+    resvg::render(&tree, tf, &mut pm.as_mut());
     let a: Vec<u8> = pm.pixels().iter().map(|p| p.alpha()).collect();
     let m = (size, a);
-    CACHE.with(|c| c.borrow_mut().insert((i, size), m.clone()));
+    CACHE.with(|c| c.borrow_mut().insert((i, size, deg), m.clone()));
     Some(m)
 }
 
 /// Draw `i` centred on (cx, cy), `size` px square, in `color`.
 pub fn draw(c: &mut Canvas, i: Icon, cx: f32, cy: f32, size: f32, color: u32) {
+    draw_ex(c, i, cx, cy, size, color, 0, 1.0);
+}
+
+/// As `draw`, turned `deg` degrees (a throbber passes steps of 10) at `alpha` 0-1.
+pub fn draw_ex(c: &mut Canvas, i: Icon, cx: f32, cy: f32, size: f32, color: u32, deg: u16, alpha: f32) {
     let n = size.round().max(1.0) as u32;
-    let Some((n, a)) = mask(i, n) else { return };
+    let Some((n, a)) = mask(i, n, deg % 360) else { return };
+    let k255 = (alpha.clamp(0.0, 1.0) * 256.0) as u32;
     let x0 = (cx - n as f32 / 2.0).round() as i64;
     let y0 = (cy - n as f32 / 2.0).round() as i64;
     for y in 0..n as i64 {
@@ -85,7 +98,7 @@ pub fn draw(c: &mut Canvas, i: Icon, cx: f32, cy: f32, size: f32, color: u32) {
         }
         for x in 0..n as i64 {
             let xx = x0 + x;
-            let v = a[(y * n as i64 + x) as usize] as u32;
+            let v = a[(y * n as i64 + x) as usize] as u32 * k255 >> 8;
             if v == 0 || xx < 0 || xx >= c.w as i64 {
                 continue;
             }

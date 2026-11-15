@@ -263,6 +263,8 @@ enum Ctl {
     Button(&'static str, Act),
     /// Two buttons on one row; the second is greyed when `bool` is false.
     Buttons(&'static str, Act, &'static str, Act),
+    /// The version and the update check: status on the left, button on the right.
+    Version,
     Note(&'static str),
     /// Name of the selected filter preset, editable for the user's own.
     PresetName,
@@ -320,8 +322,8 @@ fn page(i: usize) -> Vec<Ctl> {
             Gap,
             Button("ArkImage for this Windows user", Act::Install),
             Check("Check for updates at startup", BoolF::AutoUpdate),
-            Button("Check for updates now", Act::CheckUpdate),
             Button("Reset all settings to their defaults", Act::Reset),
+            Version,
         ],
         1 => vec![
             Check("Keep the top menu bar visible (Lock, hotkey `)", BoolF::LockTop),
@@ -418,14 +420,44 @@ pub struct Dialog {
     pub card: Option<crate::install::Card>,
     pub card_hits: Vec<(f32, f32, f32, f32)>,
     pub card_hover: Option<usize>,
+    /// Update check shown in the Version row, the one before it, and when it changed.
+    pub upd: Upd,
+    upd_prev: Upd,
+    upd_at: std::time::Instant,
     hits: Vec<Hit>,
 }
 
+/// What the Version row in Settings > General shows.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Upd {
+    /// "Version x.y.z"
+    Idle,
+    /// Throbber, "Checking for updates..."
+    Checking,
+    /// Download icon, "Update found, downloading version x.y.z"
+    Found(String),
+    /// Check icon, "You are already on the latest version."
+    Latest,
+    Failed(String),
+}
+
+/// Version row cross-fade, seconds.
+const UPD_FADE: f32 = 0.25;
+
 impl Dialog {
+    /// Change the Version row; the old state fades out as the new one fades in.
+    pub fn set_upd(&mut self, u: Upd) {
+        if u != self.upd {
+            self.upd_prev = std::mem::replace(&mut self.upd, u);
+            self.upd_at = std::time::Instant::now();
+            self.window.request_redraw();
+        }
+    }
+
     pub fn new(window: Arc<Window>, snapshot: Config, tab: usize) -> Option<Self> {
         let ctx = softbuffer::Context::new(window.clone()).ok()?;
         let surface = softbuffer::Surface::new(&ctx, window.clone()).ok()?;
-        Some(Self { window, _ctx: ctx, surface, tab, snapshot, cursor: (0.0, 0.0), hover: None, hover_fx: Vec::new(), hover_at: std::time::Instant::now(), capturing: None, renaming: false, num_edit: None, scroll: 0.0, scroll_max: 0.0, mica: false, card: None, card_hits: Vec::new(), card_hover: None, hits: Vec::new() })
+        Some(Self { window, _ctx: ctx, surface, tab, snapshot, cursor: (0.0, 0.0), hover: None, hover_fx: Vec::new(), hover_at: std::time::Instant::now(), capturing: None, renaming: false, num_edit: None, scroll: 0.0, scroll_max: 0.0, mica: false, card: None, card_hits: Vec::new(), card_hover: None, upd: Upd::Idle, upd_prev: Upd::Idle, upd_at: std::time::Instant::now(), hits: Vec::new() })
     }
 
     /// Scroll the page by `dy` design px.
@@ -470,7 +502,19 @@ impl Dialog {
         self.hover_fx.retain(|(k, a)| *a > 0.0 || Some(*k) == hov);
         let moving = self.hover_fx.iter().any(|(k, a)| *a != if Some(*k) == hov { 1.0 } else { 0.0 });
         let fx = self.hover_fx.clone();
-        let st = DrawState { tab: self.tab, fx: &fx, capturing: self.capturing, renaming: self.renaming, num_edit: self.num_edit.as_ref().map(|(f, s)| (*f, s.as_str())), scroll: self.scroll };
+        let upd_t = self.upd_at.elapsed().as_secs_f32();
+        let upd_mix = (upd_t / UPD_FADE).min(1.0);
+        // the throbber turns, and a fade runs, only on the General page
+        let moving = moving || (self.tab == 0 && (upd_mix < 1.0 || self.upd == Upd::Checking));
+        let st = DrawState {
+            tab: self.tab,
+            fx: &fx,
+            capturing: self.capturing,
+            renaming: self.renaming,
+            num_edit: self.num_edit.as_ref().map(|(f, s)| (*f, s.as_str())),
+            scroll: self.scroll,
+            upd: (&self.upd, &self.upd_prev, upd_mix, upd_t),
+        };
         let mut text = text;
         self.scroll_max = draw(&mut c, text.as_deref_mut(), cfg, &st, sf, &mut hits);
         self.scroll = self.scroll.min(self.scroll_max);

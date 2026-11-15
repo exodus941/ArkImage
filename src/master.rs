@@ -219,6 +219,12 @@ impl ApplicationHandler<UserEvent> for Master {
             self.cfg.save();
             crate::update::spawn_check(self.sh.proxy.clone(), false);
         }
+        // Test hook: ARKIMAGE_TEST_SETTINGS opens Settings > General in the first window.
+        if std::env::var_os("ARKIMAGE_TEST_SETTINGS").is_some() {
+            if let Some(w) = self.windows.first_mut() {
+                w.test_open_settings(el);
+            }
+        }
         // First run of a copy that is not installed: offer to install, once.
         if cfg!(windows)
             && !takeover

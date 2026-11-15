@@ -29,6 +29,8 @@ pub static RESTART: AtomicBool = AtomicBool::new(false);
 /// What a check found.
 #[derive(Debug, Clone)]
 pub enum Outcome {
+    /// A newer version exists and is downloading (sent before Ready).
+    Found(String),
     /// Downloaded and swapped in; restart to run it.
     Ready(String),
     /// This build is the latest.
@@ -81,8 +83,8 @@ fn agent() -> ureq::Agent {
 }
 
 /// Check, and when newer, download and swap. Blocking: run it on a worker thread.
-pub fn check_and_install() -> Outcome {
-    match run() {
+pub fn check_and_install(on_found: &dyn Fn(&str)) -> Outcome {
+    match run(on_found) {
         Ok(o) => o,
         Err(e) => Outcome::Failed(e),
     }
@@ -92,19 +94,20 @@ pub fn check_and_install() -> Outcome {
 /// reports it again instead of swapping twice (the first swap's `.old` is still locked).
 static INSTALLED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-fn run() -> Result<Outcome, String> {
+fn run(on_found: &dyn Fn(&str)) -> Result<Outcome, String> {
     if let Some(v) = INSTALLED.lock().unwrap().clone() {
         return Ok(Outcome::Ready(v));
     }
     let current = env!("CARGO_PKG_VERSION");
     let a = agent();
-    let body = a.get(&api_url()).set("Accept", "application/vnd.github+json").call().map_err(|e| format!("Can't reach GitHub: {e}"))?.into_string().map_err(|e| e.to_string())?;
+    let body = a.get(&api_url()).set("Accept", "application/vnd.github+json").call().map_err(|e| { crate::trace(&format!("update: {e}")); "Can't reach GitHub.".to_string() })?.into_string().map_err(|e| e.to_string())?;
     let rel: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("Unexpected reply from GitHub: {e}"))?;
     let tag = rel["tag_name"].as_str().ok_or("The latest release has no version tag.")?;
     crate::trace(&format!("update: latest {tag}, running {current}"));
     if !is_newer(tag, current) {
         return Ok(Outcome::UpToDate);
     }
+    on_found(tag.trim_start_matches('v'));
     let asset = rel["assets"].as_array().and_then(|v| v.iter().find(|a| a["name"].as_str() == Some(ASSET))).ok_or("The latest release has no arkimage.exe.")?;
     let url = asset["browser_download_url"].as_str().ok_or("No download link.")?;
     let size = asset["size"].as_u64().unwrap_or(0);
@@ -188,7 +191,10 @@ pub fn now_unix() -> u64 {
 /// Background check at launch; the outcome arrives as a UserEvent.
 pub fn spawn_check(proxy: winit::event_loop::EventLoopProxy<crate::app::UserEvent>, manual: bool) {
     std::thread::spawn(move || {
-        let o = check_and_install();
+        let p2 = proxy.clone();
+        let o = check_and_install(&|v| {
+            let _ = p2.send_event(crate::app::UserEvent::Update(Outcome::Found(v.to_string()), manual));
+        });
         crate::trace(&format!("update check: {o:?}"));
         let _ = proxy.send_event(crate::app::UserEvent::Update(o, manual));
     });

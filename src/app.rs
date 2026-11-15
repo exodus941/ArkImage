@@ -152,6 +152,8 @@ pub enum UserEvent {
 
 /// Chrome fade in/out duration.
 const FADE_SECS: f32 = 0.25;
+/// How often a window checks that its file was not deleted outside the app.
+const GONE_EVERY: Duration = Duration::from_millis(2500);
 
 /// Zoom In/Out stops, as Honeyview 5.53 measured (drawn width of a test square):
 /// 5%, then 10-300% by 10, 320-500% by 20, 550-2000% by 50.
@@ -364,6 +366,8 @@ pub struct App {
     slider_drag: bool,
     /// The animation scrub bar is held: playback pauses on the frame under the cursor.
     anim_drag: bool,
+    /// Next check that the file on screen still exists.
+    gone_at: Instant,
     chrome_shown: (bool, bool),
     /// Opacity of the top and bottom chrome, 0..1, stepped toward the target each frame.
     fade: (f32, f32),
@@ -533,6 +537,7 @@ impl App {
             cursor_in: false,
             slider_drag: false,
             anim_drag: false,
+            gone_at: Instant::now() + GONE_EVERY,
             chrome_shown: (false, false),
             fade: (0.0, 0.0),
             fade_last: Instant::now(),
@@ -1173,6 +1178,32 @@ impl App {
         self.update_title();
     }
 
+    /// The file on screen was deleted outside the app (checked every GONE_EVERY): show the
+    /// first image left in its folder, or close the window when none is left.
+    fn check_gone(&mut self) {
+        let Some(e) = self.cur_entry() else { return };
+        let p = e.fs_path().to_path_buf();
+        if p.exists() {
+            return;
+        }
+        crate::trace(&format!("gone: {}", p.display()));
+        self.cache.borrow_mut().remove(&e);
+        let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
+        let entries = if dir.is_dir() { source::open(&dir, self.cfg.sort, self.cfg.sort_desc).map(|pl| pl.entries).unwrap_or_default() } else { Vec::new() };
+        if entries.is_empty() {
+            crate::trace("gone: folder has no image left, closing the window");
+            self.store_geometry();
+            self.cfg.save();
+            self.closed = true;
+            self.settings = None;
+            if let Some(w) = &self.window {
+                w.set_visible(false);
+            }
+            return;
+        }
+        self.set_playlist(Playlist { container: dir, entries, index: 0 });
+    }
+
     fn remove_current_from_list(&mut self) {
         let Some(pl) = &mut self.playlist else { return };
         if pl.index >= pl.entries.len() {
@@ -1738,13 +1769,25 @@ impl App {
     /// A check the user did not ask for shows only a ready update.
     pub fn on_update(&mut self, o: &crate::update::Outcome, manual: bool) {
         use crate::{install::Card, update::Outcome};
+        use crate::settings::Upd;
+        // the Version row in Settings shows every step of a check
+        if let Some(s) = &mut self.settings {
+            s.set_upd(match o {
+                Outcome::Found(v) | Outcome::Ready(v) => Upd::Found(v.clone()),
+                Outcome::UpToDate => Upd::Latest,
+                Outcome::Failed(e) => Upd::Failed(e.clone()),
+            });
+        }
         let card = match o {
+            Outcome::Found(_) => return,
             // the new exe is in place: restart now; the session reopens in the new version
             Outcome::Ready(v) => {
                 crate::trace(&format!("update {v} ready: restarting"));
                 crate::update::request_restart();
                 return;
             }
+            // a check from Settings answers in its Version row
+            _ if self.settings.is_some() => return,
             Outcome::UpToDate if manual => Card::UpToDate,
             Outcome::Failed(e) if manual => Card::UpdateFailed(e.clone()),
             _ => return,
@@ -2279,7 +2322,6 @@ impl App {
                 I("clip".into(), "Copy to Clipboard".into(), "Ctrl+C", has),
                 S,
                 I("config".into(), "Settings".into(), "F5", true),
-                I("about".into(), "About ArkImage".into(), "F1", true),
                 I("exit".into(), "Exit".into(), "X", true),
             ],
         }
@@ -2335,6 +2377,11 @@ impl App {
     }
 
     // ---------- configuration dialog ----------
+
+    /// For the ARKIMAGE_TEST_SETTINGS hook.
+    pub fn test_open_settings(&mut self, el: &ActiveEventLoop) {
+        self.open_settings(el, 0);
+    }
 
     fn open_settings(&mut self, el: &ActiveEventLoop, tab: usize) {
         if let Some(s) = &mut self.settings {
@@ -2748,8 +2795,7 @@ impl App {
             }
             Act::CheckUpdate => {
                 if let Some(s) = &mut self.settings {
-                    s.card = Some(crate::install::Card::Checking);
-                    s.card_hover = None;
+                    s.set_upd(crate::settings::Upd::Checking);
                 }
                 crate::update::spawn_check(self.proxy.clone(), true);
                 self.settings_redraw();
@@ -2991,13 +3037,6 @@ impl App {
                 }
             }
             "config" => self.open_settings(el, 0),
-            "about" => {
-                let text = format!(
-                    "ArkImage {}\nA fast, light, multi-instance image viewer.\nOpen source (MIT). Press F1 in the window for hotkeys.",
-                    env!("CARGO_PKG_VERSION")
-                );
-                crate::dialog::tell(self.window.as_deref(), "About ArkImage", &text, crate::dialog::Kind::Info);
-            }
             "exit" => self.exit(el),
             "pageselect" => self.open_picker(),
             _ => {}
@@ -3578,6 +3617,13 @@ impl App {
                 self.request_redraw();
             }
         }
+        // a file deleted outside the app is noticed within GONE_EVERY
+        let gone_at = self.playlist.is_some().then(|| self.gone_at);
+        if gone_at.is_some_and(|t| now >= t) {
+            self.gone_at = now + GONE_EVERY;
+            self.check_gone();
+        }
+        let gone_at = self.playlist.is_some().then(|| self.gone_at);
         // Chrome fade: one frame every 16 ms until it settles (unpaced it drew ~380 fps).
         let fade_at = self.fade_active.then(|| self.fade_last + Duration::from_millis(16));
         if let Some(t) = fade_at {
@@ -3585,7 +3631,7 @@ impl App {
                 self.request_redraw();
             }
         }
-        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at]
+        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at]
             .into_iter()
             .flatten()
             .min()

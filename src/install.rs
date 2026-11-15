@@ -264,8 +264,6 @@ pub enum Card {
     Install(bool),
     Installed,
     Failed(String),
-    /// Checking for an update (Settings > Check now).
-    Checking,
     UpToDate,
     UpdateFailed(String),
 }
@@ -296,7 +294,6 @@ impl Card {
                 vec!["Open Default apps", "Close"],
             ),
             Card::Failed(e) => ("Install failed".into(), vec![e.clone()], vec!["Close"]),
-            Card::Checking => ("Checking for updates".into(), vec![format!("ArkImage {} is running.", env!("CARGO_PKG_VERSION"))], vec!["Close"]),
             Card::UpToDate => (
                 "ArkImage is up to date".into(),
                 vec![format!("Version {} is the latest release.", env!("CARGO_PKG_VERSION"))],
