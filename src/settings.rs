@@ -319,7 +319,7 @@ fn page(i: usize) -> Vec<Ctl> {
             Choice("Action when on last/first image:", ChoiceF::EndAction),
             Gap,
             Button("ArkImage for this Windows user", Act::Install),
-            Check("Check for updates once a day", BoolF::AutoUpdate),
+            Check("Check for updates at startup", BoolF::AutoUpdate),
             Button("Check for updates now", Act::CheckUpdate),
             Button("Reset all settings to their defaults", Act::Reset),
         ],

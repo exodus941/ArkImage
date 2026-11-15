@@ -266,8 +266,6 @@ pub enum Card {
     Failed(String),
     /// Checking for an update (Settings > Check now).
     Checking,
-    /// A newer version was downloaded and swapped in.
-    UpdateReady(String),
     UpToDate,
     UpdateFailed(String),
 }
@@ -299,11 +297,6 @@ impl Card {
             ),
             Card::Failed(e) => ("Install failed".into(), vec![e.clone()], vec!["Close"]),
             Card::Checking => ("Checking for updates".into(), vec![format!("ArkImage {} is running.", env!("CARGO_PKG_VERSION"))], vec!["Close"]),
-            Card::UpdateReady(v) => (
-                format!("ArkImage {v} is ready"),
-                vec!["The new version replaced the app file.".into(), "Restart to use it; your open images reopen.".into()],
-                vec!["Restart now", "Later"],
-            ),
             Card::UpToDate => (
                 "ArkImage is up to date".into(),
                 vec![format!("Version {} is the latest release.", env!("CARGO_PKG_VERSION"))],
@@ -322,10 +315,6 @@ impl Card {
             }),
             (Card::Installed, 0) => {
                 open_default_apps();
-                None
-            }
-            (Card::UpdateReady(_), 0) => {
-                crate::update::request_restart();
                 None
             }
             _ => None,

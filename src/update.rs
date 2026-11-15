@@ -6,7 +6,7 @@
 //! 3. Swap: Windows lets a running exe be renamed, so the running exe becomes
 //!    `<name>.old` and the download takes its name. The next launch is the new
 //!    version; it deletes the `.old` file.
-//! 4. "Restart now" starts the new exe with `--resume <pid>`: it waits for this process
+//! 4. The master then restarts at once: it starts the new exe with `--resume <pid>`: it waits for this process
 //!    to end, then reopens the same windows from the session file.
 //!
 //! Works in the install folder or any portable folder the user can write to.
@@ -23,7 +23,7 @@ pub const REPO: &str = "exodus941/ArkImage";
 /// The release asset to download.
 const ASSET: &str = "arkimage.exe";
 
-/// Set by the "Restart now" button; the master restarts on its next tick.
+/// Set when an update is in place; the master restarts on its next tick.
 pub static RESTART: AtomicBool = AtomicBool::new(false);
 
 /// What a check found.
@@ -53,10 +53,13 @@ pub fn is_newer(tag: &str, current: &str) -> bool {
     }
 }
 
-/// Delete `<exe>.old` left by the last update.
+/// Delete `<exe>.old`, `.old2` to `.old9` and `.new` left by the last update.
 pub fn cleanup() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(old_path(&exe));
+        for i in 2..10 {
+            let _ = std::fs::remove_file(exe.with_extension(format!("exe.old{i}")));
+        }
         let _ = std::fs::remove_file(new_path(&exe));
     }
 }
@@ -85,7 +88,14 @@ pub fn check_and_install() -> Outcome {
     }
 }
 
+/// The version this process already swapped in; a second check before the restart
+/// reports it again instead of swapping twice (the first swap's `.old` is still locked).
+static INSTALLED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 fn run() -> Result<Outcome, String> {
+    if let Some(v) = INSTALLED.lock().unwrap().clone() {
+        return Ok(Outcome::Ready(v));
+    }
     let current = env!("CARGO_PKG_VERSION");
     let a = agent();
     let body = a.get(&api_url()).set("Accept", "application/vnd.github+json").call().map_err(|e| format!("Can't reach GitHub: {e}"))?.into_string().map_err(|e| e.to_string())?;
@@ -119,15 +129,23 @@ fn run() -> Result<Outcome, String> {
     }
     std::fs::write(&new, &bytes).map_err(|e| format!("Can't write next to the app ({}): {e}", new.display()))?;
     // swap: the running exe can be renamed but not overwritten
-    let old = old_path(&exe);
-    let _ = std::fs::remove_file(&old);
+    // a locked `.old` (another process still runs it) cannot be deleted: use `.old2`, `.old3`
+    let mut old = old_path(&exe);
+    for i in 2..10 {
+        if std::fs::remove_file(&old).is_ok() || !old.exists() {
+            break;
+        }
+        old = exe.with_extension(format!("exe.old{i}"));
+    }
     std::fs::rename(&exe, &old).map_err(|e| format!("Can't replace the app: {e}"))?;
     if let Err(e) = std::fs::rename(&new, &exe) {
         let _ = std::fs::rename(&old, &exe); // put the old one back
         return Err(format!("Can't replace the app: {e}"));
     }
     crate::trace(&format!("update: {tag} installed at {}", exe.display()));
-    Ok(Outcome::Ready(tag.trim_start_matches('v').to_string()))
+    let v = tag.trim_start_matches('v').to_string();
+    *INSTALLED.lock().unwrap() = Some(v.clone());
+    Ok(Outcome::Ready(v))
 }
 
 /// Start the (new) exe to reopen this session once this process has ended.
@@ -161,11 +179,6 @@ pub fn wait_for_exit(pid: u32) {
         let _ = pid;
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-}
-
-/// True when the stored last-check time is a day old or more.
-pub fn due(last_check_unix: u64) -> bool {
-    now_unix().saturating_sub(last_check_unix) >= 24 * 3600
 }
 
 pub fn now_unix() -> u64 {

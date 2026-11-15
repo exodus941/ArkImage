@@ -1739,7 +1739,12 @@ impl App {
     pub fn on_update(&mut self, o: &crate::update::Outcome, manual: bool) {
         use crate::{install::Card, update::Outcome};
         let card = match o {
-            Outcome::Ready(v) => Card::UpdateReady(v.clone()),
+            // the new exe is in place: restart now; the session reopens in the new version
+            Outcome::Ready(v) => {
+                crate::trace(&format!("update {v} ready: restarting"));
+                crate::update::request_restart();
+                return;
+            }
             Outcome::UpToDate if manual => Card::UpToDate,
             Outcome::Failed(e) if manual => Card::UpdateFailed(e.clone()),
             _ => return,

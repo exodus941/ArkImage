@@ -32,7 +32,7 @@ pub struct Config {
     pub last_folder: String,
     /// The first-run "install ArkImage?" question was asked.
     pub install_offered: bool,
-    /// Check GitHub for updates once a day, and when the last check ran (unix seconds).
+    /// Check GitHub for updates at each start, and when the last check ran (unix seconds).
     pub auto_update: bool,
     pub update_checked: u64,
     pub cache_mb: u64,
@@ -317,7 +317,7 @@ impl Config {
         s.push_str(&format!("; the first-run install question was asked
 install_offered = {}
 ", self.install_offered as u8));
-        s.push_str(&format!("; check GitHub for a new version once a day; last check (unix seconds)
+        s.push_str(&format!("; check GitHub for a new version at each start; last check (unix seconds)
 auto_update = {}
 update_checked = {}
 ", self.auto_update as u8, self.update_checked));

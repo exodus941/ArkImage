@@ -206,8 +206,11 @@ impl ApplicationHandler<UserEvent> for Master {
             crate::install::running_installed(),
             crate::install::is_installed()
         ));
-        // Once a day: check GitHub for a newer version (in the background).
-        if cfg!(windows) && self.cfg.auto_update && crate::update::due(self.cfg.update_checked) {
+        // Every start of the master: check GitHub for a newer version (in the background).
+        // Later launches hand their files to this master and exit, so they never check;
+        // a backup taking over after a crash is not a new start and does not check either.
+        if cfg!(windows) && self.cfg.auto_update && !takeover {
+            crate::trace("update check at master start");
             let now = crate::update::now_unix();
             self.cfg.update_checked = now;
             for w in &mut self.windows {
@@ -310,7 +313,7 @@ impl ApplicationHandler<UserEvent> for Master {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        // "Restart now" after an update: start the new exe, which reopens this session
+        // After an update is in place: start the new exe, which reopens this session
         // once this process has ended, then end
         if crate::update::RESTART.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.save_session(true);
