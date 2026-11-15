@@ -1,8 +1,8 @@
-<p align="center"><img src="assets/icon.svg" width="128" height="128" alt="ArkImage icon"></p>
+<img src="assets/icon.svg" width="128" height="128" alt="ArkImage icon">
 
-<h1 align="center">ArkImage</h1>
+# ArkImage
 
-<p align="center">A fast, light image viewer for Windows, written in Rust.</p>
+A fast, light image viewer for Windows, written in Rust.
 
 ArkImage brings together the best ideas of several image viewers, adds some of its own,
 and puts them in one small program. Run it from any folder as a portable app, or install
