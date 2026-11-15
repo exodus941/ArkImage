@@ -215,11 +215,14 @@ fn draw_top(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, hits: &mut Vec<
     // menus: label, 4 px, 12 px chevron; 8 px plate padding, 8 px between plates
     let mut right = lx - 12.0 * sf - 16.0 * sf;
     let chev = 12.0 * sf;
-    for (label, id) in [("Copy to", "tb_copyto"), ("Edit", "tb_edit"), ("Bookmark", "tb_bookmark"), ("Slideshow", "tb_slideshow"), ("View", "tb_view")] {
+    // each menu: icon, 4 px, label, 4 px, chevron (as EXIF: camera, 4 px, label)
+    for (label, id, ic) in [("Copy to", "tb_copyto", Icon::Copy), ("Edit", "tb_edit", Icon::Pencil), ("Bookmark", "tb_bookmark", Icon::Bookmark), ("Slideshow", "tb_slideshow", Icon::PlayerPlay), ("View", "tb_view", Icon::Eye)] {
         let tw = t.width(label, px);
-        let x0 = right - chev - 4.0 * sf - tw;
+        let lx0 = right - chev - 4.0 * sf - tw;
+        let x0 = lx0 - 4.0 * sf - isz;
         plate(c, x0 - 8.0 * sf, right + 8.0 * sf, s.hover_amt(id));
-        text_mid(c, t, x0, mid, label, px, TOOL_TEXT);
+        icons::draw(c, ic, x0 + isz / 2.0, mid, isz, TOOL_ICON);
+        text_mid(c, t, lx0, mid, label, px, TOOL_TEXT);
         icons::draw(c, Icon::ChevronDown, right - chev / 2.0, mid, chev, TOOL_ICON);
         hits.push(Hit { x0: x0 - 8.0 * sf, y0, x1: right + 8.0 * sf, y1: y0 + tb, id });
         right = x0 - 24.0 * sf;

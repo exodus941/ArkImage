@@ -35,6 +35,8 @@ const CTRL_H: f32 = 32.0;
 const PRIMARY: u32 = u::ACCENT_FILL;
 const PRIMARY_HOVER: u32 = u::ACCENT_HOVER;
 const FIELD: u32 = 0x1C1C1C;
+/// Entry fields (combo, number, path, name, hotkey): black at 12.5% over the card (#303030), brighter than buttons.
+const INPUT: u32 = 0x2A2A2A;
 const BODY: (f32, f32) = (14.0, 20.0);
 const SMALL: (f32, f32) = (12.0, 16.0);
 const TITLE: (f32, f32) = (20.0, 28.0);
@@ -168,7 +170,7 @@ fn switch(c: &mut Canvas, x: f32, mid: f32, sf: f32, on: bool, hover: f32) {
 fn combo(c: &mut Canvas, t: &mut Text, x: f32, mid: f32, w: f32, sf: f32, label: &str, on: bool, hover: f32) {
     let d = |v: f32| v * sf;
     let (h, y) = (d(CTRL_H), (mid - d(CTRL_H) / 2.0).round());
-    boxed(c, x, y, w, h, d(4.0), if on { FIELD } else { PANEL }, lerp(LINE, ACCENT, hover), sf);
+    boxed(c, x, y, w, h, d(4.0), if on { INPUT } else { PANEL }, lerp(LINE, ACCENT, hover), sf);
     let room = w - d(12.0 + 32.0);
     let mut s = label.to_string();
     let cut = u::width(t, Face::Regular, &s, d(BODY.0)) > room;
@@ -182,8 +184,36 @@ fn combo(c: &mut Canvas, t: &mut Text, x: f32, mid: f32, w: f32, sf: f32, label:
     chevron(c, x + w - d(16.0), mid, sf, if on { SLATE400 } else { SLATE500 });
 }
 
+/// The Tabler icon drawn before a button's label, if any.
+fn button_icon(label: &str) -> Option<Icon> {
+    Some(match label {
+        "Reinstall…" => Icon::RotateCw2,
+        "Reset…" => Icon::Restore,
+        "GitHub" => Icon::GitHub,
+        "Check for Updates" => Icon::Refresh,
+        "Cancel" => Icon::Close,
+        "OK" => Icon::Check,
+        "New (copy of this preset)" => Icon::CopyPlus,
+        "Delete" => Icon::Trash,
+        "Browse…" => Icon::FolderOpen,
+        "Clear" => Icon::Eraser,
+        "Open" => Icon::FileText,
+        _ => return None,
+    })
+}
+
+/// Icon 16 px, then 8 px, then the label.
+const BTN_ICON: f32 = 16.0;
+const BTN_ICON_GAP: f32 = 8.0;
+
+/// Width of the label plus its icon.
+fn button_content_w(t: &mut Text, sf: f32, label: &str) -> f32 {
+    let tw = u::width(t, Face::Medium, label, BODY.0 * sf);
+    if button_icon(label).is_some() { tw + (BTN_ICON + BTN_ICON_GAP) * sf } else { tw }
+}
+
 fn button_w(t: &mut Text, sf: f32, label: &str) -> f32 {
-    (u::width(t, Face::Medium, label, BODY.0 * sf) + 24.0 * sf).ceil().max(80.0 * sf)
+    (button_content_w(t, sf, label) + 24.0 * sf).ceil().max(80.0 * sf)
 }
 
 /// Outline button with its label centred; `on` false greys it.
@@ -196,8 +226,13 @@ fn button(c: &mut Canvas, t: &mut Text, x: f32, mid: f32, w: f32, sf: f32, label
         boxed(c, x, y, w, h, d(4.0), lerp(FIELD, PANEL2, if on { hover } else { 0.0 }), LINE, sf);
     }
     let col = if primary { 0xFFFFFF } else if on { SLATE200 } else { SLATE500 };
-    let tw = u::width(t, Face::Medium, label, d(BODY.0));
-    text(c, t, Face::Medium, x + (w - tw) / 2.0, mid, label, (d(BODY.0), d(BODY.1)), col);
+    let cw = button_content_w(t, sf, label);
+    let mut lx = (x + (w - cw) / 2.0).round();
+    if let Some(i) = button_icon(label) {
+        crate::icons::draw(c, i, lx + d(BTN_ICON) / 2.0, mid, d(BTN_ICON), col);
+        lx += d(BTN_ICON + BTN_ICON_GAP);
+    }
+    text(c, t, Face::Medium, lx, mid, label, (d(BODY.0), d(BODY.1)), col);
 }
 
 /// Draw the dialog; returns how far the page can scroll (design px).
@@ -265,7 +300,7 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                 let fy = ctrl_y(mid);
                 let typing = st.num_edit.filter(|(g, _)| *g == f).map(|(_, s)| s);
                 let edge = lerp(LINE, ACCENT, if typing.is_some() { 1.0 } else if on { st.amt(Act::NumEdit(f)) } else { 0.0 });
-                boxed(c, bx, fy, fw, d(CTRL_H), d(4.0), if on { FIELD } else { PANEL }, edge, sf);
+                boxed(c, bx, fy, fw, d(CTRL_H), d(4.0), if on { INPUT } else { PANEL }, edge, sf);
                 if let Some(s) = typing {
                     let tw = text(c, t, Face::Mono, bx + d(12.0), mid, s, body, SLATE100);
                     caret(c, bx + d(13.0) + tw, mid, sf);
@@ -312,7 +347,7 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                 let px0 = x0 + d(CARD_PAD) + lw.max(d(112.0)) + d(16.0);
                 let pw = browse_x - d(8.0) - px0;
                 let fy = ctrl_y(mid);
-                boxed(c, px0, fy, pw, d(CTRL_H), d(4.0), FIELD, LINE, sf);
+                boxed(c, px0, fy, pw, d(CTRL_H), d(4.0), INPUT, LINE, sf);
                 let v = f.get(cfg);
                 let shown = if v.is_empty() { "Not set".to_string() } else { v.to_string() };
                 let mut s = shown.clone();
@@ -389,7 +424,7 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                 let bx = right - d(COMBO_W);
                 let fy = ctrl_y(mid);
                 let edge = lerp(LINE, ACCENT, if st.renaming { 1.0 } else if on { st.amt(Act::PresetRename) } else { 0.0 });
-                boxed(c, bx, fy, d(COMBO_W), d(CTRL_H), d(4.0), if on { FIELD } else { PANEL }, edge, sf);
+                boxed(c, bx, fy, d(COMBO_W), d(CTRL_H), d(4.0), if on { INPUT } else { PANEL }, edge, sf);
                 let name = crate::filters::get(&cfg.filter_presets, cfg.filter).name;
                 let tw = text(c, t, Face::Regular, bx + d(12.0), mid, &name, body, if on { SLATE200 } else { SLATE500 });
                 if st.renaming {
@@ -416,7 +451,7 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                 let fy = ctrl_y(mid);
                 let cap = st.capturing == Some(i);
                 let edge = lerp(LINE, ACCENT, if cap { 1.0 } else { st.amt(Act::KeyCapture(i)) });
-                boxed(c, kx, fy, kw, d(CTRL_H), d(4.0), FIELD, edge, sf);
+                boxed(c, kx, fy, kw, d(CTRL_H), d(4.0), INPUT, edge, sf);
                 let kt = if cap { "Press a key…".to_string() } else if b.key.is_empty() { "None".to_string() } else { crate::bindings::display(&b.key) };
                 let face = if cap || b.key.is_empty() { Face::Regular } else { Face::Mono };
                 text(c, t, face, kx + d(12.0), mid, &kt, body, if cap { ACCENT } else if b.key.is_empty() { SLATE500 } else { SLATE200 });

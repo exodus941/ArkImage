@@ -27,6 +27,21 @@ pub enum Icon {
     Download,
     CircleCheck,
     Loader,
+    RotateCw2,
+    Restore,
+    GitHub,
+    Refresh,
+    Check,
+    CopyPlus,
+    Trash,
+    FolderOpen,
+    Eraser,
+    FileText,
+    Eye,
+    PlayerPlay,
+    Bookmark,
+    Pencil,
+    Copy,
 }
 
 fn svg(i: Icon) -> &'static str {
@@ -51,6 +66,21 @@ fn svg(i: Icon) -> &'static str {
         Icon::Download => include_str!("../assets/icons/download.svg"),
         Icon::CircleCheck => include_str!("../assets/icons/circle-check.svg"),
         Icon::Loader => include_str!("../assets/icons/loader-2.svg"),
+        Icon::RotateCw2 => include_str!("../assets/icons/rotate-clockwise-2.svg"),
+        Icon::Restore => include_str!("../assets/icons/restore.svg"),
+        Icon::GitHub => include_str!("../assets/icons/brand-github.svg"),
+        Icon::Refresh => include_str!("../assets/icons/refresh.svg"),
+        Icon::Check => include_str!("../assets/icons/check.svg"),
+        Icon::CopyPlus => include_str!("../assets/icons/copy-plus.svg"),
+        Icon::Trash => include_str!("../assets/icons/trash.svg"),
+        Icon::FolderOpen => include_str!("../assets/icons/folder-open.svg"),
+        Icon::Eraser => include_str!("../assets/icons/eraser.svg"),
+        Icon::FileText => include_str!("../assets/icons/file-text.svg"),
+        Icon::Eye => include_str!("../assets/icons/eye.svg"),
+        Icon::PlayerPlay => include_str!("../assets/icons/player-play.svg"),
+        Icon::Bookmark => include_str!("../assets/icons/bookmark.svg"),
+        Icon::Pencil => include_str!("../assets/icons/pencil.svg"),
+        Icon::Copy => include_str!("../assets/icons/copy.svg"),
     }
 }
 
