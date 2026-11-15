@@ -352,7 +352,12 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                 let on = !matches!(now, Upd::Checking | Upd::Found(_));
                 let verb = "Check for Updates";
                 let bw = button_w(t, sf, verb);
-                let max_x = right - bw - d(16.0);
+                // GitHub button 8 px left of Check for Updates
+                let gw = button_w(t, sf, "GitHub");
+                let gx = right - bw - d(8.0) - gw;
+                button(c, t, gx, mid, gw, sf, "GitHub", false, true, st.amt(Act::GitHub));
+                hit(gx, ctrl_y(mid), gx + gw, ctrl_y(mid) + d(CTRL_H), Act::GitHub);
+                let max_x = gx - d(16.0);
                 upd_status(c, t, x0 + d(CARD_PAD), mid, sf, before, 1.0 - m, secs, max_x);
                 upd_status(c, t, x0 + d(CARD_PAD), mid, sf, now, m, secs, max_x);
                 button(c, t, right - bw, mid, bw, sf, verb, false, on, if on { st.amt(Act::CheckUpdate) } else { 0.0 });

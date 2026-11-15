@@ -304,6 +304,8 @@ pub enum Act {
     Install,
     /// Check GitHub for a newer version now.
     CheckUpdate,
+    /// Open the GitHub page in the browser.
+    GitHub,
     Ok,
     /// Close without saving.
     Cancel,

@@ -200,6 +200,19 @@ pub fn spawn_check(proxy: winit::event_loop::EventLoopProxy<crate::app::UserEven
     });
 }
 
+/// Open the project page in the default browser.
+pub fn open_repo_page() {
+    let url = format!("https://github.com/{REPO}");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let r = std::process::Command::new("cmd").raw_arg(format!("/C start \"\" \"{url}\"")).creation_flags(0x0800_0000).spawn();
+        crate::trace(&format!("open {url}: {}", if r.is_ok() { "started" } else { "failed" }));
+    }
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(&url).spawn();
+}
+
 pub fn request_restart() {
     RESTART.store(true, Ordering::SeqCst);
 }

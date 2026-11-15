@@ -2793,6 +2793,10 @@ impl App {
                 };
                 self.msg("Settings reset. OK keeps them, Cancel undoes.");
             }
+            Act::GitHub => {
+                crate::update::open_repo_page();
+                return;
+            }
             Act::CheckUpdate => {
                 if let Some(s) = &mut self.settings {
                     s.set_upd(crate::settings::Upd::Checking);
@@ -3476,7 +3480,8 @@ impl App {
                                     _ => "Fit to Width",
                                 });
                             } else {
-                                self.toggle_maximize();
+                                // default view: the same as the title bar's full-screen button
+                                self.toggle_fullscreen();
                             }
                             return;
                         }
