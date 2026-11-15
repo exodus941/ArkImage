@@ -1,0 +1,53 @@
+[package]
+name = "arkimage"
+version = "1.0.0"
+edition = "2021"
+description = "Fast, lightweight, multi-instance image viewer"
+license = "MIT"
+
+[dependencies]
+resvg = { version = "0.50.0", default-features = false }
+winit = "0.30"
+softbuffer = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "tga", "dds", "ico", "pnm", "hdr", "exr", "qoi", "rayon"] }
+fast_image_resize = "5"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+kamadak-exif = "0.6"
+psd = "0.3"
+fontdue = "0.9"
+rfd = "0.15"
+arboard = "3"
+trash = "5"
+dirs = "5"
+muda = "0.17"
+unrar = "0.5.8"
+sevenz-rust2 = "0.25.0"
+interprocess = "2.4.8"
+ureq = "2"
+serde_json = "1"
+sha2 = "0.10"
+
+# HEIC/HEIF. Windows: libheif linked statically from vcpkg (see .cargo/config.toml). Linux: system libheif.
+# macOS uses the system ImageIO framework instead.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+libheif-rs = "2"
+# Lossy WebP fast path (macOS uses ImageIO instead).
+libwebp-sys = "0.14"
+
+[target."cfg(windows)".dependencies]
+mslnk = "0.1"
+winreg = "0.55"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[dev-dependencies]
+
+[build-dependencies]
+winresource = "0.1.34"

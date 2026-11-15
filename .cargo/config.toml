@@ -1,0 +1,7 @@
+# Windows: link libheif (with the libde265 decoder) statically from vcpkg, so the build is
+# one exe with no DLLs beside it. Install once with
+#   vcpkg install "libheif[core,libde265]:x64-windows-static-md"
+# and set VCPKG_ROOT. For the old DLL build, set VCPKGRS_DYNAMIC=1 and use the
+# x64-windows triplet instead.
+[env]
+VCPKGRS_TRIPLET = "x64-windows-static-md"
