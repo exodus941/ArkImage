@@ -35,8 +35,10 @@ const CTRL_H: f32 = 32.0;
 const PRIMARY: u32 = u::ACCENT_FILL;
 const PRIMARY_HOVER: u32 = u::ACCENT_HOVER;
 const FIELD: u32 = 0x1C1C1C;
-/// Entry fields (combo, number, path, name, hotkey): black at 12.5% over the card (#303030), brighter than buttons.
-const INPUT: u32 = 0x2A2A2A;
+/// Entry fields (combo, number, path, name, hotkey): #1C1C1C at 50% over the card (#303030).
+const INPUT: u32 = 0x262626;
+/// Buttons: #1C1C1C mixed 25% with the brand blue ACCENT_FILL (#0080C5).
+const BUTTON: u32 = 0x153546;
 const BODY: (f32, f32) = (14.0, 20.0);
 const SMALL: (f32, f32) = (12.0, 16.0);
 const TITLE: (f32, f32) = (20.0, 28.0);
@@ -223,7 +225,7 @@ fn button(c: &mut Canvas, t: &mut Text, x: f32, mid: f32, w: f32, sf: f32, label
     if primary {
         c.fill_rrect(x, y, w, h, d(4.0), lerp(PRIMARY, PRIMARY_HOVER, hover), 1.0);
     } else {
-        boxed(c, x, y, w, h, d(4.0), lerp(FIELD, PANEL2, if on { hover } else { 0.0 }), LINE, sf);
+        boxed(c, x, y, w, h, d(4.0), lerp(BUTTON, PANEL2, if on { hover } else { 0.0 }), LINE, sf);
     }
     let col = if primary { 0xFFFFFF } else if on { SLATE200 } else { SLATE500 };
     let cw = button_content_w(t, sf, label);
@@ -313,7 +315,7 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                 for (k, (sym, dir)) in [("−", -1i64), ("+", 1)].iter().enumerate() {
                     let sx = bx + fw + d(4.0) + (bw + d(4.0)) * k as f32;
                     let act = Act::Step(f, *dir);
-                    boxed(c, sx, fy, bw, d(CTRL_H), d(4.0), lerp(FIELD, PANEL2, if on { st.amt(act) } else { 0.0 }), LINE, sf);
+                    boxed(c, sx, fy, bw, d(CTRL_H), d(4.0), lerp(BUTTON, PANEL2, if on { st.amt(act) } else { 0.0 }), LINE, sf);
                     let tw = u::width(t, Face::Medium, sym, body.0);
                     text(c, t, Face::Medium, sx + (bw - tw) / 2.0, mid, sym, body, if on { SLATE200 } else { SLATE500 });
                     if on {
