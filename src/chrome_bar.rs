@@ -55,6 +55,16 @@ pub(super) fn draw_bottom(c: &mut Canvas, _t: Option<&mut Text>, s: &State, hits
     c.fill_rrect(sx, sy, fw, sh, sh / 2.0, 0xFFFFFF, a);
     hits.push(Hit { x0: sx - 8.0 * sf, y0: sy - 8.0 * sf, x1: sx + sw + 8.0 * sf, y1: sy + sh + 8.0 * sf, id: "bar_slider" });
 
+    // animation scrub bar: a bare track BAR_GAP above the bar, same style as the page slider
+    if let Some((f, n)) = s.anim {
+        let (tx, ty, tw, th) = anim_track(c.w as f32, c.h as f32, sf);
+        c.fill_rrect(tx, ty, tw, th, th / 2.0, 0xFFFFFF, 0.14);
+        let frac = (f + 1) as f32 / n.max(1) as f32;
+        let a = 0.40 + 0.16 * s.hover_amt("anim_slider");
+        c.fill_rrect(tx, ty, (frac * tw).max(th), th, th / 2.0, 0xFFFFFF, a);
+        hits.push(Hit { x0: tx - 8.0 * sf, y0: ty - 8.0 * sf, x1: tx + tw + 8.0 * sf, y1: ty + th + 8.0 * sf, id: "anim_slider" });
+    }
+
     // icon row, centred; Tabler icons, 20 px
     let ox = (bx + bw / 2.0 - ROW_W * sf / 2.0).round();
     let at = |d: f32| ox + d * sf;

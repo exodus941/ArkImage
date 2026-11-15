@@ -1,12 +1,12 @@
 [package]
 name = "arkimage"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Fast, lightweight, multi-instance image viewer"
 license = "MIT"
 
 [dependencies]
-resvg = { version = "0.50.0", default-features = false }
+resvg = { version = "0.50.0", default-features = false, features = ["text", "system-fonts", "svgz", "raster-images"] }
 winit = "0.30"
 softbuffer = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "tga", "dds", "ico", "pnm", "hdr", "exr", "qoi", "rayon"] }

@@ -362,6 +362,8 @@ pub struct App {
     hover: Option<&'static str>,
     cursor_in: bool,
     slider_drag: bool,
+    /// The animation scrub bar is held: playback pauses on the frame under the cursor.
+    anim_drag: bool,
     chrome_shown: (bool, bool),
     /// Opacity of the top and bottom chrome, 0..1, stepped toward the target each frame.
     fade: (f32, f32),
@@ -530,6 +532,7 @@ impl App {
             hover: None,
             cursor_in: false,
             slider_drag: false,
+            anim_drag: false,
             chrome_shown: (false, false),
             fade: (0.0, 0.0),
             fade_last: Instant::now(),
@@ -1663,10 +1666,12 @@ impl App {
             info_on: self.show_info,
             index: self.index(),
             len: self.len(),
+            anim: self.anim_frames().map(|n| (self.frame_idx.min(n - 1), n)),
         };
         // Keep the rows under a partly faded bar, draw the bar, then blend the two.
         let top_rows = ((chrome::top_zone(sf) + 2.0).ceil() as usize).min(c.h);
-        let bot_from = c.h.saturating_sub(((chrome::BAR_H + chrome::BAR_GAP + 6.0) * sf).ceil() as usize);
+        let anim_h = if st.anim.is_some() { chrome::ANIM_H + chrome::BAR_GAP } else { 0.0 };
+        let bot_from = c.h.saturating_sub(((chrome::BAR_H + chrome::BAR_GAP + anim_h + 6.0) * sf).ceil() as usize);
         let saved_top = (show_top && self.fade.0 < 1.0).then(|| c.buf[..top_rows * c.w].to_vec());
         let saved_bot = (show_bottom && self.fade.1 < 1.0).then(|| c.buf[bot_from * c.w..].to_vec());
         let mut hits = std::mem::take(&mut self.hits);
@@ -1989,7 +1994,8 @@ impl App {
         let empty = self.playlist.is_none();
         let menu_open = false;
         let top = self.cfg.lock_top || empty || menu_open || (self.cursor_in && y < chrome::top_zone(sf));
-        let bottom = self.cfg.lock_bottom || empty || self.slider_drag || (self.cursor_in && y > ch - chrome::bottom_zone(sf));
+        let anim = self.anim_frames().is_some();
+        let bottom = self.cfg.lock_bottom || empty || self.slider_drag || self.anim_drag || (self.cursor_in && y > ch - chrome::bottom_zone(sf, anim));
         (top, bottom)
     }
 
@@ -2111,6 +2117,10 @@ impl App {
                 self.slider_drag = true;
                 self.slider_seek();
             }
+            "anim_slider" => {
+                self.anim_drag = true;
+                self.anim_seek();
+            }
             "bar_zin" => self.zoom_step(true, None),
             "bar_zout" => self.zoom_step(false, None),
             "bar_rotl" => self.rotate(3),
@@ -2190,7 +2200,7 @@ impl App {
                 I("pageselect".into(), "Select Image".into(), "Enter", has),
                 I("close".into(), "Close".into(), "F4", has),
                 I("reveal".into(), if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in Windows Explorer" }.into(), "Ctrl+Enter", has),
-                I("reveal_all".into(), if cfg!(target_os = "macos") { "Show All Open Images in Finder" } else { "Select All Open Images in Explorer" }.into(), "", has),
+                I("reveal_all".into(), if cfg!(target_os = "macos") { "Show Open Images from Same Folder in Finder" } else { "Select Open Images from Same Folder in Explorer" }.into(), "", has),
                 S,
                 C("f0".into(), "No Filter".into(), "U", cfg.filter == 0),
                 C("f1".into(), "Soften".into(), "I", cfg.filter == 1),
@@ -3115,6 +3125,27 @@ impl App {
         }
     }
 
+    /// Frame count of the current image when it animates and plays; None otherwise.
+    fn anim_frames(&self) -> Option<usize> {
+        let n = self.current.as_ref()?.1.frames.len();
+        (n > 1 && self.cfg.double == 0).then_some(n)
+    }
+
+    /// Scrub: show the frame under the cursor and hold it while the button is down.
+    fn anim_seek(&mut self) {
+        let Some(n) = self.anim_frames() else { return };
+        let Some(sz) = self.window.as_ref().map(|w| w.inner_size()) else { return };
+        let (tx, _, tw, _) = chrome::anim_track(sz.width as f32, sz.height as f32, self.sf());
+        let frac = ((self.cursor.0 as f32 - tx) / tw).clamp(0.0, 1.0);
+        let f = ((frac * n as f32) as usize).min(n - 1);
+        self.next_frame_at = None;
+        if f != self.frame_idx {
+            self.frame_idx = f;
+            self.base = None;
+        }
+        self.request_redraw();
+    }
+
     fn advance_frame(&mut self, now: Instant) {
         let Some(d) = self.current.as_ref().map(|c| c.1.clone()) else { return };
         let n = d.frames.len();
@@ -3328,6 +3359,10 @@ impl App {
                     self.slider_seek();
                     return;
                 }
+                if self.anim_drag {
+                    self.anim_seek();
+                    return;
+                }
                 if let (true, Some((sc, sp, moved))) = (self.drag_rect, self.drag) {
                     let moved = moved || (position.x - sc.0).abs() + (position.y - sc.1).abs() > 4.0;
                     self.drag = Some((sc, sp, moved));
@@ -3438,6 +3473,16 @@ impl App {
                     if self.slider_drag {
                         self.slider_drag = false;
                         self.preload();
+                        return;
+                    }
+                    if self.anim_drag {
+                        // resume playback from the frame let go on
+                        self.anim_drag = false;
+                        if let Some(d) = self.current.as_ref().map(|c| c.1.clone()) {
+                            let ms = d.frames[self.frame_idx.min(d.frames.len() - 1)].delay_ms.max(10) as u64;
+                            self.next_frame_at = Some(Instant::now() + Duration::from_millis(ms));
+                        }
+                        self.request_redraw();
                         return;
                     }
                     if let Some(((sx, sy), _, moved)) = self.drag.take() {

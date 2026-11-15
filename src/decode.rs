@@ -55,6 +55,42 @@ fn single(img: RgbaImage) -> Vec<Frame> {
     vec![Frame { img: Arc::new(img), delay_ms: 0 }]
 }
 
+/// Rasterise an SVG. A vector has no pixel size, so the longer side is drawn at
+/// 2048 px at least (sharp at zoom), and at most 8192 px; aspect is kept.
+fn svg(bytes: &[u8]) -> Result<RgbaImage, String> {
+    use resvg::{tiny_skia, usvg};
+    // system fonts for <text>, loaded once per process
+    static FONTS: std::sync::OnceLock<std::sync::Arc<usvg::fontdb::Database>> = std::sync::OnceLock::new();
+    let mut opt = usvg::Options::default();
+    // loading every system font costs about 2.5 s: only for text, or a compressed file
+    let has_text = bytes.windows(5).any(|w| w == b"<text") || !bytes.starts_with(b"<");
+    if has_text { opt.fontdb = FONTS
+        .get_or_init(|| {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            std::sync::Arc::new(db)
+        })
+        .clone(); }
+    let tree = usvg::Tree::from_data(bytes, &opt).map_err(es)?;
+    let size = tree.size();
+    let long = size.width().max(size.height());
+    let scale = (long.max(2048.0).min(8192.0)) / long;
+    let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
+    let mut pm = tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or("SVG too large")?;
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pm.as_mut());
+    // tiny-skia stores premultiplied alpha; the viewer wants straight alpha
+    let mut px = pm.take();
+    for p in px.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        if a != 0 && a != 255 {
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    RgbaImage::from_raw(w.max(1), h.max(1), px).ok_or_else(|| "bad SVG data".into())
+}
+
 fn decode_frames(bytes: &[u8], ext: &str) -> Result<(Vec<Frame>, String), String> {
     if matches!(ext, "psd" | "psb") || bytes.starts_with(b"8BPS") {
         if let Some(img) = crate::psd_fast::decode(bytes) {
@@ -63,6 +99,15 @@ fn decode_frames(bytes: &[u8], ext: &str) -> Result<(Vec<Frame>, String), String
         let p = psd::Psd::from_bytes(bytes).map_err(es)?;
         let img = RgbaImage::from_raw(p.width(), p.height(), p.rgba()).ok_or("bad PSD data")?;
         return Ok((single(img), "PSD".into()));
+    }
+    #[cfg(windows)]
+    if ext == "lottie" || (ext == "json" && crate::lottie::is_lottie_json(bytes)) {
+        let (imgs, delay) = crate::lottie::decode(bytes, ext)?;
+        let name = if imgs.len() > 1 { "Lottie (animated)" } else { "Lottie" };
+        return Ok((imgs.into_iter().map(|i| Frame { img: Arc::new(i), delay_ms: delay }).collect(), name.into()));
+    }
+    if matches!(ext, "svg" | "svgz") {
+        return Ok((single(svg(bytes)?), "SVG".into()));
     }
     if crate::heic::is_heif(bytes) || matches!(ext, "heic" | "heif" | "hif") {
         return Ok((single(crate::heic::decode(bytes)?), "HEIF".into()));

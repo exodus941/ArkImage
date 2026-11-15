@@ -11,7 +11,10 @@ use std::{
 pub const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "webp", "bmp", "dib", "tif", "tiff",
     "tga", "dds", "ico", "pnm", "pbm", "pgm", "ppm", "pam", "hdr", "exr", "qoi", "psd", "psb", "heic", "heif", "hif",
+    "svg", "svgz", "lottie", "json",
 ];
+/// Extensions the app opens but never registers for: other programs own them.
+pub const NOT_ASSOCIATED: &[&str] = &["json"];
 pub const ARCHIVE_EXTS: &[&str] = &["zip", "cbz", "rar", "cbr", "7z", "cb7"];
 
 pub fn ext_of(name: &str) -> String {
@@ -28,6 +31,17 @@ pub fn is_archive_name(name: &str) -> bool {
 
 pub fn is_image_name(name: &str) -> bool {
     IMAGE_EXTS.contains(&ext_of(name).as_str())
+}
+
+/// Reads the first 64 KB of a .json file and checks for Lottie keys.
+fn json_file_is_lottie(p: &Path) -> bool {
+    use std::io::Read;
+    let mut head = vec![0u8; 64 * 1024];
+    let Ok(mut f) = fs::File::open(p) else { return false };
+    let n = f.read(&mut head).unwrap_or(0);
+    head.truncate(n);
+    let has = |k: &[u8]| head.windows(k.len()).any(|w| w == k);
+    head.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') && has(b"\"layers\"") && has(b"\"fr\"")
 }
 
 pub fn is_archive(p: &Path) -> bool {
@@ -167,6 +181,10 @@ fn list_dir(dir: &Path, sort: u8, desc: bool) -> io::Result<Vec<Entry>> {
             continue;
         }
         let p = de.path();
+        // most .json files are not animations: list only those that look like Lottie
+        if ext_of(&name) == "json" && !json_file_is_lottie(&p) {
+            continue;
+        }
         // DirEntry carries type/size/date from the directory scan on Windows; a full
         // fs::metadata per file costs an extra open for each of e.g. 46,000 files.
         let Ok(ft) = de.file_type() else { continue };
@@ -190,7 +208,7 @@ fn list_dir(dir: &Path, sort: u8, desc: bool) -> io::Result<Vec<Entry>> {
 fn list_zip(archive: &Path, sort: u8, desc: bool) -> io::Result<Vec<Entry>> {
     let mut items = Vec::new();
     for (name, size) in crate::archive::list(archive)? {
-        if is_image_name(&name) {
+        if is_image_name(&name) && ext_of(&name) != "json" {
             items.push(Item { key: name.clone(), size, mtime: SystemTime::UNIX_EPOCH, entry: Entry::Zip { archive: archive.to_path_buf(), name } });
             continue;
         }

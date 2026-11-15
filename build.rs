@@ -20,6 +20,11 @@ fn main() {
         println!("cargo:warning=VCPKG_ROOT not set; HEIC needs libheif from vcpkg");
         return;
     };
+    // rlottie (Lottie playback): static, from the same vcpkg tree; the C API is in src/lottie.rs.
+    let triplet = env::var("VCPKGRS_TRIPLET").unwrap_or_else(|_| "x64-windows-static-md".into());
+    let lib = PathBuf::from(&root).join("installed").join(&triplet).join("lib");
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    println!("cargo:rustc-link-lib=static=rlottie");
     // The default build links libheif statically (one exe; see .cargo/config.toml).
     // Only a DLL build (VCPKGRS_DYNAMIC=1) needs the DLLs beside the exe.
     if env::var_os("VCPKGRS_DYNAMIC").is_none() {

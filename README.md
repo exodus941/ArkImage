@@ -6,7 +6,7 @@ A fast, light image viewer for Windows, written in Rust.
 
 ArkImage brings together the best ideas of several image viewers, adds some of its own,
 and puts them in one small program. Run it from any folder as a portable app, or install
-it for your Windows user with one click. Either way it keeps itself up to date.
+it for your Windows user with one click.
 
 ## Download
 
@@ -23,7 +23,7 @@ It is a single file with nothing to unpack.
 ## Features
 
 - Opens JPEG, PNG, GIF and APNG, WebP, BMP, TIFF, TGA, DDS, ICO, PNM, HDR, EXR, QOI,
-  PSD and PSB, and HEIC/HEIF.
+  PSD and PSB, HEIC/HEIF, and SVG/SVGZ.
 - Reads images straight from ZIP/CBZ, RAR/CBR and 7z/CB7 archives, including archives inside archives.
 - One process serves every window: images open in a shared cache and are never decoded twice.
 - Preloads the next images in the direction you browse.

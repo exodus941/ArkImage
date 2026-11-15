@@ -19,6 +19,8 @@ pub const BAR_H: f32 = 84.0;
 pub const BAR_GAP: f32 = 16.0;
 /// Slider track gap from the bar's top, left and right edges, design px.
 pub const SLIDER_INSET: f32 = 16.0;
+/// Slider and scrub track height, design px.
+pub const TRACK_H: f32 = 12.0;
 /// Frosted glass: blur radius (design px) and tint opacities (0-255).
 const GLASS_BLUR: f32 = 32.0;
 const GLASS_TITLE_A: u32 = 205;
@@ -66,6 +68,8 @@ pub struct State<'a> {
     pub info_on: bool,
     pub index: usize,
     pub len: usize,
+    /// (frame, frame count) for an animation; None for a still image.
+    pub anim: Option<(usize, usize)>,
 }
 
 impl State<'_> {
@@ -80,8 +84,20 @@ pub fn top_zone(sf: f32) -> f32 {
     (TITLE_H + TOOL_H + 1.0) * sf
 }
 
-pub fn bottom_zone(sf: f32) -> f32 {
-    (BAR_H + BAR_GAP + 24.0) * sf
+/// Animation scrub bar above the bottom bar: a bare 8 px track, no panel.
+pub const ANIM_H: f32 = 8.0;
+
+/// The bottom hover zone; it grows by the scrub bar and its gap when one shows.
+pub fn bottom_zone(sf: f32, anim: bool) -> f32 {
+    (BAR_H + BAR_GAP + 24.0 + if anim { ANIM_H + BAR_GAP } else { 0.0 }) * sf
+}
+
+/// Scrub track (x, y, w, h): 75% of the bar's width, centred, BAR_GAP above the bar.
+pub fn anim_track(w: f32, h: f32, sf: f32) -> (f32, f32, f32, f32) {
+    let (bx, by, bw, _) = bar_rect(w, h, sf);
+    let th = (ANIM_H * sf).round();
+    let tw = (bw * 0.75).round();
+    ((bx + (bw - tw) / 2.0).round(), by - (BAR_GAP * sf).round() - th, tw.max(1.0), th)
 }
 
 /// Bar rectangle (x, y, w, h) in physical pixels.
@@ -96,7 +112,7 @@ pub fn slider_rect(w: f32, h: f32, sf: f32) -> (f32, f32, f32, f32) {
     let (bx, by, bw, _) = bar_rect(w, h, sf);
     // the same gap above, left and right of the track
     let inset = (SLIDER_INSET * sf).round();
-    (bx + inset, by + inset, (bw - 2.0 * inset).max(1.0), (12.0 * sf).round())
+    (bx + inset, by + inset, (bw - 2.0 * inset).max(1.0), (TRACK_H * sf).round())
 }
 
 pub fn draw(c: &mut Canvas, t: Option<&mut Text>, s: &State, hits: &mut Vec<Hit>) {
@@ -215,3 +231,20 @@ fn draw_top(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, hits: &mut Vec<
     hits.push(Hit { x0: fx - 12.0 * sf, y0, x1: fx + 12.0 * sf, y1: y0 + tb, id: "tb_full" });
 }
 
+
+#[cfg(test)]
+mod tests {
+    /// Scrub track at 1280x860: 8 px tall, 75% of the bar, centred, 16 px above the bar.
+    #[test]
+    fn scrub_track_geometry() {
+        for sf in [1.0f32, 1.5, 2.0] {
+            let (w, h) = (1280.0 * sf, 860.0 * sf);
+            let (bx, by, bw, _) = super::bar_rect(w, h, sf);
+            let (tx, ty, tw, th) = super::anim_track(w, h, sf);
+            assert_eq!(th, 8.0 * sf, "height at sf {sf}");
+            assert_eq!(tw, (bw * 0.75).round());
+            assert_eq!(tx - bx, bx + bw - (tx + tw), "centred at sf {sf}");
+            assert_eq!(by - (ty + th), 16.0 * sf, "gap at sf {sf}");
+        }
+    }
+}

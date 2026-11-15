@@ -14,6 +14,8 @@ mod icon;
 mod install;
 mod icons;
 mod ipc;
+#[cfg(windows)]
+mod lottie;
 mod master;
 mod picker;
 mod psd_fast;

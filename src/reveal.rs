@@ -3,8 +3,24 @@
 use std::path::{Path, PathBuf};
 
 /// Open `folder` and select every file in `files` (all must sit in `folder`).
+/// Runs on its own thread: the shell call can block for seconds and froze the UI.
+/// Falls back to `explorer /select` for the first file if the shell call fails.
 #[cfg(windows)]
 pub fn select_in_folder(folder: &Path, files: &[PathBuf]) -> bool {
+    let (folder, files) = (folder.to_path_buf(), files.to_vec());
+    std::thread::spawn(move || {
+        if !select_now(&folder, &files) {
+            if let Some(f) = files.first() {
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", f.display())).spawn();
+            }
+        }
+    });
+    true
+}
+
+#[cfg(windows)]
+fn select_now(folder: &Path, files: &[PathBuf]) -> bool {
     use std::{ffi::c_void, os::windows::ffi::OsStrExt};
     type Pidl = *mut c_void;
     #[link(name = "shell32")]

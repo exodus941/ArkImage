@@ -44,7 +44,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("delete", "Delete"),
     ("pageselect", "Select Image"),
     ("reveal", "Show in Explorer"),
-    ("reveal_all", "Select All Open Images in Explorer"),
+    ("reveal_all", "Select Open Images from Same Folder in Explorer"),
 ];
 
 pub fn label(id: &str) -> &'static str {

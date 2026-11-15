@@ -182,7 +182,8 @@ pub fn message_card(c: &mut Canvas, t: &mut Text, sf: f32, lines: &[String], at:
         let f = if i == 0 { Face::Title } else { Face::Regular };
         w = w.max(width(t, f, l, bpx));
     }
-    let w = (w + 2.0 * d(PAD)).min(max_w).round();
+    // ceil, never round: rounding down left the text 0.5 px short, and fit_middle cut it.
+    let w = (w + 2.0 * d(PAD)).ceil().min(max_w);
     let h = (2.0 * d(PAD) + lines.len() as f32 * blh + if lines.len() > 1 { d(4.0) } else { 0.0 }).round();
     let (x, y) = match at {
         None => (((c.w as f32 - w) / 2.0).round(), ((c.h as f32 - h) / 2.0).round()),
@@ -260,5 +261,30 @@ pub fn help_card(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, rows: &[(St
         line(c, t, Face::Mono, x0, top, k, (d(LABEL.0), blh), ACCENT);
         line(c, t, Face::Regular, x0 + kw + d(KV_GAP), top, a, (bpx, blh), SLATE200);
         top += blh + d(ROW_GAP);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The error card must fit its own text: no middle cut when the window has room.
+    #[test]
+    fn message_card_fits_its_text() {
+        let mut t = Text::load().unwrap();
+        let lines = ["Can't open the image file".to_string(), "arkimg.svg".into(), "The image format could not be determined".into()];
+        for sf in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let d = |v: f32| v * sf;
+            let bpx = d(BODY.0);
+            let mut w: f32 = 0.0;
+            for (i, l) in lines.iter().enumerate() {
+                w = w.max(width(&mut t, if i == 0 { Face::Title } else { Face::Regular }, l, bpx));
+            }
+            let w = (w + 2.0 * d(PAD)).ceil();
+            for (i, l) in lines.iter().enumerate() {
+                let f = if i == 0 { Face::Title } else { Face::Regular };
+                assert_eq!(&fit_middle(&mut t, f, l, bpx, w - 2.0 * d(PAD)), l, "sf {sf}");
+            }
+        }
     }
 }

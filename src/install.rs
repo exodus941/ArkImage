@@ -89,7 +89,7 @@ mod reg {
             k.create_subkey("shell\\open\\command")?.0.set_value("", &open)?;
         }
         // "Open with" list for each extension
-        let exts: Vec<(&str, &str)> = IMAGE_EXTS.iter().map(|e| (*e, PROG_IMAGE)).chain(ARCHIVE_EXTS.iter().map(|e| (*e, PROG_ARCHIVE))).collect();
+        let exts: Vec<(&str, &str)> = IMAGE_EXTS.iter().filter(|e| !crate::source::NOT_ASSOCIATED.contains(e)).map(|e| (*e, PROG_IMAGE)).chain(ARCHIVE_EXTS.iter().map(|e| (*e, PROG_ARCHIVE))).collect();
         for (e, prog) in &exts {
             classes.create_subkey(format!(".{e}\\OpenWithProgids"))?.0.set_value(*prog, &"")?;
         }
