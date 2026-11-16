@@ -73,7 +73,20 @@ The result is `target/release/arkimage.exe`, with no DLLs beside it.
 For a release, build with `scripts/build-release.ps1`. It maps the build machine's folder
 paths out of the exe, so the file names no user or folder of the machine that built it.
 
-Test fixtures and tests:
+## Build (macOS)
+
+The macOS app's source is in [`macos/`](macos). On a Mac with Apple Silicon, build the
+app, the DMG and the updater zip with:
+
+```bash
+cd macos && scripts/build-macos.sh
+```
+
+It builds rlottie from source on first run and leaves everything in `macos/dist/`.
+
+## Tests
+
+Test fixtures and tests (Windows source, at the top of this repo):
 
 ```bash
 cargo run --example make_fixtures
