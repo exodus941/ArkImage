@@ -72,6 +72,12 @@ pub struct State<'a> {
     /// While the page track is dragged: the cursor (physical px) and how far along the
     /// track it is, 0-1. Draws the page-number pill above the cursor.
     pub page_drag: Option<(f32, f32, f32)>,
+    /// A comic-book archive is open: the reading-order button shows, blue when `rtl`.
+    pub archive: bool,
+    pub rtl: bool,
+    /// Flip buttons turn blue while their flip is on.
+    pub flip_h: bool,
+    pub flip_v: bool,
 }
 
 impl State<'_> {

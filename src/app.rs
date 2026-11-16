@@ -34,6 +34,32 @@ use crate::{
     text::Text,
 };
 
+/// Copy `old` (a full-canvas frame) into the canvas shifted `dx` px sideways; rows only,
+/// one memcpy each, so a full 3440x1440 frame moves without per-pixel work.
+fn shift_rows(c: &mut Canvas, old: &[u32], dx: i64) {
+    let w = c.w as i64;
+    if old.len() != c.buf.len() || dx.abs() >= w {
+        return;
+    }
+    let n = (w - dx.abs()) as usize;
+    let (src, dst) = if dx >= 0 { (0usize, dx as usize) } else { ((-dx) as usize, 0usize) };
+    for y in 0..c.h {
+        let row = y * c.w;
+        c.buf[row + dst..row + dst + n].copy_from_slice(&old[row + src..row + src + n]);
+    }
+}
+
+/// A slide between images: the last settled frame moves out while the new image moves in,
+/// purely sideways. `start` is set when the new image is first ready to draw.
+struct Slide {
+    old: Vec<u32>,
+    w: usize,
+    h: usize,
+    /// +1: the new image enters from the right (forward); -1: from the left.
+    dir: i32,
+    start: Option<Instant>,
+}
+
 /// Which edge of a bar menu lines up with its button.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuEdge {
@@ -357,6 +383,10 @@ pub struct App {
     show_info: bool,
     show_name: bool,
     show_help: bool,
+    /// When the hotkeys card was last shown or hidden, for its 250 ms fade.
+    help_at: Instant,
+    /// When the "Drop an image" card appeared, for its fade-in.
+    empty_at: Option<Instant>,
     slideshow: Option<(u32, Instant)>,
     mods: ModifiersState,
     cursor: (f64, f64),
@@ -383,6 +413,16 @@ pub struct App {
     /// and the high-quality resize runs PINCH_SETTLE after the last event (or when a macOS
     /// pinch ends). (Added 2026-11-16 by Claude on the Mac, for both; see the handoff.)
     pinch_at: Option<Instant>,
+    /// The image layer of the last settled frame (before the chrome), and what it showed.
+    last_frame: Vec<u32>,
+    last_key: Option<(u64, u64, u64, u64, usize, usize)>,
+    slide: Option<Slide>,
+    /// Direction of the step that caused the next go_to (wrap-around keeps it right).
+    nav_hint: Option<i32>,
+    /// The archive whose pages are reversed (right-to-left reading), if any.
+    rtl_for: Option<PathBuf>,
+    /// When the last slide frame was drawn; the next one is due 8 ms later.
+    slide_drawn: Instant,
     fullscreen: bool,
     on_top: bool,
     rng: u64,
@@ -549,6 +589,8 @@ impl App {
             show_info: false,
             show_name: false,
             show_help: false,
+            help_at: Instant::now() - Duration::from_secs(1),
+            empty_at: None,
             slideshow: None,
             mods: ModifiersState::empty(),
             cursor: (0.0, 0.0),
@@ -564,6 +606,12 @@ impl App {
             last_click: None,
             wheel_acc: 0.0,
             pinch_at: None,
+            last_frame: Vec::new(),
+            last_key: None,
+            slide: None,
+            nav_hint: None,
+            rtl_for: None,
+            slide_drawn: Instant::now(),
             fullscreen: false,
             on_top: false,
             rng: seed,
@@ -850,8 +898,24 @@ impl App {
         if pl.entries.is_empty() {
             return;
         }
+        let before = pl.index;
         pl.index = i.min(pl.entries.len() - 1);
         crate::trace(&format!("go_to {}", pl.index));
+        // slide from the last settled frame; a fast scrub keeps sliding from that one
+        let hint = self.nav_hint.take();
+        let after = self.index();
+        if self.cfg.slide_ms > 0 && after != before && !self.last_frame.is_empty() {
+            if let Some((_, _, _, _, w, h)) = self.last_key {
+                let dir = hint.unwrap_or(if after > before { 1 } else { -1 });
+                match &mut self.slide {
+                    // a slide already running the same way: keep it going and let the
+                    // newest image take the incoming place, so a fast scroll moves on
+                    // smoothly instead of restarting from the old image every step
+                    Some(s) if s.w == w && s.h == h && s.dir == dir => {}
+                    _ => self.slide = Some(Slide { old: self.last_frame.clone(), w, h, dir, start: None }),
+                }
+            }
+        }
         self.view.rotation = 0;
         self.view.flip_h = false;
         self.view.flip_v = false;
@@ -872,6 +936,7 @@ impl App {
 
     fn step(&mut self, n: isize, single: bool) {
         self.dir = if n < 0 { -1 } else { 1 };
+        self.nav_hint = Some(self.dir as i32);
         let len = self.len() as isize;
         if len == 0 {
             return;
@@ -910,7 +975,9 @@ impl App {
                 let len = self.len();
                 self.go_to(if forward { 0 } else { len.saturating_sub(1) });
             }
-            2 => self.container_step(forward),
+            // an archive is read on its own: it never moves on to another folder or archive
+            // by itself (the user can, with [ and ])
+            2 if !self.archive_open() => self.container_step(forward, false),
             _ => self.msg(if forward { "This is the last image." } else { "This is the first image." }),
         }
     }
@@ -944,13 +1011,14 @@ impl App {
         }
     }
 
-    fn container_step(&mut self, forward: bool) {
+    /// Next or previous folder; `manual` (the [ and ] keys) also steps into archives.
+    fn container_step(&mut self, forward: bool, manual: bool) {
         let Some(pl) = &self.playlist else {
             self.msg("Move Folder: Unable to navigate (Please open a file)");
             return;
         };
         let c = pl.container.clone();
-        match source::sibling(&c, forward, self.cfg.sort, self.cfg.sort_desc) {
+        match source::sibling(&c, forward, self.cfg.sort, self.cfg.sort_desc, manual) {
             Some(np) => {
                 let name = np.container.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 self.set_playlist(np);
@@ -1586,15 +1654,50 @@ impl App {
                 self.picker.draw(c, t.as_mut(), &pl.entries, pl.index, sf, &self.thumb_jobs, &mc);
             }
             *self.text.borrow_mut() = t;
+            if self.picker.bar_anim {
+                self.request_redraw();
+            }
             return;
         }
         c.fill(self.cfg.bg_color);
         self.ensure_base();
         let bg = self.cfg.bg_color;
         let checker = self.cfg.transparent_grid;
+        // a slide in progress: drop it if the window changed size, start it once the new
+        // image is ready, end it after slide_ms
+        if self.slide.as_ref().is_some_and(|s| s.w != c.w || s.h != c.h) || self.cfg.slide_ms == 0 {
+            self.slide = None;
+        }
+        let ready = self.displaying_current();
+        let mut slide_at: Option<(f64, i64)> = None;
+        if let Some(s) = &mut self.slide {
+            if s.start.is_none() && ready {
+                s.start = Some(Instant::now());
+            }
+            if let Some(t0) = s.start {
+                let t = (t0.elapsed().as_secs_f64() * 1000.0 / self.cfg.slide_ms as f64).min(1.0);
+                if t >= 1.0 {
+                    self.slide = None;
+                } else {
+                    // ease-out cubic: leaves fast, lands soft
+                    let e = 1.0 - (1.0 - t).powi(3);
+                    let w = c.w as f64;
+                    let d = s.dir as f64;
+                    slide_at = Some((d * w * (1.0 - e), (-d * w * e).round() as i64));
+                }
+            }
+        }
+        if let (Some((_, dx_old)), Some(s)) = (slide_at, &self.slide) {
+            shift_rows(c, &s.old, dx_old);
+        }
         if let Some(l) = self.compute_layout(c.w as f64, c.h as f64) {
             let base = self.base.clone().unwrap();
             let preset = self.preset();
+            if let Some((dx_new, _)) = slide_at {
+                // during the slide: sample only the visible pixels, no filters (as pinch zoom)
+                render::blit_sample(c, &base, l.ox + dx_new, l.oy, l.z, true, bg, checker);
+                self.slide_drawn = Instant::now();
+            } else {
             // Enlarged images go through the resize path too when the preset sharpens,
             // up to 4x and 40 MP; past that, per-pixel sampling (no sharpening).
             let up_sharp = preset.amount > 0 && preset.smooth() && l.z <= 4.0 && l.sw * l.sh <= 40e6;
@@ -1624,6 +1727,14 @@ impl App {
             } else {
                 render::blit_sample(c, &base, l.ox, l.oy, l.z, self.pinch_at.is_some() || self.preset().smooth(), bg, checker);
             }
+            // keep the settled image layer for the next slide (only when it changed)
+            let key = (self.base_gen as u64, l.ox.to_bits(), l.oy.to_bits(), l.z.to_bits(), c.w, c.h);
+            if self.cfg.slide_ms > 0 && ready && self.pinch_at.is_none() && self.last_key != Some(key) {
+                self.last_frame.clear();
+                self.last_frame.extend_from_slice(c.buf);
+                self.last_key = Some(key);
+            }
+            }
         } else {
             self.layout = None;
         }
@@ -1643,8 +1754,16 @@ impl App {
         let Some(mut t) = self.text.borrow_mut().take() else { return };
         let (cw, ch) = (c.w as f32, c.h as f32);
 
+        // the "Drop an image" card fades in over 250 ms when it appears
         if self.playlist.is_none() {
-            crate::ui::empty_card(c, &mut t, cw, ch, sf);
+            let at = *self.empty_at.get_or_insert_with(Instant::now);
+            let a = crate::ui::fade_amount(at, true);
+            crate::ui::faded(c, a, |c| crate::ui::empty_card(c, &mut t, cw, ch, sf));
+            if a < 1.0 {
+                self.request_redraw();
+            }
+        } else {
+            self.empty_at = None;
         }
         if self.picker.open {
             if let Some(pl) = &self.playlist {
@@ -1653,6 +1772,9 @@ impl App {
                 self.picker.draw(c, Some(&mut t), &pl.entries, pl.index, sf, &self.thumb_jobs, &mc);
             }
             *self.text.borrow_mut() = Some(t);
+            if self.picker.bar_anim {
+                self.request_redraw();
+            }
             return;
         }
         if let (Some(m), Some(e)) = (&failed, &cur) {
@@ -1704,9 +1826,16 @@ impl App {
             c.fill_rrect(x0, y0, w, h, 0.0, crate::ui::ACCENT, 0.15);
             c.stroke_rrect(x0, y0, w, h, 0.0, sf.max(1.0), crate::ui::ACCENT_LIGHT, 1.0);
         }
-        if self.show_help {
+        // the hotkeys card fades in and out over 250 ms
+        let ha = crate::ui::fade_amount(self.help_at, self.show_help);
+        if ha > 0.0 {
             let rows: Vec<(String, String)> = HELP.iter().map(|(k, a)| (k.to_string(), a.to_string())).collect();
-            crate::ui::help_card(c, &mut t, sf, "Hotkeys", &rows);
+            crate::ui::faded(c, ha, |c| crate::ui::help_card(c, &mut t, sf, "Hotkeys", &rows));
+            if ha < 1.0 {
+                self.request_redraw();
+            }
+        } else if !self.show_help && self.help_at.elapsed().as_secs_f32() < 0.3 {
+            self.request_redraw();
         }
         self.hits.clear();
         let title = self.chrome_title();
@@ -1770,6 +1899,10 @@ impl App {
             anim_speed: self.anim_speed,
             anim_fps: self.anim_fps(),
             page_drag: self.page_drag(),
+            archive: self.archive_open(),
+            rtl: self.rtl_on(),
+            flip_h: self.view.flip_h,
+            flip_v: self.view.flip_v,
         };
         // Keep the rows under a partly faded bar, draw the bar, then blend the two.
         let top_rows = ((chrome::top_zone(sf) + 2.0).ceil() as usize).min(c.h);
@@ -1928,8 +2061,8 @@ impl App {
                 Some('+') | Some('=') => return if p { self.zoom_pct(1.0) } else { self.zoom_step(true, None) },
                 Some('-') | Some('_') => return if p { self.zoom_pct(-1.0) } else { self.zoom_step(false, None) },
                 Some('*') => return self.zoom_to(1.0, None),
-                Some('[') | Some('{') => return self.container_step(false),
-                Some(']') | Some('}') => return self.container_step(true),
+                Some('[') | Some('{') => return self.container_step(false, true),
+                Some(']') | Some('}') => return self.container_step(true, true),
                 _ => {}
             }
         }
@@ -2051,6 +2184,7 @@ impl App {
             K::F5 => self.open_settings(el, 0),
             K::F1 => {
                 self.show_help = !self.show_help;
+                self.help_at = Instant::now();
                 self.request_redraw();
             }
             K::KeyA if p => {
@@ -2075,6 +2209,7 @@ impl App {
             K::Escape => {
                 if self.show_help {
                     self.show_help = false;
+                    self.help_at = Instant::now();
                     self.request_redraw();
                 } else if self.fullscreen {
                     self.toggle_fullscreen();
@@ -2248,6 +2383,10 @@ impl App {
                 self.show_menu_above(el, kind, x, y, edge, 0.0);
             }
             "bar_open" => self.open_dialog(),
+            "bar_grid" => self.open_picker(),
+            "bar_fliph" => self.menu_action(el, "fliph"),
+            "bar_flipv" => self.menu_action(el, "flipv"),
+            "bar_rtl" => self.toggle_rtl(),
             "bar_slider" => {
                 self.slider_drag = true;
                 self.slider_seek();
@@ -2349,7 +2488,7 @@ impl App {
                 I("reveal".into(), if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in Windows Explorer" }.into(), "Ctrl+Enter", has),
                 I("reveal_all".into(), if cfg!(target_os = "macos") { "Show Open Images from Same Folder in Finder" } else { "Select Open Images from Same Folder in Explorer" }.into(), "", has),
                 S,
-                // every preset, the three with hotkeys first (U, I, S)
+                // every preset in one list, the three with hotkeys first (U, I, S)
                 Sub("Filters".into(), {
                     let keys = ["U", "I", "S"];
                     let mut v: Vec<MenuEntry> = crate::filters::all(&cfg.filter_presets)
@@ -2357,7 +2496,6 @@ impl App {
                         .enumerate()
                         .map(|(i, p)| C(format!("f{i}"), p.name, keys.get(i).copied().unwrap_or(""), cfg.filter as usize == i))
                         .collect();
-                    v.insert(3, S);
                     v.push(S);
                     v.push(I("fedit".into(), "Edit Filters...".into(), "", true));
                     v
@@ -2399,12 +2537,17 @@ impl App {
                     I("zin1".into(), "Zoom In (1%)".into(), "Ctrl++", has),
                     I("zout1".into(), "Zoom Out (1%)".into(), "Ctrl+-", has),
                 ]),
-                Sub("Rotate".into(), vec![
+                Sub("Rotate/Flip".into(), vec![
                     C("rot0".into(), "Do Not Rotate".into(), "Alt+Up", v.rotation == 0),
                     C("rotl".into(), "Rotate 90° Counter-Clockwise".into(), "Alt+Left", v.rotation == 3),
                     C("rotr".into(), "Rotate 90° Clockwise".into(), "Alt+Right", v.rotation == 1),
                     C("rot180".into(), "Rotate 180°".into(), "Alt+Down", v.rotation == 2),
+                    S,
+                    C("fliph".into(), "Flip Horizontal".into(), "Ctrl+M", v.flip_h),
+                    C("flipv".into(), "Flip Vertical".into(), "Ctrl+F", v.flip_v),
                 ]),
+                // on: 250 ms; off: none
+                C("slide_toggle".into(), "Slide Animation".into(), "", cfg.slide_ms > 0),
                 S,
                 C("info".into(), "File/EXIF Information".into(), "Tab", self.show_info),
                 I("delete".into(), "Delete".into(), "Del", has),
@@ -3011,9 +3154,36 @@ impl App {
         }
     }
 
+    /// True when the open playlist is a comic-book archive.
+    fn archive_open(&self) -> bool {
+        self.playlist.as_ref().is_some_and(|p| source::is_archive(&p.container))
+    }
+
+    /// True when the open archive reads right to left (its pages reversed).
+    fn rtl_on(&self) -> bool {
+        self.playlist.as_ref().is_some_and(|p| self.rtl_for.as_deref() == Some(p.container.as_path()))
+    }
+
+    /// Reverse the open archive's pages, keeping the current page shown.
+    fn toggle_rtl(&mut self) {
+        if !self.archive_open() {
+            return;
+        }
+        let on = self.rtl_on();
+        let Some(pl) = &mut self.playlist else { return };
+        pl.entries.reverse();
+        pl.index = pl.entries.len().saturating_sub(1) - pl.index.min(pl.entries.len().saturating_sub(1));
+        self.rtl_for = if on { None } else { Some(pl.container.clone()) };
+        self.request_redraw();
+    }
+
     fn resort(&mut self) {
         let Some(pl) = &self.playlist else { return };
         let c = pl.container.clone();
+        // an archive keeps its page order (and its reading direction) whatever the sort
+        if source::is_archive(&c) {
+            return;
+        }
         let cur = self.cur_entry();
         if let Ok(mut np) = source::open(&c, self.cfg.sort, self.cfg.sort_desc) {
             if let Some(i) = cur.and_then(|e| np.entries.iter().position(|x| *x == e)) {
@@ -3052,6 +3222,11 @@ impl App {
         }
         if let Some(q) = id.strip_prefix("spd:").and_then(|q| q.parse::<u32>().ok()) {
             self.set_anim_speed(q as f32 / 4.0);
+            return;
+        }
+        if id == "slide_toggle" {
+            self.cfg.slide_ms = if self.cfg.slide_ms > 0 { 0 } else { 250 };
+            self.cfg.save();
             return;
         }
         if let Some(n) = id.strip_prefix("ss:") {
@@ -3097,8 +3272,8 @@ impl App {
             "prev10" => self.step(-10, true),
             "rnext" => self.random(),
             "rprev" => self.random_back(),
-            "nextdir" => self.container_step(true),
-            "prevdir" => self.container_step(false),
+            "nextdir" => self.container_step(true, true),
+            "prevdir" => self.container_step(false, true),
             "neg" => {
                 self.view.negative = !self.view.negative;
                 self.invalidate();
@@ -3572,6 +3747,14 @@ impl App {
             }
             WindowEvent::CursorMoved { position, .. } if self.picker.open => {
                 self.cursor = (position.x, position.y);
+                // the handle lights up under the cursor (250 ms fade)
+                let (cx, cy) = (position.x as f32, position.y as f32);
+                let hot = self.picker_bar().is_some_and(|b| b.hit(cx, cy, self.sf()));
+                if hot != self.picker.bar_hot && self.picker.bar_drag.is_none() {
+                    self.picker.bar_hot = hot;
+                    self.picker.bar_hot_at = Some(Instant::now());
+                    self.request_redraw();
+                }
                 // dragging the scroll handle: keep the grab point under the cursor
                 if let Some(grab) = self.picker.bar_drag {
                     if let Some(b) = self.picker_bar() {
@@ -3906,7 +4089,23 @@ impl App {
                 self.request_redraw();
             }
         }
-        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end]
+        // 250 ms card and handle fades: one frame every 16 ms while any runs (a redraw asked
+        // for inside a draw is dropped on Windows, so the fades are paced from here)
+        let fading = self.picker.bar_anim
+            || self.help_at.elapsed() < Duration::from_millis(260)
+            || self.empty_at.is_some_and(|t| t.elapsed() < Duration::from_millis(260))
+            || self.modal_at.is_some_and(|t| t.elapsed() < Duration::from_millis(260));
+        let ui_at = fading.then(|| self.fade_last + Duration::from_millis(16));
+        if ui_at.is_some_and(|t| now >= t) {
+            self.fade_last = now;
+            self.request_redraw();
+        }
+        // a running slide: one frame every 8 ms until it ends
+        let slide_at = self.slide.as_ref().and_then(|s| s.start).map(|_| self.slide_drawn + Duration::from_millis(8));
+        if slide_at.is_some_and(|t| now >= t) {
+            self.request_redraw();
+        }
+        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at]
             .into_iter()
             .flatten()
             .min()

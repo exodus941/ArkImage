@@ -5,54 +5,69 @@
 
 use super::*;
 
-/// Icon centres along the centred row, design px from the row's left edge; 32 px apart.
-/// open, menu | EXIF, full screen, view, edit, copy to |
-/// zoom in, zoom out | rotate L, rotate R | lock | prev, next.
-/// The second section is the old top toolbar, icon-only. (Moved here from the top toolbar 2026-11-16 by Claude on the Mac, for Windows and macOS; see docs/windows-handoff.md.)
-const ROW_W: f32 = 528.0;
-const X_OPEN: f32 = 16.0;
-const X_MENU: f32 = 48.0;
-const X_SEP1: f32 = 72.0;
-const X_EXIF: f32 = 96.0;
-const X_FULL: f32 = 128.0;
-const X_VIEW: f32 = 160.0;
-const X_EDIT: f32 = 192.0;
-const X_COPY: f32 = 224.0;
-const X_SEP2: f32 = 248.0;
-const X_ZIN: f32 = 272.0;
-const X_ZOUT: f32 = 304.0;
-const X_SEP3: f32 = 328.0;
-const X_ROTL: f32 = 352.0;
-const X_ROTR: f32 = 384.0;
-const X_SEP4: f32 = 408.0;
-const X_LOCK: f32 = 432.0;
-const X_SEP5: f32 = 456.0;
-const X_PREV: f32 = 480.0;
-const X_NEXT: f32 = 512.0;
+/// The icon row, laid out from `row()`: buttons 32 px apart, a separator 24 px after a
+/// button and 24 px before the next. open, select image, menu | EXIF, full screen, view,
+/// edit, copy to | zoom in, zoom out | rotate L, rotate R, flip H, flip V | lock |
+/// prev, [reading order, archives only], next.
+const STEP: f32 = 32.0;
+const SEP_GAP: f32 = 24.0;
+
+/// Button centres and separator positions (design px from the row's left edge), and the row width.
+fn layout(s: &State) -> (Vec<(&'static str, f32, Icon, &'static str)>, Vec<f32>, f32) {
+    let mut x = 16.0;
+    let mut first = true;
+    let (mut buttons, mut seps) = (Vec::new(), Vec::new());
+    for (id, icon, tip) in row(s) {
+        if id.is_empty() {
+            seps.push(x + SEP_GAP);
+            x += 2.0 * SEP_GAP - STEP;
+            continue;
+        }
+        if !first {
+            x += STEP;
+        }
+        first = false;
+        buttons.push((id, x, icon, tip));
+    }
+    (buttons, seps, x + 16.0)
+}
 
 /// Tooltip: 12 px text, 8 px side padding, 24 px tall, radius 8, 8 px above the hover plate.
 const TIP_H: f32 = 24.0;
 const TIP_PAD: f32 = 8.0;
 const TIP_GAP: f32 = 8.0;
 
-/// Every button of the row: id, centre, icon, tooltip.
-fn row(s: &State) -> [(&'static str, f32, Icon, &'static str); 14] {
-    [
-        ("bar_open", X_OPEN, Icon::Eject, "Open File"),
-        ("bar_menu", X_MENU, Icon::Menu, "Menu"),
-        ("tb_exif", X_EXIF, Icon::Camera, "File and EXIF Info"),
-        ("tb_full", X_FULL, Icon::ArrowsMaximize, "Full Screen"),
-        ("tb_view", X_VIEW, Icon::Eye, "View"),
-        ("tb_edit", X_EDIT, Icon::Pencil, "Edit"),
-        ("tb_copyto", X_COPY, Icon::Copy, "Copy to"),
-        ("bar_zin", X_ZIN, Icon::Plus, "Zoom In"),
-        ("bar_zout", X_ZOUT, Icon::Minus, "Zoom Out"),
-        ("bar_rotl", X_ROTL, Icon::RotateLeft, "Rotate Left"),
-        ("bar_rotr", X_ROTR, Icon::RotateRight, "Rotate Right"),
-        ("bar_lock", X_LOCK, if s.lock_bottom { Icon::Lock } else { Icon::LockOpen }, if s.lock_bottom { "Unlock the Bar" } else { "Keep the Bar Visible" }),
-        ("bar_prev", X_PREV, Icon::ChevronLeft, "Previous Image"),
-        ("bar_next", X_NEXT, Icon::ChevronRight, "Next Image"),
-    ]
+/// Every item of the row in order: id, icon, tooltip; an empty id is a separator.
+fn row(s: &State) -> Vec<(&'static str, Icon, &'static str)> {
+    let sep = ("", Icon::Close, "");
+    let mut v = vec![
+        ("bar_open", Icon::Eject, "Open File"),
+        ("bar_grid", Icon::LayoutGrid, "Select Image"),
+        ("bar_menu", Icon::Menu, "Menu"),
+        sep,
+        ("tb_exif", Icon::Camera, "File and EXIF Info"),
+        ("tb_full", Icon::ArrowsMaximize, "Full Screen"),
+        ("tb_view", Icon::Eye, "View"),
+        ("tb_edit", Icon::Pencil, "Edit"),
+        ("tb_copyto", Icon::Copy, "Copy to"),
+        sep,
+        ("bar_zin", Icon::Plus, "Zoom In"),
+        ("bar_zout", Icon::Minus, "Zoom Out"),
+        sep,
+        ("bar_rotl", Icon::RotateLeft, "Rotate Left"),
+        ("bar_rotr", Icon::RotateRight, "Rotate Right"),
+        ("bar_fliph", Icon::FlipH, "Flip Horizontal"),
+        ("bar_flipv", Icon::FlipV, "Flip Vertical"),
+        sep,
+        ("bar_lock", if s.lock_bottom { Icon::Lock } else { Icon::LockOpen }, if s.lock_bottom { "Unlock the Bar" } else { "Keep the Bar Visible" }),
+        sep,
+        ("bar_prev", Icon::ChevronLeft, "Previous Image"),
+    ];
+    if s.archive {
+        v.push(("bar_rtl", Icon::TextRtl, if s.rtl { "Left-to-Right Order" } else { "Right-to-Left Order" }));
+    }
+    v.push(("bar_next", Icon::ChevronRight, "Next Image"));
+    v
 }
 /// Row centre below the bar top: 16 inset + 12 slider + 16 gap + 12 (half the 24 px row).
 const ROW_Y: f32 = 56.0;
@@ -90,11 +105,15 @@ pub(super) fn draw_bottom(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, h
     let vh = (8.0 * sf).round();
     let vy = sy + ((sh - vh) / 2.0).round();
     c.fill_rrect(sx, vy, sw, vh, vh / 2.0, 0xFFFFFF, 0.14);
-    let frac = if s.len > 1 { (s.index + 1) as f32 / s.len as f32 } else { 1.0 };
+    // right to left the pages are reversed, so page 1 sits at the right end and the
+    // fill grows leftwards as reading advances (index falling)
+    let frac = if s.len <= 1 { 1.0 } else if s.rtl { (s.len - s.index) as f32 / s.len as f32 } else { (s.index + 1) as f32 / s.len as f32 };
     let fw = (frac * sw).max(vh);
     // 40% at rest, 56% under the cursor (was 62 / 82: too bright)
     let a = 0.40 + 0.16 * s.hover_amt("bar_slider");
-    c.fill_rrect(sx, vy, fw, vh, vh / 2.0, 0xFFFFFF, a);
+    // right-to-left reading fills from the right end
+    let fx = if s.rtl { sx + sw - fw } else { sx };
+    c.fill_rrect(fx, vy, fw, vh, vh / 2.0, 0xFFFFFF, a);
     hits.push(Hit { x0: sx - 8.0 * sf, y0: sy - 8.0 * sf, x1: sx + sw + 8.0 * sf, y1: sy + sh + 8.0 * sf, id: "bar_slider" });
 
     // Added 2026-11-16 by Claude on the Mac, for Windows and macOS (see docs/windows-handoff.md).
@@ -159,7 +178,8 @@ pub(super) fn draw_bottom(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, h
     }
 
     // icon row, centred; Tabler icons, 20 px
-    let ox = (bx + bw / 2.0 - ROW_W * sf / 2.0).round();
+    let (buttons, seps, row_w) = layout(s);
+    let ox = (bx + bw / 2.0 - row_w * sf / 2.0).round();
     let at = |d: f32| ox + d * sf;
     let cy = (by + ROW_Y * sf).round();
     let isz = ICON_PX * sf;
@@ -174,16 +194,19 @@ pub(super) fn draw_bottom(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, h
         icons::draw(c, icon, x, cy, isz, col);
         hits.push(Hit { x0: x - p / 2.0, y0: cy - p / 2.0, x1: x + p / 2.0, y1: cy + p / 2.0, id });
     };
-    for sep in [X_SEP1, X_SEP2, X_SEP3, X_SEP4, X_SEP5] {
+    for &sep in &seps {
         c.rect_alpha(at(sep) as i32, (cy - 8.0 * sf) as i32, sf.max(1.0) as i32, (16.0 * sf) as i32, 0xFFFFFF, 60);
     }
     // lock: closed and blue while the bar is locked, open otherwise; EXIF blue while its
     // panel shows
     let blue = |id: &str| mix(BLUE, 0xFFFFFF, (s.hover_amt(id) * 96.0) as u32);
-    for (id, off, icon, _) in row(s).into_iter().filter(|b| !b.0.is_empty()) {
+    for &(id, off, icon, _) in &buttons {
         let col = match id {
             "bar_lock" if s.lock_bottom => blue(id),
             "tb_exif" if s.info_on => blue(id),
+            "bar_fliph" if s.flip_h => blue(id),
+            "bar_flipv" if s.flip_v => blue(id),
+            "bar_rtl" if s.rtl => blue(id),
             _ => col_for(id),
         };
         button(c, id, at(off), icon, col);
@@ -191,7 +214,7 @@ pub(super) fn draw_bottom(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, h
     // tooltips over the hovered buttons, 8 px above the plate, inside the window
     let Some(t) = t else { return };
     let prev = t.face(crate::text::Face::Medium);
-    for (id, off, _, tip) in row(s).into_iter().filter(|b| !b.0.is_empty()) {
+    for &(id, off, _, tip) in &buttons {
         let a = s.tip_amt(id);
         if a <= 0.0 {
             continue;
@@ -211,7 +234,9 @@ pub(super) fn draw_bottom(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, h
     // centred over the cursor, at the right end its right edge is 8 px left of it
     if let Some((px0, py0, f)) = s.page_drag {
         t.face(crate::text::Face::Mono);
-        let label = page_label(s.index + 1, s.len);
+        // the reading page: right to left the list is reversed
+        let page = if s.rtl { s.len - s.index } else { s.index + 1 };
+        let label = page_label(page, s.len);
         let px = 12.0 * sf;
         let w = (t.width(&label, px) + 2.0 * TIP_PAD * sf).round();
         let h = (TIP_H * sf).round();

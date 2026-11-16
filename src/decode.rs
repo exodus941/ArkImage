@@ -370,7 +370,7 @@ mod tests {
             assert_eq!((d.orig_w, d.orig_h), (300, 450), "{arc}");
             assert_eq!(d.frames[0].img.get_pixel(5, 100).0, [200, 50, 200, 255], "{arc}");
         }
-        let sib = crate::source::sibling(Path::new("tests/fixtures/set_a").canonicalize().as_deref().unwrap_or(dir), true, 0, false);
+        let sib = crate::source::sibling(Path::new("tests/fixtures/set_a").canonicalize().as_deref().unwrap_or(dir), true, 0, false, true);
         assert!(sib.is_some());
     }
 }
