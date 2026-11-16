@@ -476,6 +476,9 @@ pub struct App {
     /// macOS: open the next popup above its control, this many physical px wide (speed menu).
     #[cfg(target_os = "macos")]
     popup_select: Option<(f64, bool)>,
+    /// The next popup is a dropdown of this width (physical px): macOS opens it under the
+    /// field, exactly as wide.
+    below_w: Option<f64>,
     /// The next popup is a right-click menu: macOS places it at the pointer.
     at_pointer: bool,
     /// A preset's name before renaming started (Esc puts it back).
@@ -663,6 +666,7 @@ impl App {
             popup_closed: None,
             #[cfg(target_os = "macos")]
             popup_select: None,
+            below_w: None,
             at_pointer: false,
             rename_orig: None,
             hover_fx: Vec::new(),
@@ -2687,6 +2691,7 @@ impl App {
             // a dropped opener must not leave its placement for the next menu, or a later
             // right-click opens above and beside the cursor as if over the button
             self.popup_select = None;
+            self.below_w = None;
             return;
         }
         self.popup_show(el, w, items, x, y);
@@ -2712,9 +2717,15 @@ impl App {
                     match self.popup_select.take() {
                         // a pop-up button: the chosen item opens over the control
                         Some((pw, left)) => crate::mac::popup_over(menu.ns_menu(), h.ns_view.as_ptr() as _, x as f64 / w.scale_factor(), y as f64 / w.scale_factor(), pw / w.scale_factor(), left),
+                        None if self.below_w.is_some() => {
+                            let bw = self.below_w.take().unwrap_or(0.0);
+                            let sf = w.scale_factor();
+                            crate::mac::menu_below(menu.ns_menu(), h.ns_view.as_ptr() as _, x as f64 / sf, y as f64 / sf, bw / sf);
+                        }
                         None if self.at_pointer => crate::mac::context_menu_at_pointer(menu.ns_menu(), h.ns_view.as_ptr() as _),
                         None => {
-                            menu.show_context_menu_for_nsview(h.ns_view.as_ptr() as _, Some(pos));
+                            let _ = pos;
+                            crate::mac::menu_below(menu.ns_menu(), h.ns_view.as_ptr() as _, x as f64 / w.scale_factor(), y as f64 / w.scale_factor(), 0.0);
                         }
                     }
                 },
@@ -2730,6 +2741,13 @@ impl App {
     /// For the ARKIMAGE_TEST_SETTINGS hook.
     pub fn test_open_settings(&mut self, el: &ActiveEventLoop) {
         self.open_settings(el, 0);
+    }
+
+    /// For the ARKIMAGE_TEST_CHOICE hook: open the first dropdown in Settings.
+    pub fn test_choice(&mut self, el: &ActiveEventLoop) {
+        if let Some(a) = self.settings.as_ref().and_then(|s| s.first_choice()) {
+            self.settings_act(el, a);
+        }
     }
 
     fn open_settings(&mut self, el: &ActiveEventLoop, tab: usize) {
@@ -3013,7 +3031,10 @@ impl App {
             Act::Swatch(c) => self.cfg.bg_color = c,
             Act::Clear(f) => f.set(&mut self.cfg, String::new()),
             Act::Choice(f) => {
-                let Some((x, y, w)) = self.settings.as_ref().and_then(|s| s.anchor(a).map(|(x, y)| (x, y, s.window.clone()))) else { return };
+                let Some((x, y, w)) = self.settings.as_ref().and_then(|s| s.anchor(a).map(|(x, y, bw)| (x, y, bw, s.window.clone()))).map(|(x, y, bw, w)| {
+                    self.below_w = Some(bw as f64);
+                    (x, y, w)
+                }) else { return };
                 let cur = f.get(&self.cfg);
                 let items = f
                     .options(&self.cfg)
@@ -3050,7 +3071,10 @@ impl App {
             }
             Act::KeyAction(i) | Act::MouseAction(i) => {
                 let key = matches!(a, Act::KeyAction(_));
-                let Some((x, y, w)) = self.settings.as_ref().and_then(|s| s.anchor(a).map(|(x, y)| (x, y, s.window.clone()))) else { return };
+                let Some((x, y, w)) = self.settings.as_ref().and_then(|s| s.anchor(a).map(|(x, y, bw)| (x, y, bw, s.window.clone()))).map(|(x, y, bw, w)| {
+                    self.below_w = Some(bw as f64);
+                    (x, y, w)
+                }) else { return };
                 let cur = if key { &self.cfg.keys[i].action } else { &self.cfg.mouse[i].action };
                 let cur = crate::bindings::index(cur);
                 let items = crate::bindings::ACTIONS

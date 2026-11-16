@@ -145,13 +145,43 @@ pub unsafe fn popup_over(menu: *mut std::ffi::c_void, view: *mut std::ffi::c_voi
         let flipped: bool = msg_send![view, isFlipped];
         let frame: NSRect = msg_send![view, frame];
         // the menu hangs down from the location, so lift it by its own height plus 4 px
-        let top = y - 4.0 - size.height;
+        // AppKit draws the top MENU_TOP_INSET above the point asked for
+        let top = y - 4.0 - size.height + MENU_TOP_INSET;
         let ly = if flipped { top } else { frame.size.height - top };
+        if std::env::var_os("ARKIMAGE_MENU_LOG").is_some() {
+            eprintln!("popup_over x={x} y={y} w={w} menu_h={} view_h={}", size.height, frame.size.height);
+        }
         let at = objc2_foundation::NSPoint::new(if left { x } else { x + w - size.width.max(w) }, ly);
         let none: *mut AnyObject = std::ptr::null_mut();
         let _: bool = msg_send![menu, popUpMenuPositioningItem: none, atLocation: at, inView: view];
     }
 }
+
+/// A dropdown under its field: exactly the field's width, its top 2 pt below the field's
+/// bottom edge (x, y, w: logical px from the view's top-left). AppKit draws the menu's
+/// frame a few points above the requested point; the measured offset is added back.
+pub unsafe fn menu_below(menu: *mut std::ffi::c_void, view: *mut std::ffi::c_void, x: f64, y: f64, w: f64) {
+    const GAP: f64 = 2.0;
+    let (menu, view) = (menu as *mut AnyObject, view as *mut AnyObject);
+    if menu.is_null() || view.is_null() {
+        return;
+    }
+    unsafe {
+        let _: () = msg_send![menu, setMinimumWidth: w];
+        let flipped: bool = msg_send![view, isFlipped];
+        let frame: NSRect = msg_send![view, frame];
+        let top = y + GAP + MENU_TOP_INSET;
+        let ly = if flipped { top } else { frame.size.height - top };
+        if std::env::var_os("ARKIMAGE_MENU_LOG").is_some() {
+            eprintln!("menu_below field_left={x} field_bottom={y} w={w} flipped={flipped} view_h={}", frame.size.height);
+        }
+        let none: *mut AnyObject = std::ptr::null_mut();
+        let _: bool = msg_send![menu, popUpMenuPositioningItem: none, atLocation: objc2_foundation::NSPoint::new(x, ly), inView: view];
+    }
+}
+
+/// How far above the requested point AppKit puts a menu's top edge, in points.
+const MENU_TOP_INSET: f64 = 5.0; // measured 2026-11-16: 448 asked 453
 
 /// A context menu at the pointer, placed by AppKit as Finder does: beside the pointer,
 /// flipped up or left to stay on screen, with no scroll arrows unless it is taller than

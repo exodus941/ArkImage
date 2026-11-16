@@ -480,9 +480,14 @@ impl Dialog {
         self.hits.iter().rev().find(|h| x >= h.x0 && x < h.x1 && y >= h.y0 && y < h.y1).map(|h| h.act)
     }
 
-    /// Where a choice box sits, for placing its popup menu (physical px, bottom-left).
-    pub fn anchor(&self, act: Act) -> Option<(f32, f32)> {
-        self.hits.iter().find(|h| h.act == act).map(|h| (h.x0, h.y1))
+    /// Where a choice box sits, for placing its popup menu (physical px: left, bottom, width).
+    pub fn anchor(&self, act: Act) -> Option<(f32, f32, f32)> {
+        self.hits.iter().find(|h| h.act == act).map(|h| (h.x0, h.y1, h.x1 - h.x0))
+    }
+
+    /// For the ARKIMAGE_TEST_CHOICE hook: the first choice box.
+    pub fn first_choice(&self) -> Option<Act> {
+        self.hits.iter().find(|h| matches!(h.act, Act::Choice(_))).map(|h| h.act)
     }
 
     pub fn render(&mut self, cfg: &Config, text: Option<&mut Text>) {

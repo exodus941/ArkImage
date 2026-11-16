@@ -68,7 +68,7 @@ impl Master {
             last_session: Vec::new(),
             last_save: Instant::now(),
             crash_at,
-            speed_menu_at: std::env::var_os("ARKIMAGE_TEST_SPEED_MENU").or(std::env::var_os("ARKIMAGE_TEST_PICKER")).or(std::env::var("ARKIMAGE_TEST_FULLSCREEN").ok().filter(|v| v == "3").map(Into::into)).map(|_| Instant::now() + Duration::from_secs(3)),
+            speed_menu_at: std::env::var_os("ARKIMAGE_TEST_SPEED_MENU").or(std::env::var_os("ARKIMAGE_TEST_CHOICE")).or(std::env::var_os("ARKIMAGE_TEST_CLICK")).or(std::env::var_os("ARKIMAGE_TEST_PICKER")).or(std::env::var("ARKIMAGE_TEST_FULLSCREEN").ok().filter(|v| v == "3").map(Into::into)).map(|_| Instant::now() + Duration::from_secs(3)),
             hang_at,
         };
         if m.restore.is_empty() {
@@ -365,7 +365,14 @@ impl ApplicationHandler<UserEvent> for Master {
                     w.test_fullscreen(false);
                 }
             } else {
-                let id = if std::env::var_os("ARKIMAGE_TEST_PICKER").is_some() { "picker" } else { "anim_speed" };
+                if std::env::var_os("ARKIMAGE_TEST_CHOICE").is_some() {
+                    if let Some(w) = self.windows.first_mut() {
+                        w.test_choice(el);
+                    }
+                    return;
+                }
+                let click = std::env::var("ARKIMAGE_TEST_CLICK").ok().map(|v| &*Box::leak(v.into_boxed_str()));
+                let id = if let Some(c) = click { c } else if std::env::var_os("ARKIMAGE_TEST_PICKER").is_some() { "picker" } else { "anim_speed" };
                 if let Some(w) = self.windows.first_mut() {
                     w.test_click(el, id);
                 }
