@@ -2620,6 +2620,29 @@ impl App {
         self.popup_closed = Some((Instant::now(), opener.to_string(), false));
     }
 
+    /// A settings field's menu: top edge 2 px under the field, right edge on the field's
+    /// right edge (x, y: the field's bottom-right, physical px).
+    fn popup_field(&mut self, el: &ActiveEventLoop, w: &Arc<Window>, items: Vec<MenuEntry>, x: f32, y: f32, opener: &str) {
+        #[cfg(windows)]
+        {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if self.popup_closed.as_ref().is_some_and(|(t, o, _)| o == opener && t.elapsed() < Duration::from_millis(300)) {
+                return;
+            }
+            let Ok(h) = w.window_handle() else { return };
+            let RawWindowHandle::Win32(h) = h.as_raw() else { return };
+            let gap = (2.0 * w.scale_factor() as f32).round();
+            let chosen = crate::popup_win::show_below(h.hwnd.get(), items, x as i32, (y + gap) as i32, crate::popup_win::Edge::Right);
+            self.popup_closed = Some((Instant::now(), opener.to_string(), false));
+            if let Some(id) = chosen {
+                self.menu_action(el, &id);
+            }
+            self.request_redraw();
+        }
+        #[cfg(not(windows))]
+        self.popup(el, w, items, x, y, opener);
+    }
+
     fn popup_show(&mut self, el: &ActiveEventLoop, w: &Arc<Window>, items: Vec<MenuEntry>, x: f32, y: f32) {
         use muda::ContextMenu;
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -2942,7 +2965,7 @@ impl App {
                     .map(|(i, o)| MenuEntry::Check(format!("cfgopt:{i}"), o.to_string(), "", i as u8 == cur))
                     .collect();
                 self.pending_choice = Some(f);
-                self.popup(el, &w, items, x, y, &format!("{a:?}"));
+                self.popup_field(el, &w, items, x, y, &format!("{a:?}"));
                 self.settings_redraw();
                 return;
             }
@@ -2979,7 +3002,7 @@ impl App {
                     .map(|(k, (_, lbl))| MenuEntry::Check(format!("bindopt:{k}"), lbl.to_string(), "", k == cur))
                     .collect();
                 self.pending_bind = Some((key, i));
-                self.popup(el, &w, items, x, y, &format!("{a:?}"));
+                self.popup_field(el, &w, items, x, y, &format!("{a:?}"));
                 self.settings_redraw();
                 return;
             }

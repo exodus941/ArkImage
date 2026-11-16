@@ -80,6 +80,15 @@ fn pad(s: String, min_w: usize) -> String {
 /// `min_chars` pads every label to that many figure-width characters (0: none).
 /// Returns the chosen id.
 pub fn show_above(hwnd: Hwnd, items: Vec<MenuEntry>, x: i32, y: i32, edge: Edge, min_chars: usize) -> Option<String> {
+    show(hwnd, items, x, y, edge, min_chars, true)
+}
+
+/// Show `items` with the menu's top edge on (x, y) client px of `hwnd` and its `edge` there.
+pub fn show_below(hwnd: Hwnd, items: Vec<MenuEntry>, x: i32, y: i32, edge: Edge) -> Option<String> {
+    show(hwnd, items, x, y, edge, 0, false)
+}
+
+fn show(hwnd: Hwnd, items: Vec<MenuEntry>, x: i32, y: i32, edge: Edge, min_chars: usize, above: bool) -> Option<String> {
     unsafe {
         let m = CreatePopupMenu();
         if m.is_null() {
@@ -90,9 +99,32 @@ pub fn show_above(hwnd: Hwnd, items: Vec<MenuEntry>, x: i32, y: i32, edge: Edge,
         let mut p = Point { x, y };
         ClientToScreen(hwnd, &mut p);
         SetForegroundWindow(hwnd);
-        let align = TPM_BOTTOMALIGN | TPM_RETURNCMD | if edge == Edge::Right { TPM_RIGHTALIGN } else { 0 };
+        let align = if above { TPM_BOTTOMALIGN } else { 0 } | TPM_RETURNCMD | if edge == Edge::Right { TPM_RIGHTALIGN } else { 0 };
         let cmd = TrackPopupMenu(m, align, p.x, p.y, 0, hwnd, std::ptr::null());
         DestroyMenu(m);
         (cmd > 0).then(|| ids.get(cmd as usize - 1).cloned()).flatten()
+    }
+}
+
+/// Dark Win32 menus for the whole process: uxtheme ordinal 135 is SetPreferredAppMode
+/// (2 = ForceDark), ordinal 136 is FlushMenuThemes. Undocumented, present since Windows 10 1903;
+/// a missing export leaves the menus light.
+pub fn dark_menus() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(n: *const u16) -> isize;
+        fn GetProcAddress(m: isize, n: *const u8) -> Option<unsafe extern "system" fn(i32) -> i32>;
+    }
+    unsafe {
+        let m = LoadLibraryW(wide("uxtheme.dll").as_ptr());
+        if m == 0 {
+            return;
+        }
+        if let Some(f) = GetProcAddress(m, 135usize as *const u8) {
+            f(2);
+        }
+        if let Some(f) = GetProcAddress(m, 136usize as *const u8) {
+            f(0);
+        }
     }
 }

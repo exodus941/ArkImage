@@ -475,9 +475,9 @@ impl Dialog {
         self.hits.iter().rev().find(|h| x >= h.x0 && x < h.x1 && y >= h.y0 && y < h.y1).map(|h| h.act)
     }
 
-    /// Where a choice box sits, for placing its popup menu (physical px, bottom-left).
+    /// Where a choice box sits, for placing its popup menu (physical px, bottom-right).
     pub fn anchor(&self, act: Act) -> Option<(f32, f32)> {
-        self.hits.iter().find(|h| h.act == act).map(|h| (h.x0, h.y1))
+        self.hits.iter().find(|h| h.act == act).map(|h| (h.x1, h.y1))
     }
 
     pub fn render(&mut self, cfg: &Config, text: Option<&mut Text>) {

@@ -53,6 +53,8 @@ pub fn trace(msg: &str) {
 
 fn main() {
     T0.get_or_init(Instant::now);
+    #[cfg(windows)]
+    popup_win::dark_menus();
     TRACE.get_or_init(|| {
         std::env::var_os("ARKIMAGE_TRACE").and_then(|p| {
             std::fs::OpenOptions::new().create(true).append(true).open(p).ok().map(Mutex::new)
