@@ -157,7 +157,7 @@ pub unsafe fn popup_over(menu: *mut std::ffi::c_void, view: *mut std::ffi::c_voi
     }
 }
 
-/// A dropdown under its field: exactly the field's width, its top 2 pt below the field's
+/// A dropdown under its field: its own width, right edge on the field's right edge, its top 2 pt below the field's
 /// bottom edge (x, y, w: logical px from the view's top-left). AppKit draws the menu's
 /// frame a few points above the requested point; the measured offset is added back.
 pub unsafe fn menu_below(menu: *mut std::ffi::c_void, view: *mut std::ffi::c_void, x: f64, y: f64, w: f64) {
@@ -167,16 +167,18 @@ pub unsafe fn menu_below(menu: *mut std::ffi::c_void, view: *mut std::ffi::c_voi
         return;
     }
     unsafe {
-        let _: () = msg_send![menu, setMinimumWidth: w];
+        // the menu keeps its own width; its right edge lines up with the field's
+        let size: objc2_foundation::NSSize = msg_send![menu, size];
+        let left = if w > 0.0 { x + w - size.width } else { x };
         let flipped: bool = msg_send![view, isFlipped];
         let frame: NSRect = msg_send![view, frame];
         let top = y + GAP + MENU_TOP_INSET;
         let ly = if flipped { top } else { frame.size.height - top };
         if std::env::var_os("ARKIMAGE_MENU_LOG").is_some() {
-            eprintln!("menu_below field_left={x} field_bottom={y} w={w} flipped={flipped} view_h={}", frame.size.height);
+            eprintln!("menu_below field_left={x} field_bottom={y} w={w} menu_w={} flipped={flipped} view_h={}", size.width, frame.size.height);
         }
         let none: *mut AnyObject = std::ptr::null_mut();
-        let _: bool = msg_send![menu, popUpMenuPositioningItem: none, atLocation: objc2_foundation::NSPoint::new(x, ly), inView: view];
+        let _: bool = msg_send![menu, popUpMenuPositioningItem: none, atLocation: objc2_foundation::NSPoint::new(left, ly), inView: view];
     }
 }
 
