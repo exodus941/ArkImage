@@ -15,12 +15,15 @@ Get it from the [latest release](https://github.com/exodus941/ArkImage/releases/
 
 Download `arkimage.exe`. It is a single file with nothing to unpack.
 
-- **Portable:** put it in any folder and run it. To keep its settings beside it, create an
-  empty `ArkImage.ini` in the same folder.
+- **Portable:** put it in any folder and run it. It keeps its settings in `ArkImage.ini`
+  beside itself.
 - **Installed:** on first run, ArkImage offers to install itself for your user, with no
   administrator rights. It copies itself to `AppData\Local\Programs\ArkImage`, adds Start
   menu and desktop shortcuts, and registers for every image type it opens. Remove it from
   Settings > Apps.
+- **Settings after an install:** the install moves `ArkImage.ini` to
+  `AppData\Roaming\ArkImage`. From then on, every copy uses those settings, portable
+  copies too.
 
 ### macOS
 

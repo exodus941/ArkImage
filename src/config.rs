@@ -107,22 +107,93 @@ impl Default for Config {
     }
 }
 
+/// Where this copy keeps its settings (the user's rules, 2026-11-16):
+/// 1. ARKIMAGE_CONFIG_DIR, when set (tests: a test copy never touches the user's settings).
+/// 2. AppData's ArkImage.ini, when it exists: it always wins.
+/// 3. Else ArkImage.ini beside the exe (portable).
+/// 4. Else, on Windows, a new empty ArkImage.ini beside the exe (filled with the defaults
+///    by `load`). A folder it cannot write to falls back to AppData.
+/// An install moves the portable ini to AppData, so rule 2 then holds for every copy.
+fn pick_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("ARKIMAGE_CONFIG_DIR") {
+        return PathBuf::from(d);
+    }
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    pick(Config::appdata_dir(), exe_dir, cfg!(windows))
+}
+
+/// `pick_dir` without the environment: `create` allows a new ini beside the exe.
+fn pick(appdata: PathBuf, exe_dir: Option<PathBuf>, create: bool) -> PathBuf {
+    if appdata.join("ArkImage.ini").exists() {
+        return appdata;
+    }
+    let Some(exe_dir) = exe_dir else { return appdata };
+    let ini = exe_dir.join("ArkImage.ini");
+    if ini.exists() {
+        return exe_dir;
+    }
+    if create && fs::write(&ini, "").is_ok() {
+        crate::trace(&format!("portable: created {}", ini.display()));
+        return exe_dir;
+    }
+    appdata
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::pick;
+    use std::{fs, path::PathBuf};
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("arkimage-pick-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("appdata")).unwrap();
+        fs::create_dir_all(d.join("exe")).unwrap();
+        d
+    }
+
+    /// The user's rules: AppData's ini wins; else the local one; else a new local one.
+    #[test]
+    fn appdata_wins_then_local_then_new() {
+        let d = tmp("rules");
+        let (a, e) = (d.join("appdata"), d.join("exe"));
+        // nothing anywhere: a new empty ini beside the exe
+        assert_eq!(pick(a.clone(), Some(e.clone()), true), e);
+        assert!(e.join("ArkImage.ini").exists());
+        // a local ini and no AppData: the local one
+        assert_eq!(pick(a.clone(), Some(e.clone()), true), e);
+        // AppData's exists (after an install): it wins, and no new local ini is made
+        fs::write(a.join("ArkImage.ini"), "").unwrap();
+        fs::remove_file(e.join("ArkImage.ini")).unwrap();
+        assert_eq!(pick(a.clone(), Some(e.clone()), true), a);
+        assert!(!e.join("ArkImage.ini").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A folder the copy cannot write to falls back to AppData.
+    #[test]
+    fn unwritable_folder_uses_appdata() {
+        let d = tmp("ro");
+        let (a, e) = (d.join("appdata"), d.join("exe").join("missing"));
+        assert_eq!(pick(a.clone(), Some(e), true), a);
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
 fn b(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 impl Config {
+    /// The folder that holds ArkImage.ini, the session, bookmarks and crash log
+    /// (see `pick_dir`).
     pub fn dir() -> PathBuf {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(d) = exe.parent() {
-                if d.join("ArkImage.ini").exists() {
-                    return d.to_path_buf();
-                }
-            }
-        }
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("ArkImage")
+        pick_dir()
+    }
+
+    /// The per-user settings folder (%APPDATA%\ArkImage, ~/Library/Application Support/ArkImage).
+    pub fn appdata_dir() -> PathBuf {
+        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("ArkImage")
     }
 
     pub fn path() -> PathBuf {
@@ -131,7 +202,12 @@ impl Config {
 
     pub fn load() -> Self {
         let mut c = Self::default();
-        if let Ok(s) = fs::read_to_string(Self::path()) {
+        let text = fs::read_to_string(Self::path());
+        // a new portable ini starts empty: fill it with the defaults so it reads as settings
+        if text.as_ref().is_ok_and(|s| s.trim().is_empty()) {
+            c.save();
+        }
+        if let Ok(s) = text {
             for line in s.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with(['#', ';', '[']) {

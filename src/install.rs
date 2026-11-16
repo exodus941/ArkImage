@@ -202,7 +202,41 @@ pub fn install() -> Result<PathBuf, String> {
     }
     reg::register(&dst).map_err(|e| format!("Can't register file types: {e}"))?;
     reg::notify();
+    move_portable_files();
     Ok(dst)
+}
+
+/// Files a portable copy keeps beside its exe; an install moves them to AppData.
+const PORTABLE_FILES: [&str; 4] = ["ArkImage.ini", "session.txt", "bookmarks.txt", "crash.log"];
+
+/// After an install from a portable copy: move its settings to AppData so nothing stays
+/// beside the original exe. AppData's ini then wins for every copy (config::pick_dir).
+#[cfg(windows)]
+fn move_portable_files() {
+    use crate::config::Config;
+    let from = Config::dir();
+    let to = Config::appdata_dir();
+    // a test copy (ARKIMAGE_CONFIG_DIR) never moves files into the user's AppData
+    if from == to || from == install_dir() || std::env::var_os("ARKIMAGE_CONFIG_DIR").is_some() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&to);
+    for name in PORTABLE_FILES {
+        let (a, b) = (from.join(name), to.join(name));
+        if !a.exists() {
+            continue;
+        }
+        // rename fails across drives: copy, then delete
+        if std::fs::rename(&a, &b).is_err() && std::fs::copy(&a, &b).is_ok() {
+            let _ = std::fs::remove_file(&a);
+        }
+        crate::trace(&format!("install: moved {} to {}", a.display(), b.display()));
+    }
+    // AppData's ini is the one every copy reads from now on; an empty one means defaults
+    let ini = to.join("ArkImage.ini");
+    if !ini.exists() {
+        let _ = std::fs::write(&ini, "");
+    }
 }
 
 /// Remove shortcuts, registry entries and the installed folder (after this process exits).
