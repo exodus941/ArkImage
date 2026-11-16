@@ -10,9 +10,11 @@ use crate::text::Text;
 #[path = "chrome_bar.rs"]
 mod bar;
 use bar::draw_bottom;
+pub use bar::fmt_speed;
+/// Bottom-bar icon size, design px (menus align to the icon's edges).
+pub use bar::ICON_PX as BAR_ICON_PX;
 
 pub const TITLE_H: f32 = 24.0;
-pub const TOOL_H: f32 = 32.0;
 /// Bottom bar: full window width minus BAR_GAP on each side; slider on top, icon row below.
 /// 16 inset + 12 slider + 16 gap + 24 icon row + 16 below.
 pub const BAR_H: f32 = 84.0;
@@ -24,19 +26,11 @@ pub const TRACK_H: f32 = 12.0;
 /// Frosted glass: blur radius (design px) and tint opacities (0-255).
 const GLASS_BLUR: f32 = 32.0;
 const GLASS_TITLE_A: u32 = 205;
-const GLASS_TOOL_A: u32 = 190;
 const GLASS_BAR_A: u32 = 150;
 
 /// Title bar and lock colour: the icon's blue (crate::ui::ACCENT_FILL).
 const BLUE: u32 = crate::ui::ACCENT_FILL;
 const CLOSE_RED: u32 = 0xC75050;
-const TOOL_TOP: u32 = 0xFBFBFB;
-const TOOL_MID: u32 = 0xEDEDED;
-const TOOL_BOT: u32 = 0xDEDEDE;
-const TOOL_RULE: u32 = 0x666666;
-const TOOL_TEXT: u32 = 0x333333;
-/// Toolbar icons on the light toolbar.
-const TOOL_ICON: u32 = 0x444444;
 const ICON: u32 = 0xC8C8C8;
 
 /// A clickable area in physical pixels.
@@ -65,15 +59,26 @@ pub struct State<'a> {
     pub lock_bottom: bool,
     /// Hover fade per control, 0-1: rises over 250 ms while hovered, falls over 250 ms after.
     pub hover_fx: &'a [(&'static str, f32)],
+    /// Tooltip fade per bottom-bar button, 0-1: 125 ms in on hover, 125 ms out after.
+    pub tip_fx: &'a [(&'static str, f32)],
     pub info_on: bool,
     pub index: usize,
     pub len: usize,
     /// (frame, frame count) for an animation; None for a still image.
     pub anim: Option<(usize, usize)>,
+    /// Format pill beside the scrub bar: "GIF", "WEBP", "APNG", "JSON", "LOTTIE"...
+    pub anim_fmt: &'a str,
+    /// Playback speed (0.25-4) and the frame rate it gives, for the speed pill.
+    pub anim_speed: f32,
+    pub anim_fps: u32,
 }
 
 impl State<'_> {
     /// How far the hover on `id` has faded in, 0-1.
+    pub fn tip_amt(&self, id: &str) -> f32 {
+        self.tip_fx.iter().find(|(k, _)| *k == id).map(|(_, a)| *a).unwrap_or(0.0)
+    }
+
     pub fn hover_amt(&self, id: &str) -> f32 {
         self.hover_fx.iter().find(|(k, _)| *k == id).map(|(_, a)| *a).unwrap_or(0.0)
     }
@@ -81,24 +86,35 @@ impl State<'_> {
 
 /// Heights of the top chrome block and the bottom hover zone, in physical pixels.
 pub fn top_zone(sf: f32) -> f32 {
-    (TITLE_H + TOOL_H + 1.0) * sf
+    TITLE_H * sf
 }
 
-/// Animation scrub bar above the bottom bar: a bare 8 px track, no panel.
-pub const ANIM_H: f32 = 8.0;
+/// Animation scrub row above the bottom bar: a bare 4 px track beside the pills, which
+/// are 24 px tall and set the row height. (Pills added 2026-11-16 by Claude on the Mac,
+/// see docs/windows-handoff.md.)
+pub const ANIM_H: f32 = 24.0;
 
 /// The bottom hover zone; it grows by the scrub bar and its gap when one shows.
 pub fn bottom_zone(sf: f32, anim: bool) -> f32 {
     (BAR_H + BAR_GAP + 24.0 + if anim { ANIM_H + BAR_GAP } else { 0.0 }) * sf
 }
 
-/// Scrub track (x, y, w, h): 75% of the bar's width, centred, BAR_GAP above the bar.
-pub fn anim_track(w: f32, h: f32, sf: f32) -> (f32, f32, f32, f32) {
+/// Scrub row (x, y, w, h) for the track, BAR_GAP above the bar and as wide as the bar:
+/// [format] [counter] [track ...] [speed]. `left` and `right` are the physical px the pills
+/// take at each end; the track keeps PILL_GAP clear of them.
+pub fn anim_track(w: f32, h: f32, sf: f32, left: f32, right: f32) -> (f32, f32, f32, f32) {
     let (bx, by, bw, _) = bar_rect(w, h, sf);
     let th = (ANIM_H * sf).round();
-    let tw = (bw * 0.75).round();
-    ((bx + (bw - tw) / 2.0).round(), by - (BAR_GAP * sf).round() - th, tw.max(1.0), th)
+    let gap = (PILL_GAP * sf).round();
+    let x = bx + left + gap;
+    (x, by - (BAR_GAP * sf).round() - th, (bx + bw - right - gap - x).max(1.0), th)
 }
+
+/// Pills beside the scrub track: 24 px tall, 12 px side padding, 4 px apart, 12 px from the track.
+pub const PILL_H: f32 = 24.0;
+pub const PILL_PAD: f32 = 12.0;
+pub const PILL_GAP: f32 = 12.0;
+pub const PILL_SPACE: f32 = 4.0;
 
 /// Bar rectangle (x, y, w, h) in physical pixels.
 pub fn bar_rect(w: f32, h: f32, sf: f32) -> (f32, f32, f32, f32) {
@@ -135,10 +151,9 @@ fn draw_top(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, hits: &mut Vec<
     let sf = s.sf;
     let w = c.w as f32;
     let th = (TITLE_H * sf).round();
-    let tb = (TOOL_H * sf).round();
 
     // Frosted glass: blur what is under the top chrome, then tint it.
-    c.blur(0, 0, w as i32, (th + tb) as i32 + 1, (GLASS_BLUR * sf).round() as usize);
+    c.blur(0, 0, w as i32, th as i32 + 1, (GLASS_BLUR * sf).round() as usize);
     // --- title bar ---
     c.rect_alpha(0, 0, w as i32, th as i32, BLUE, GLASS_TITLE_A);
     hits.push(Hit { x0: 0.0, y0: 0.0, x1: w, y1: th, id: "title" });
@@ -181,72 +196,45 @@ fn draw_top(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, hits: &mut Vec<
         text_mid(c, t, 32.0 * sf, th / 2.0, &title, px, 0xFFFFFF);
     }
 
-    // --- toolbar ---
-    let y0 = th;
-    // 1 px highlight row, then the gradient (Honeyview: #FBFBFB, then #EDEDED to #DEDEDE)
-    c.rect_alpha(0, y0 as i32, w as i32, 1, TOOL_TOP, GLASS_TOOL_A);
-    c.vgrad(0, y0 as i32 + 1, w as i32, tb as i32 - 1, TOOL_MID, TOOL_BOT, GLASS_TOOL_A);
-    c.rect_alpha(0, (y0 + tb) as i32, w as i32, sf.round().max(1.0) as i32, TOOL_RULE, 160);
-    hits.push(Hit { x0: 0.0, y0, x1: w, y1: y0 + tb + sf, id: "toolbar" });
-    let mid = y0 + tb / 2.0;
-    let Some(t) = t else { return };
-    let px = 12.0 * sf;
-    // hover plates: 24 px tall (4 px above and below), 8 px past the content each side
-    let (py0, ph) = (y0 + 4.0 * sf, tb - 8.0 * sf);
-    let plate = |c: &mut Canvas, x0: f32, x1: f32, a: f32| {
-        if a > 0.0 {
-            c.rect_alpha(x0 as i32, py0 as i32, (x1 - x0) as i32, ph as i32, 0x000000, (20.0 * a) as u32);
-        }
-    };
-
-    // left: camera + EXIF
-    let ew = t.width("EXIF", px);
-    let (ex0, ex1) = (8.0 * sf, 32.0 * sf + ew + 8.0 * sf);
-    plate(c, ex0, ex1, if s.info_on { 1.4 } else { s.hover_amt("tb_exif") });
-    icons::draw(c, Icon::Camera, 20.0 * sf, mid, isz, TOOL_ICON);
-    text_mid(c, t, 32.0 * sf, mid, "EXIF", px, TOOL_TEXT);
-    hits.push(Hit { x0: ex0, y0, x1: ex1, y1: y0 + tb, id: "tb_exif" });
-
-    // right side, laid out right to left: lock 24 px from the edge
-    let lx = w - 24.0 * sf;
-    plate(c, lx - 12.0 * sf, lx + 12.0 * sf, s.hover_amt("tb_lock"));
-    icons::draw(c, if s.lock_top { Icon::Lock } else { Icon::LockOpen }, lx, mid, isz, if s.lock_top { BLUE } else { TOOL_ICON });
-    hits.push(Hit { x0: lx - 12.0 * sf, y0, x1: lx + 12.0 * sf, y1: y0 + tb, id: "tb_lock" });
-    // menus: label, 4 px, 12 px chevron; 8 px plate padding, 8 px between plates
-    let mut right = lx - 12.0 * sf - 16.0 * sf;
-    let chev = 12.0 * sf;
-    // each menu: icon, 4 px, label, 4 px, chevron (as EXIF: camera, 4 px, label)
-    for (label, id, ic) in [("Copy to", "tb_copyto", Icon::Copy), ("Edit", "tb_edit", Icon::Pencil), ("Bookmark", "tb_bookmark", Icon::Bookmark), ("Slideshow", "tb_slideshow", Icon::PlayerPlay), ("View", "tb_view", Icon::Eye)] {
-        let tw = t.width(label, px);
-        let lx0 = right - chev - 4.0 * sf - tw;
-        let x0 = lx0 - 4.0 * sf - isz;
-        plate(c, x0 - 8.0 * sf, right + 8.0 * sf, s.hover_amt(id));
-        icons::draw(c, ic, x0 + isz / 2.0, mid, isz, TOOL_ICON);
-        text_mid(c, t, lx0, mid, label, px, TOOL_TEXT);
-        icons::draw(c, Icon::ChevronDown, right - chev / 2.0, mid, chev, TOOL_ICON);
-        hits.push(Hit { x0: x0 - 8.0 * sf, y0, x1: right + 8.0 * sf, y1: y0 + tb, id });
-        right = x0 - 24.0 * sf;
-    }
-    // full screen
-    let fx = right - 4.0 * sf;
-    plate(c, fx - 12.0 * sf, fx + 12.0 * sf, s.hover_amt("tb_full"));
-    icons::draw(c, Icon::ArrowsMaximize, fx, mid, isz, TOOL_ICON);
-    hits.push(Hit { x0: fx - 12.0 * sf, y0, x1: fx + 12.0 * sf, y1: y0 + tb, id: "tb_full" });
 }
 
 
 #[cfg(test)]
 mod tests {
-    /// Scrub track at 1280x860: 8 px tall, 75% of the bar, centred, 16 px above the bar.
+    /// Speed labels drop trailing zeros; the 16 menu steps run 0.25 to 4.
+    #[test]
+    fn speed_labels() {
+        assert_eq!(super::fmt_speed(0.25), "0.25");
+        assert_eq!(super::fmt_speed(0.5), "0.5");
+        assert_eq!(super::fmt_speed(1.0), "1");
+        assert_eq!(super::fmt_speed(1.75), "1.75");
+        assert_eq!(super::fmt_speed(4.0), "4");
+    }
+
+    /// The frame counter pads the current frame to the digits of the count.
+    #[test]
+    fn counter_padding() {
+        let fmt = |f: usize, n: usize| {
+            let digits = n.to_string().len();
+            format!("{:0digits$}/{n}", f)
+        };
+        assert_eq!(fmt(1, 300), "001/300");
+        assert_eq!(fmt(5, 30), "05/30");
+        assert_eq!(fmt(4, 4), "4/4");
+        assert_eq!(fmt(42, 1200), "0042/1200");
+    }
+
+    /// Scrub row at 1280x860: 24 px tall, between the pills, 16 px above the bar.
     #[test]
     fn scrub_track_geometry() {
         for sf in [1.0f32, 1.5, 2.0] {
             let (w, h) = (1280.0 * sf, 860.0 * sf);
             let (bx, by, bw, _) = super::bar_rect(w, h, sf);
-            let (tx, ty, tw, th) = super::anim_track(w, h, sf);
-            assert_eq!(th, 8.0 * sf, "height at sf {sf}");
-            assert_eq!(tw, (bw * 0.75).round());
-            assert_eq!(tx - bx, bx + bw - (tx + tw), "centred at sf {sf}");
+            let (left, right) = (160.0 * sf, 100.0 * sf);
+            let (tx, ty, tw, th) = super::anim_track(w, h, sf, left, right);
+            assert_eq!(th, 24.0 * sf, "height at sf {sf}");
+            assert_eq!(tx - bx, left + (12.0 * sf).round(), "left pills at sf {sf}");
+            assert_eq!(bx + bw - (tx + tw), right + (12.0 * sf).round(), "right pill at sf {sf}");
             assert_eq!(by - (ty + th), 16.0 * sf, "gap at sf {sf}");
         }
     }

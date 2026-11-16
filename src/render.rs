@@ -352,24 +352,36 @@ pub fn blit_sample(
             (a * 4, b * 4, ((fx - a as f64) * 256.0) as u32)
         })
         .collect();
-    for y in y0..y1 {
-        let fy = ((y as f64 + 0.5 - oy) / z - 0.5).clamp(0.0, (ih - 1) as f64);
-        let ya = fy.floor() as usize;
-        let yb = (ya + 1).min(ih - 1);
-        let ty = ((fy - ya as f64) * 256.0) as u32;
-        let ra = &raw[ya * stride..(ya + 1) * stride];
-        let rb = &raw[yb * stride..(yb + 1) * stride];
-        let drow = &mut c.buf[y * c.w..(y + 1) * c.w];
-        for (i, x) in (x0..x1).enumerate() {
-            let (xa, xb, tx) = cols[i];
-            let ch = |k: usize| -> u32 {
-                let top = ra[xa + k] as u32 * (256 - tx) + ra[xb + k] as u32 * tx;
-                let bot = rb[xa + k] as u32 * (256 - tx) + rb[xb + k] as u32 * tx;
-                (top * (256 - ty) + bot * ty) >> 16
-            };
-            put(drow, x, y, ch(0), ch(1), ch(2), ch(3));
+    // rows split across the cores: a full-window frame is 7 MP on a Retina display
+    let cw = c.w;
+    let rows = &mut c.buf[y0 * cw..y1 * cw];
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
+    let per = (y1 - y0).div_ceil(n).max(1);
+    let cols = &cols;
+    std::thread::scope(|sc| {
+        for (k, chunk) in rows.chunks_mut(per * cw).enumerate() {
+            sc.spawn(move || {
+                for (j, drow) in chunk.chunks_mut(cw).enumerate() {
+                    let y = y0 + k * per + j;
+                    let fy = ((y as f64 + 0.5 - oy) / z - 0.5).clamp(0.0, (ih - 1) as f64);
+                    let ya = fy.floor() as usize;
+                    let yb = (ya + 1).min(ih - 1);
+                    let ty = ((fy - ya as f64) * 256.0) as u32;
+                    let ra = &raw[ya * stride..(ya + 1) * stride];
+                    let rb = &raw[yb * stride..(yb + 1) * stride];
+                    for (i, x) in (x0..x1).enumerate() {
+                        let (xa, xb, tx) = cols[i];
+                        let ch = |k: usize| -> u32 {
+                            let top = ra[xa + k] as u32 * (256 - tx) + ra[xb + k] as u32 * tx;
+                            let bot = rb[xa + k] as u32 * (256 - tx) + rb[xb + k] as u32 * tx;
+                            (top * (256 - ty) + bot * ty) >> 16
+                        };
+                        put(drow, x, y, ch(0), ch(1), ch(2), ch(3));
+                    }
+                }
+            });
         }
-    }
+    });
 }
 
 /// Resize. filter: 0 nearest, 1 bilinear, 2 Lanczos3, 3 quick preview, 4 bicubic.

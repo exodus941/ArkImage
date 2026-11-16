@@ -15,7 +15,7 @@ use std::{
 use image::RgbaImage;
 use winit::{
     dpi::LogicalSize,
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoopProxy},
     keyboard::{Key, KeyCode, ModifiersState, PhysicalKey},
     window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId, WindowLevel},
@@ -33,6 +33,13 @@ use crate::{
     source::{self, Entry, Playlist},
     text::Text,
 };
+
+/// Which edge of a bar menu lines up with its button.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuEdge {
+    Left,
+    Right,
+}
 
 pub enum MenuEntry {
     Item(String, String, &'static str, bool),
@@ -107,7 +114,7 @@ fn mica(_w: &Window) -> bool {
 }
 
 
-fn menu_label(text: &str, key: &str) -> String {
+pub(crate) fn menu_label(text: &str, key: &str) -> String {
     // Windows right-aligns text after a tab; macOS would print it literally.
     if cfg!(windows) && !key.is_empty() {
         format!("{text}\t{key}")
@@ -149,6 +156,16 @@ pub enum UserEvent {
     /// An update check finished; true when the user asked for it (Settings).
     Update(crate::update::Outcome, bool),
 }
+
+/// Two-finger swipe: logical px of sideways travel for one image, the quiet time that ends
+/// a gesture, px per line for wheels that report lines, and the sign that makes a drag to
+/// the right mean "next" (flip it if a platform reports the other way).
+const SWIPE_PX: f64 = 64.0;
+const SWIPE_GAP: Duration = Duration::from_millis(300);
+/// The full-quality redraw follows the last pinch event after this long.
+const PINCH_SETTLE: Duration = Duration::from_millis(150);
+const SWIPE_LINE_PX: f64 = 40.0;
+const SWIPE_SIGN: f64 = 1.0;
 
 /// Chrome fade in/out duration.
 const FADE_SECS: f32 = 0.25;
@@ -320,6 +337,13 @@ pub struct App {
     job_tx: mpsc::Sender<Entry>,
     current: Option<(Entry, Arc<Decoded>)>,
     frame_idx: usize,
+    /// Two-finger swipe state: sideways travel so far, whether this gesture already stepped,
+    /// and the time of its last event.
+    swipe_acc: f64,
+    swipe_done: bool,
+    swipe_at: Option<Instant>,
+    /// Animation playback speed, 0.25 to 4 in 0.25 steps (the speed pill); per window.
+    anim_speed: f32,
     next_frame_at: Option<Instant>,
     view: View,
     base: Option<Arc<RgbaImage>>,
@@ -353,6 +377,10 @@ pub struct App {
     modal_hover: Option<usize>,
     last_click: Option<(Instant, (f64, f64))>,
     wheel_acc: f64,
+    /// Last pinch event: while set, the image is drawn by sampling only the visible pixels,
+    /// and the high-quality resize runs PINCH_SETTLE after the last event (or when a macOS
+    /// pinch ends). (Added 2026-11-16 by Claude on the Mac, for both; see the handoff.)
+    pinch_at: Option<Instant>,
     fullscreen: bool,
     on_top: bool,
     rng: u64,
@@ -389,6 +417,8 @@ pub struct App {
     rename_orig: Option<String>,
     /// Hover fade per chrome control (0-1), and when it was last stepped.
     hover_fx: Vec<(&'static str, f32)>,
+    /// Tooltip fades of the bottom-bar buttons (see chrome::State::tip_fx).
+    tip_fx: Vec<(&'static str, f32)>,
     hover_at: Instant,
     /// A number field's value before typing started (Esc puts it back).
     num_edit_orig: Option<i64>,
@@ -500,6 +530,10 @@ impl App {
             job_tx: sh.job_tx.clone(),
             current: None,
             frame_idx: 0,
+            swipe_acc: 0.0,
+            swipe_done: false,
+            swipe_at: None,
+            anim_speed: 1.0,
             next_frame_at: None,
             view: View::default(),
             base: None,
@@ -526,6 +560,7 @@ impl App {
             modal_hover: None,
             last_click: None,
             wheel_acc: 0.0,
+            pinch_at: None,
             fullscreen: false,
             on_top: false,
             rng: seed,
@@ -551,6 +586,7 @@ impl App {
             popup_closed: None,
             rename_orig: None,
             hover_fx: Vec::new(),
+            tip_fx: Vec::new(),
             hover_at: Instant::now(),
             num_edit_orig: None,
             pending_bind: None,
@@ -741,7 +777,7 @@ impl App {
         crate::trace(&format!("current {}", e.name()));
         self.frame_idx = 0;
         self.next_frame_at = if d.frames.len() > 1 && self.cfg.double == 0 {
-            Some(Instant::now() + Duration::from_millis(d.frames[0].delay_ms as u64))
+            Some(Instant::now() + Duration::from_millis(self.frame_ms(d.frames[0].delay_ms)))
         } else {
             None
         };
@@ -1559,7 +1595,7 @@ impl App {
             // Enlarged images go through the resize path too when the preset sharpens,
             // up to 4x and 40 MP; past that, per-pixel sampling (no sharpening).
             let up_sharp = preset.amount > 0 && preset.smooth() && l.z <= 4.0 && l.sw * l.sh <= 40e6;
-            if l.z < 0.999 || (l.z > 1.001 && up_sharp) {
+            if self.pinch_at.is_none() && (l.z < 0.999 || (l.z > 1.001 && up_sharp)) {
                 let sw = (l.sw.round() as u32).max(1);
                 let sh = (l.sh.round() as u32).max(1);
                 let key = (self.base_gen, sw, sh, preset.fingerprint(self.cfg.interp));
@@ -1583,7 +1619,7 @@ impl App {
                 let img = &self.scaled.as_ref().unwrap().1;
                 render::blit(c, img, l.ox.round() as i64, l.oy.round() as i64, bg, checker);
             } else {
-                render::blit_sample(c, &base, l.ox, l.oy, l.z, self.preset().smooth(), bg, checker);
+                render::blit_sample(c, &base, l.ox, l.oy, l.z, self.pinch_at.is_some() || self.preset().smooth(), bg, checker);
             }
         } else {
             self.layout = None;
@@ -1684,7 +1720,29 @@ impl App {
         if self.hover_fx.iter().any(|(k, a)| *a != if Some(*k) == hov { 1.0 } else { 0.0 }) {
             self.request_redraw();
         }
+        // Tooltips: the same idea over 125 ms, for the bottom bar's buttons only.
+        let tip_step = (dt / 0.125).min(1.0);
+        let tip_hov = hov.filter(|h| h.starts_with("bar_") && *h != "bar_slider" || h.starts_with("tb_"));
+        // moving from one button to the next hands the tooltip over at once, at the shown
+        // opacity, so two never overlap; the 125 ms fade-out is for leaving the buttons
+        if let Some(h) = tip_hov {
+            if !self.tip_fx.iter().any(|(k, _)| *k == h) {
+                let shown = self.tip_fx.iter().map(|(_, a)| *a).fold(0.0, f32::max);
+                self.tip_fx.clear();
+                self.tip_fx.push((h, shown));
+            }
+        }
+        for (k, a) in &mut self.tip_fx {
+            let to = if Some(*k) == tip_hov { 1.0 } else { 0.0 };
+            *a = if (*a - to).abs() <= tip_step { to } else { *a + tip_step * (to - *a).signum() };
+        }
+        self.tip_fx.retain(|(k, a)| *a > 0.0 || Some(*k) == tip_hov);
+        if self.tip_fx.iter().any(|(k, a)| *a != if Some(*k) == tip_hov { 1.0 } else { 0.0 }) {
+            self.request_redraw();
+        }
+        let tip_fx = self.tip_fx.clone();
         let hover_fx = self.hover_fx.clone();
+        let anim_fmt = self.anim_format();
         let st = chrome::State {
             sf,
             title: &title,
@@ -1694,10 +1752,14 @@ impl App {
             lock_top: self.cfg.lock_top,
             lock_bottom: self.cfg.lock_bottom,
             hover_fx: &hover_fx,
+            tip_fx: &tip_fx,
             info_on: self.show_info,
             index: self.index(),
             len: self.len(),
             anim: self.anim_frames().map(|n| (self.frame_idx.min(n - 1), n)),
+            anim_fmt: &anim_fmt,
+            anim_speed: self.anim_speed,
+            anim_fps: self.anim_fps(),
         };
         // Keep the rows under a partly faded bar, draw the bar, then blend the two.
         let top_rows = ((chrome::top_zone(sf) + 2.0).ceil() as usize).min(c.h);
@@ -2156,14 +2218,23 @@ impl App {
                 self.cfg.lock_bottom = !self.cfg.lock_bottom;
                 self.request_redraw();
             }
-            "tb_view" | "tb_slideshow" | "tb_bookmark" | "tb_edit" | "tb_copyto" => {
-                self.show_menu(el, &h.id[3..], h.x0, h.y1);
+            "tb_view" | "tb_edit" | "tb_copyto" | "bar_menu" => {
+                // Opens above the button, bottom edge 4 px above it. The main menu left-aligns
+                // with the button's left edge, the others right-align with its right edge.
+                let kind = if h.id == "bar_menu" { "context" } else { &h.id[3..] };
+                let (x, edge) = if h.id == "bar_menu" { (h.x0, MenuEdge::Left) } else { (h.x1, MenuEdge::Right) };
+                let y = h.y0 - 4.0 * self.sf();
+                self.show_menu_above(el, kind, x, y, edge, 0.0);
             }
             "bar_open" => self.open_dialog(),
-            "bar_menu" => self.show_menu(el, "context", h.x0, h.y0),
             "bar_slider" => {
                 self.slider_drag = true;
                 self.slider_seek();
+            }
+            // right-aligned above the pill, at least as wide as the pill
+            "anim_speed" => {
+                let y = h.y0 - 4.0 * self.sf();
+                self.show_menu_above(el, "speed", h.x1, y, MenuEdge::Right, h.x1 - h.x0);
             }
             "anim_slider" => {
                 self.anim_drag = true;
@@ -2197,6 +2268,13 @@ impl App {
         };
         match kind {
             "view" => view_items(),
+            // playback speed: 0.25x to 4x in 0.25 steps
+            "speed" => (1..=16)
+                .map(|q| {
+                    let v = q as f32 / 4.0;
+                    C(format!("spd:{q}"), format!("{}\u{d7}", chrome::fmt_speed(v)), "", (self.anim_speed - v).abs() < 0.01)
+                })
+                .collect(),
             "slideshow" => {
                 let cur = self.slideshow.map(|s| s.0).unwrap_or(0);
                 let mut m = vec![C("ss:0".into(), "Stop Slideshow".into(), "Ctrl+0", cur == 0), S];
@@ -2324,6 +2402,40 @@ impl App {
                 I("config".into(), "Settings".into(), "F5", true),
                 I("exit".into(), "Exit".into(), "X", true),
             ],
+        }
+    }
+
+    /// A bar menu: bottom edge on (x, y) physical px, `edge` of the menu at x, at least
+    /// `min_w` physical px wide. Windows builds its own popup (muda opens only below);
+    /// macOS uses muda here and aligns in its own build.
+    fn show_menu_above(&mut self, el: &ActiveEventLoop, kind: &str, x: f32, y: f32, edge: MenuEdge, min_w: f32) {
+        #[cfg(windows)]
+        {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if self.popup_closed.as_ref().is_some_and(|(t, o, _)| o == kind && t.elapsed() < Duration::from_millis(300)) {
+                return;
+            }
+            let items = self.menu_items(kind);
+            let Some(w) = self.window.clone() else { return };
+            let Ok(h) = w.window_handle() else { return };
+            let RawWindowHandle::Win32(h) = h.as_raw() else { return };
+            // menu text is 9 pt Segoe UI; a figure space is about 7 px at 100%, and the
+            // check column and margins take about 64 px
+            let sf = self.sf();
+            let min_chars = if min_w > 0.0 { ((min_w / sf - 64.0) / 7.0).ceil().max(0.0) as usize } else { 0 };
+            let e = if edge == MenuEdge::Left { crate::popup_win::Edge::Left } else { crate::popup_win::Edge::Right };
+            crate::trace(&format!("menu {kind} above x={x} y={y} edge={edge:?} min_w={min_w} chars={min_chars}"));
+            let chosen = crate::popup_win::show_above(h.hwnd.get(), items, x as i32, y as i32, e, min_chars);
+            self.popup_closed = Some((Instant::now(), kind.to_string(), false));
+            if let Some(id) = chosen {
+                self.menu_action(el, &id);
+            }
+            self.request_redraw();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (edge, min_w);
+            self.show_menu(el, kind, x, y);
         }
     }
 
@@ -2924,6 +3036,10 @@ impl App {
             }
             return;
         }
+        if let Some(q) = id.strip_prefix("spd:").and_then(|q| q.parse::<u32>().ok()) {
+            self.set_anim_speed(q as f32 / 4.0);
+            return;
+        }
         if let Some(n) = id.strip_prefix("ss:") {
             self.set_slideshow(n.parse().unwrap_or(0));
             return;
@@ -3078,6 +3194,16 @@ impl App {
         self.request_redraw();
     }
 
+    /// Where the cursor is over the picker: on the close button, outside the panel, or neither.
+    fn picker_close_at_cursor(&self) -> (bool, bool) {
+        let Some(sz) = self.window.as_ref().map(|w| w.inner_size()) else { return (false, false) };
+        let (w, h, sf) = (sz.width as f32, sz.height as f32, self.sf());
+        let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let (x0, y0, x1, y1) = picker::close_rect(w, h, sf);
+        let (px, py, pw, ph) = picker::panel_rect(w, h, sf);
+        (x >= x0 && x < x1 && y >= y0 && y < y1, x < px || x >= px + pw || y < py || y >= py + ph)
+    }
+
     fn picker_index_at_cursor(&self) -> Option<usize> {
         let g = self.picker_grid()?;
         self.picker.index_at(&g, self.cursor.0 as f32, self.cursor.1 as f32, self.len())
@@ -3182,14 +3308,52 @@ impl App {
     /// Scrub: show the frame under the cursor and hold it while the button is down.
     fn anim_seek(&mut self) {
         let Some(n) = self.anim_frames() else { return };
-        let Some(sz) = self.window.as_ref().map(|w| w.inner_size()) else { return };
-        let (tx, _, tw, _) = chrome::anim_track(sz.width as f32, sz.height as f32, self.sf());
+        // the track as last drawn: its grab area is the track plus 8 px on each side
+        let Some(h) = self.hits.iter().find(|h| h.id == "anim_slider") else { return };
+        let pad = 8.0 * self.sf();
+        let (tx, tw) = (h.x0 + pad, (h.x1 - h.x0 - 2.0 * pad).max(1.0));
         let frac = ((self.cursor.0 as f32 - tx) / tw).clamp(0.0, 1.0);
         let f = ((frac * n as f32) as usize).min(n - 1);
         self.next_frame_at = None;
         if f != self.frame_idx {
             self.frame_idx = f;
             self.base = None;
+        }
+        self.request_redraw();
+    }
+
+    // Speed pill helpers: added 2026-11-16 by Claude on the Mac (see docs/windows-handoff.md).
+    /// A frame's display time at the chosen speed: its delay (10 ms floor) over the speed,
+    /// and never under 4 ms, the shortest wait the event loop keeps reliably.
+    fn frame_ms(&self, delay_ms: u32) -> u64 {
+        ((delay_ms.max(10) as f32 / self.anim_speed).round() as u64).max(4)
+    }
+
+    /// Format pill text: the file's extension in capitals ("GIF", "WEBP", "JSON", "LOTTIE"),
+    /// except an animated PNG, which reads "APNG".
+    fn anim_format(&self) -> String {
+        let Some((e, d)) = &self.current else { return String::new() };
+        if d.format.starts_with("APNG") {
+            return "APNG".into();
+        }
+        e.ext().to_ascii_uppercase()
+    }
+
+    /// Frames per second shown in the speed pill: the current frame's rate at this speed.
+    fn anim_fps(&self) -> u32 {
+        let Some((_, d)) = &self.current else { return 0 };
+        let ms = self.frame_ms(d.frames[self.frame_idx.min(d.frames.len().saturating_sub(1))].delay_ms);
+        (1000.0 / ms as f32).round() as u32
+    }
+
+    fn set_anim_speed(&mut self, v: f32) {
+        self.anim_speed = v.clamp(0.25, 4.0);
+        // re-time the frame on screen from now, so a slower speed takes effect at once
+        if self.next_frame_at.is_some() {
+            if let Some(d) = self.current.as_ref().map(|c| c.1.clone()) {
+                let ms = self.frame_ms(d.frames[self.frame_idx.min(d.frames.len() - 1)].delay_ms);
+                self.next_frame_at = Some(Instant::now() + Duration::from_millis(ms));
+            }
         }
         self.request_redraw();
     }
@@ -3202,7 +3366,7 @@ impl App {
             return;
         }
         self.frame_idx = (self.frame_idx + 1) % n;
-        let delay = d.frames[self.frame_idx].delay_ms.max(10) as u64;
+        let delay = self.frame_ms(d.frames[self.frame_idx].delay_ms);
         // Keep cadence; do not fall behind after a slow frame.
         let mut next = self.next_frame_at.unwrap_or(now) + Duration::from_millis(delay);
         if next < now {
@@ -3385,8 +3549,10 @@ impl App {
             WindowEvent::CursorMoved { position, .. } if self.picker.open => {
                 self.cursor = (position.x, position.y);
                 let h = self.picker_index_at_cursor();
-                if h != self.picker.hover {
+                let ch = self.picker_close_at_cursor().0;
+                if h != self.picker.hover || ch != self.picker.close_hover {
                     self.picker.hover = h;
+                    self.picker.close_hover = ch;
                     self.request_redraw();
                 }
             }
@@ -3435,7 +3601,11 @@ impl App {
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) if self.picker.open => {
-                    if let Some(i) = self.picker_index_at_cursor() {
+                    // the close button, or a click outside the panel, closes the grid
+                    let (on_close, outside) = self.picker_close_at_cursor();
+                    if on_close || outside {
+                        self.close_picker();
+                    } else if let Some(i) = self.picker_index_at_cursor() {
                         self.go_to(i);
                         self.close_picker();
                     }
@@ -3528,7 +3698,7 @@ impl App {
                         // resume playback from the frame let go on
                         self.anim_drag = false;
                         if let Some(d) = self.current.as_ref().map(|c| c.1.clone()) {
-                            let ms = d.frames[self.frame_idx.min(d.frames.len() - 1)].delay_ms.max(10) as u64;
+                            let ms = self.frame_ms(d.frames[self.frame_idx.min(d.frames.len() - 1)].delay_ms);
                             self.next_frame_at = Some(Instant::now() + Duration::from_millis(ms));
                         }
                         self.request_redraw();
@@ -3569,7 +3739,30 @@ impl App {
                 self.picker.scroll -= dy;
                 self.request_redraw();
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                // Two-finger sideways drag on a touchpad: previous / next image.
+                // (Added 2026-11-16 by Claude on the Mac, for Windows and macOS; see docs/windows-handoff.md.)
+                let (sx, sy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x as f64 * SWIPE_LINE_PX, y as f64 * SWIPE_LINE_PX),
+                    MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
+                };
+                // Windows: a touchpad pinch arrives as wheel events with Ctrl held (as does
+                // Ctrl+wheel on a mouse): zoom continuously, 1.25x per notch of 120
+                if cfg!(windows) && self.mods.control_key() {
+                    let notches = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y as f64,
+                        MouseScrollDelta::PixelDelta(p) => p.y / 120.0,
+                    };
+                    if let Some(l) = self.layout {
+                        self.pinch_at = Some(Instant::now());
+                        self.zoom_to(l.z * 1.25f64.powf(notches), Some(self.cursor));
+                        self.request_redraw();
+                    }
+                    return;
+                }
+                if self.swipe(sx, sy, phase) {
+                    return;
+                }
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => {
@@ -3592,7 +3785,9 @@ impl App {
                     self.mouse_bind(el, if dy > 0.0 { 5 } else { 6 });
                 }
             }
-            WindowEvent::PinchGesture { delta, .. } => {
+            WindowEvent::PinchGesture { delta, phase, .. } => {
+                self.pinch_at = (!matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled)).then(Instant::now);
+                self.request_redraw();
                 if let Some(l) = self.layout {
                     let a = Some(self.cursor);
                     self.zoom_to(l.z * (1.0 + delta), a);
@@ -3600,6 +3795,31 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// A sideways two-finger drag: one image per gesture, previous for a drag to the left,
+    /// next for a drag to the right, once SWIPE_PX of mostly-sideways travel adds up. A new
+    /// gesture starts with the touchpad's Started phase, or after SWIPE_GAP without events
+    /// (Windows reports no phases). Returns true when the event was taken as a swipe.
+    fn swipe(&mut self, dx: f64, dy: f64, phase: TouchPhase) -> bool {
+        let now = Instant::now();
+        if phase == TouchPhase::Started || self.swipe_at.is_none_or(|t| now - t > SWIPE_GAP) {
+            self.swipe_acc = 0.0;
+            self.swipe_done = false;
+        }
+        if dx.abs() <= dy.abs() {
+            return false;
+        }
+        self.swipe_at = Some(now);
+        if self.swipe_done {
+            return true;
+        }
+        self.swipe_acc += dx * SWIPE_SIGN;
+        if self.swipe_acc.abs() >= SWIPE_PX * self.sf() as f64 {
+            self.swipe_done = true;
+            self.step(if self.swipe_acc > 0.0 { 1 } else { -1 }, false);
+        }
+        true
     }
 
     /// Timers for this window (animation, slideshow, toast, fade); returns the next deadline.
@@ -3629,6 +3849,13 @@ impl App {
             self.check_gone();
         }
         let gone_at = self.playlist.is_some().then(|| self.gone_at);
+        // pinch settled: draw once more at full quality
+        let pinch_end = self.pinch_at.map(|t| t + PINCH_SETTLE);
+        if pinch_end.is_some_and(|t| now >= t) {
+            self.pinch_at = None;
+            self.request_redraw();
+        }
+        let pinch_end = self.pinch_at.map(|t| t + PINCH_SETTLE);
         // Chrome fade: one frame every 16 ms until it settles (unpaced it drew ~380 fps).
         let fade_at = self.fade_active.then(|| self.fade_last + Duration::from_millis(16));
         if let Some(t) = fade_at {
@@ -3636,7 +3863,7 @@ impl App {
                 self.request_redraw();
             }
         }
-        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at]
+        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end]
             .into_iter()
             .flatten()
             .min()

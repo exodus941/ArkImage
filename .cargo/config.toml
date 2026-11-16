@@ -5,3 +5,4 @@
 # x64-windows triplet instead.
 [env]
 VCPKGRS_TRIPLET = "x64-windows-static-md"
+

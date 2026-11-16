@@ -27,6 +27,15 @@ const CELL_W: f32 = 184.0;
 const CELL_H: f32 = 208.0;
 const TOP: f32 = 52.0;
 const SIDE: f32 = 24.0;
+/// The grid is a panel inset from every window edge, with rounded corners, a close button
+/// in its header and 16 px under the last row. (Panel and close button added 2026-11-16
+/// by Claude on the Mac, for Windows and macOS; see docs/windows-handoff.md.)
+const INSET: f32 = 32.0;
+const PANEL_R: f32 = 16.0;
+const BOTTOM: f32 = 16.0;
+/// Close button: a 32 px square, 10 px from the panel's top and right edges, centred on the header.
+const CLOSE: f32 = 32.0;
+const CLOSE_INSET: f32 = 10.0;
 /// Thumbnails kept in memory (160 px RGBA is about 100 KB each).
 const CACHE_MAX: usize = 900;
 
@@ -127,6 +136,22 @@ pub struct Picker {
     /// Blurred, dimmed copy of the viewer behind the grid, and its size.
     pub bg: Vec<u32>,
     pub bg_dims: (usize, usize),
+    /// Hover fade of the close button, 0 or 1.
+    pub close_hover: bool,
+}
+
+/// Panel rectangle (x, y, w, h) in physical px.
+pub fn panel_rect(w: f32, h: f32, sf: f32) -> (f32, f32, f32, f32) {
+    let i = (INSET * sf).round();
+    (i, i, (w - 2.0 * i).max(1.0), (h - 2.0 * i).max(1.0))
+}
+
+/// Close button rectangle (x0, y0, x1, y1) in physical px.
+pub fn close_rect(w: f32, h: f32, sf: f32) -> (f32, f32, f32, f32) {
+    let (px, py, pw, _) = panel_rect(w, h, sf);
+    let (s, i) = ((CLOSE * sf).round(), (CLOSE_INSET * sf).round());
+    let x1 = px + pw - i;
+    (x1 - s, py + i, x1, py + i + s)
 }
 
 pub struct Grid {
@@ -141,10 +166,11 @@ pub struct Grid {
 impl Picker {
     pub fn grid(&self, w: f32, h: f32, sf: f32) -> Grid {
         let (cw, ch) = (CELL_W * sf, CELL_H * sf);
-        let cols = (((w - 2.0 * SIDE * sf) / cw).floor() as usize).max(1);
-        let x0 = ((w - cols as f32 * cw) / 2.0).round();
-        let top = TOP * sf;
-        Grid { cols, cw, ch, x0, top, view_h: (h - top).max(1.0) }
+        let (px, py, pw, ph) = panel_rect(w, h, sf);
+        let cols = (((pw - 2.0 * SIDE * sf) / cw).floor() as usize).max(1);
+        let x0 = (px + (pw - cols as f32 * cw) / 2.0).round();
+        let top = py + TOP * sf;
+        Grid { cols, cw, ch, x0, top, view_h: (py + ph - BOTTOM * sf - top).max(1.0) }
     }
 
     fn max_scroll(&self, g: &Grid, n: usize) -> f32 {
@@ -175,7 +201,7 @@ impl Picker {
     }
 
     pub fn index_at(&self, g: &Grid, x: f32, y: f32, n: usize) -> Option<usize> {
-        if y < g.top || x < g.x0 {
+        if y < g.top || y >= g.top + g.view_h || x < g.x0 {
             return None;
         }
         let col = ((x - g.x0) / g.cw) as usize;
@@ -225,13 +251,17 @@ impl Picker {
         let n = entries.len();
         let g = self.grid(c.w as f32, c.h as f32, sf);
         self.clamp(&g, n);
-        // Background: the viewer, blurred and dimmed, made once per open/resize.
-        // (Re-blurring the full window every frame cost 41 ms at 1600x1000.)
+        // Background: the viewer, blurred and dimmed, with the panel on it; made once per
+        // open/resize. (Re-blurring the full window every frame cost 41 ms at 1600x1000.)
+        let (px, py, pw, ph) = panel_rect(c.w as f32, c.h as f32, sf);
         if self.bg_dims == (c.w, c.h) && self.bg.len() == c.buf.len() {
             c.buf.copy_from_slice(&self.bg);
         } else {
             c.blur(0, 0, c.w as i32, c.h as i32, (12.0 * sf) as usize);
-            c.rect_alpha(0, 0, c.w as i32, c.h as i32, 0x0C0C0C, 215);
+            c.rect_alpha(0, 0, c.w as i32, c.h as i32, 0x0C0C0C, 160);
+            // the panel: the icon's base grey, nearly opaque, with a faint edge
+            c.fill_rrect(px, py, pw, ph, PANEL_R * sf, crate::ui::ICON_GREY, 0.94);
+            c.stroke_rrect(px, py, pw, ph, PANEL_R * sf, sf.max(1.0), 0xFFFFFF, 0.08);
             self.bg = c.buf.to_vec();
             self.bg_dims = (c.w, c.h);
         }
@@ -302,16 +332,31 @@ impl Picker {
                 let _ = lh;
             }
         }
-        // header (opaque, so cells scrolling under it do not show through)
-        c.rect_alpha(0, 0, c.w as i32, g.top as i32, 0x141414, 255);
-        c.rect_alpha(0, g.top as i32 - 1, c.w as i32, 1, 0x3A3A3A, 255);
+        // clip: cells that scrolled past the grid's top or bottom are covered with the
+        // cached background (panel header and bottom padding, and the margin around it)
+        let (y_top, y_bot) = (g.top.max(0.0) as usize, ((g.top + g.view_h).ceil() as usize).min(c.h));
+        c.buf[..y_top.min(c.h) * c.w].copy_from_slice(&self.bg[..y_top.min(c.h) * c.w]);
+        c.buf[y_bot * c.w..].copy_from_slice(&self.bg[y_bot * c.w..]);
+        c.rect_alpha(px as i32, g.top as i32 - 1, pw as i32, sf.max(1.0) as i32, 0xFFFFFF, 20);
+        let mid = py + (TOP * sf) / 2.0;
+        // close button: a hover plate behind the Tabler X, as the bottom bar's buttons
+        let (x0, y0, x1, y1) = close_rect(c.w as f32, c.h as f32, sf);
+        if self.close_hover {
+            c.fill_rrect(x0, y0, x1 - x0, y1 - y0, 8.0 * sf, 0xFFFFFF, 0.12);
+        }
+        let col = if self.close_hover { 0xFFFFFF } else { 0xC8C8C8 };
+        crate::icons::draw(c, crate::icons::Icon::Close, (x0 + x1) / 2.0, (y0 + y1) / 2.0, 20.0 * sf, col);
         if let Some(t) = t.as_deref_mut() {
-            let px = 14.0 * sf;
+            let fpx = 14.0 * sf;
             let head = format!("Select Image   {} / {}", self.sel + 1, n);
-            t.draw(c, (SIDE * sf).round(), (16.0 * sf).round(), &head, px, 0xF0F0F0);
+            let lh = t.line_height(fpx);
+            t.draw(c, (px + SIDE * sf).round(), (mid - lh / 2.0).round(), &head, fpx, 0xF0F0F0);
             let hint = "Enter open   Esc close   arrows, PgUp/PgDn, Home/End, wheel";
-            let hw = t.width(hint, 12.0 * sf);
-            t.draw(c, (c.w as f32 - SIDE * sf - hw).round(), (16.0 * sf).round(), hint, 12.0 * sf, 0x9A9A9A);
+            let hpx = 12.0 * sf;
+            let hw = t.width(hint, hpx);
+            let hl = t.line_height(hpx);
+            // 16 px clear of the close button
+            t.draw(c, (x0 - 16.0 * sf - hw).round(), (mid - hl / 2.0).round(), hint, hpx, 0x9A9A9A);
         }
         // scrollbar
         let max = self.max_scroll(&g, n);
@@ -319,7 +364,7 @@ impl Picker {
             let track = g.view_h - 8.0 * sf;
             let thumb_h = (track * g.view_h / (g.view_h + max)).max(24.0 * sf);
             let y = g.top + 4.0 * sf + (track - thumb_h) * (self.scroll / max);
-            c.fill_rrect(c.w as f32 - 12.0 * sf, y, 4.0 * sf, thumb_h, 2.0 * sf, 0xFFFFFF, 0.35);
+            c.fill_rrect(px + pw - 12.0 * sf, y, 4.0 * sf, thumb_h, 2.0 * sf, 0xFFFFFF, 0.35);
         }
         // nearest the selection first; workers pop from the end, so sort farthest-first
         let pos: HashMap<&Entry, usize> = vis.clone().map(|i| (&entries[i], i)).collect();

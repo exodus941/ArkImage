@@ -18,6 +18,8 @@ mod ipc;
 mod lottie;
 mod master;
 mod picker;
+#[cfg(windows)]
+mod popup_win;
 mod psd_fast;
 mod render;
 mod reveal;
