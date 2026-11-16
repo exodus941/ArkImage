@@ -102,6 +102,13 @@ impl Text {
         self.fonts[self.cur as usize].horizontal_line_metrics(px).map(|m| m.ascent).unwrap_or(px)
     }
 
+    /// Cap height of the current face at `px`: the top of a rendered "H" above its baseline.
+    /// Measured per face and size, never a fixed ratio.
+    pub fn cap_height(&mut self, px: f32) -> f32 {
+        let m = self.glyph('H', px).0;
+        m.height as f32 + m.ymin as f32
+    }
+
     pub fn width(&mut self, s: &str, px: f32) -> f32 {
         s.chars().map(|c| self.glyph(c, px).0.advance_width).sum()
     }

@@ -38,10 +38,9 @@ pub enum Icon {
     Eraser,
     FileText,
     Eye,
-    PlayerPlay,
-    Bookmark,
     Pencil,
     Copy,
+    Power,
 }
 
 fn svg(i: Icon) -> &'static str {
@@ -77,10 +76,9 @@ fn svg(i: Icon) -> &'static str {
         Icon::Eraser => include_str!("../assets/icons/eraser.svg"),
         Icon::FileText => include_str!("../assets/icons/file-text.svg"),
         Icon::Eye => include_str!("../assets/icons/eye.svg"),
-        Icon::PlayerPlay => include_str!("../assets/icons/player-play.svg"),
-        Icon::Bookmark => include_str!("../assets/icons/bookmark.svg"),
         Icon::Pencil => include_str!("../assets/icons/pencil.svg"),
         Icon::Copy => include_str!("../assets/icons/copy.svg"),
+        Icon::Power => include_str!("../assets/icons/power.svg"),
     }
 }
 

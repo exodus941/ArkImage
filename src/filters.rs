@@ -2,7 +2,8 @@
 //! The built-in presets are read-only; the user can add copies and delete them.
 //! `Config::filter` is an index into `all()`: built-ins first, then the user's.
 
-/// Resize kernels, by index. 0 uses the Interpolation setting.
+/// Resize kernels, by index. 0 was "Interpolation setting" (the old Interpolation menu); it is
+/// no longer offered, and a saved 0 loads as 4, Lanczos3, what that menu defaulted to.
 pub const KERNELS: [&str; 7] = ["Interpolation setting", "None (Nearest)", "Bilinear", "Bicubic", "Lanczos3", "Lanczos4 (sharpest)", "Mitchell (no halos)"];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,10 +32,10 @@ fn p(name: &str, kernel: u8, amount: u16, radius: u16, threshold: u8) -> Preset 
 pub fn builtins() -> Vec<Preset> {
     vec![
         p("No Filter", 1, 0, 100, 0),
-        p("Soften", 0, 0, 100, 0),
-        p("Soften+Sharpen", 0, 60, 100, 0),
-        p("Sharpen More", 0, 120, 100, 2),
-        p("Sharpen Fine Detail", 0, 80, 60, 0),
+        p("Soften", 4, 0, 100, 0),
+        p("Soften+Sharpen", 4, 60, 100, 0),
+        p("Sharpen More", 4, 120, 100, 2),
+        p("Sharpen Fine Detail", 4, 80, 60, 0),
     ]
 }
 
@@ -71,7 +72,7 @@ impl Preset {
         }
         Some(Self {
             name,
-            kernel: it.next()?.trim().parse::<u8>().ok()?.min(KERNELS.len() as u8 - 1),
+            kernel: match it.next()?.trim().parse::<u8>().ok()?.min(KERNELS.len() as u8 - 1) { 0 => 4, k => k },
             amount: it.next()?.trim().parse::<u16>().ok()?.min(AMOUNT_MAX),
             radius: it.next()?.trim().parse::<u16>().ok()?.clamp(RADIUS_MIN, RADIUS_MAX),
             threshold: it.next()?.trim().parse::<u8>().ok()?.min(THRESHOLD_MAX),

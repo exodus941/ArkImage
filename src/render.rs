@@ -54,14 +54,6 @@ impl Canvas<'_> {
         }
     }
 
-    /// Vertical gradient from `top` to `bot` over rows y..y+h, painted with `alpha`.
-    pub fn vgrad(&mut self, x: i32, y: i32, w: i32, h: i32, top: u32, bot: u32, alpha: u32) {
-        for i in 0..h.max(0) {
-            let t = if h > 1 { (i * 255 / (h - 1)) as u32 } else { 0 };
-            self.rect_alpha(x, y + i, w, 1, mix(top, bot, t), alpha);
-        }
-    }
-
     /// Blur a rectangle in place: three box passes each way (close to a Gaussian, sigma ~ r).
     /// The rectangle is box-downsampled by BLUR_F first; at 4x a 3440x142 strip costs 1/16 per pass.
     pub fn blur(&mut self, x: i32, y: i32, w: i32, h: i32, r: usize) {

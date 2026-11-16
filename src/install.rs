@@ -300,7 +300,12 @@ pub enum Card {
     Failed(String),
     UpToDate,
     UpdateFailed(String),
+    /// Close All Instances: confirm before every window closes.
+    CloseAll,
 }
+
+/// Set by the Close All Instances card; the master closes every window on its next tick.
+pub static CLOSE_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl Card {
     /// Title, body lines, and buttons (primary first).
@@ -334,6 +339,11 @@ impl Card {
                 vec!["Close"],
             ),
             Card::UpdateFailed(e) => ("Update check failed".into(), vec![e.clone()], vec!["Close"]),
+            Card::CloseAll => (
+                "Close All Instances".into(),
+                vec!["Every ArkImage window closes now.".into()],
+                vec!["Close All", "Cancel"],
+            ),
         }
     }
 
@@ -344,6 +354,10 @@ impl Card {
                 Ok(_) => Card::Installed,
                 Err(e) => Card::Failed(e),
             }),
+            (Card::CloseAll, 0) => {
+                CLOSE_ALL.store(true, std::sync::atomic::Ordering::SeqCst);
+                None
+            }
             (Card::Installed, 0) => {
                 open_default_apps();
                 None

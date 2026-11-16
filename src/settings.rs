@@ -137,8 +137,9 @@ impl ChoiceF {
                 .map(|(i, p)| if crate::filters::is_builtin(i as u8) { format!("{} (built-in)", p.name) } else { p.name })
                 .collect(),
             ChoiceF::Sort => s(&["Name", "Date modified", "Size", "Type"]),
-            ChoiceF::Double => s(&["Off", "Smart Double page (Left->Right)", "Smart Double page (Left<-Right)"]),
-            ChoiceF::Kernel => s(&crate::filters::KERNELS),
+            ChoiceF::Double => s(&["Off", "Smart Double Page (Left->Right)", "Smart Double Page (Left<-Right)"]),
+            // index 0 ("Interpolation setting") is not offered: the list starts at 1
+            ChoiceF::Kernel => s(&crate::filters::KERNELS[1..]),
         }
     }
     pub fn get(self, c: &Config) -> u8 {
@@ -148,7 +149,7 @@ impl ChoiceF {
             ChoiceF::Filter => c.filter,
             ChoiceF::Sort => c.sort,
             ChoiceF::Double => c.double,
-            ChoiceF::Kernel => crate::filters::get(&c.filter_presets, c.filter).kernel,
+            ChoiceF::Kernel => crate::filters::get(&c.filter_presets, c.filter).kernel.saturating_sub(1),
         }
     }
     /// False for a control the user may not change now (a built-in preset's fields).
@@ -164,7 +165,7 @@ impl ChoiceF {
             ChoiceF::Double => c.double = v,
             ChoiceF::Kernel => {
                 if let Some(p) = user_preset(c) {
-                    p.kernel = v.min(crate::filters::KERNELS.len() as u8 - 1);
+                    p.kernel = (v + 1).min(crate::filters::KERNELS.len() as u8 - 1);
                 }
             }
         }
@@ -422,6 +423,8 @@ pub struct Dialog {
     pub card: Option<crate::install::Card>,
     pub card_hits: Vec<(f32, f32, f32, f32)>,
     pub card_hover: Option<usize>,
+    /// When the card appeared, for its 250 ms fade-in.
+    pub card_at: Option<std::time::Instant>,
     /// Update check shown in the Version row, the one before it, and when it changed.
     pub upd: Upd,
     upd_prev: Upd,
@@ -459,7 +462,7 @@ impl Dialog {
     pub fn new(window: Arc<Window>, snapshot: Config, tab: usize) -> Option<Self> {
         let ctx = softbuffer::Context::new(window.clone()).ok()?;
         let surface = softbuffer::Surface::new(&ctx, window.clone()).ok()?;
-        Some(Self { window, _ctx: ctx, surface, tab, snapshot, cursor: (0.0, 0.0), hover: None, hover_fx: Vec::new(), hover_at: std::time::Instant::now(), capturing: None, renaming: false, num_edit: None, scroll: 0.0, scroll_max: 0.0, mica: false, card: None, card_hits: Vec::new(), card_hover: None, upd: Upd::Idle, upd_prev: Upd::Idle, upd_at: std::time::Instant::now(), hits: Vec::new() })
+        Some(Self { window, _ctx: ctx, surface, tab, snapshot, cursor: (0.0, 0.0), hover: None, hover_fx: Vec::new(), hover_at: std::time::Instant::now(), capturing: None, renaming: false, num_edit: None, scroll: 0.0, scroll_max: 0.0, mica: false, card: None, card_hits: Vec::new(), card_hover: None, card_at: None, upd: Upd::Idle, upd_prev: Upd::Idle, upd_at: std::time::Instant::now(), hits: Vec::new() })
     }
 
     /// Scroll the page by `dy` design px.
@@ -522,7 +525,14 @@ impl Dialog {
         self.scroll = self.scroll.min(self.scroll_max);
         if let (Some(card), Some(t)) = (&self.card, text) {
             let (title, body, buttons) = card.content();
-            self.card_hits = crate::ui::modal_card(&mut c, t, sf, &title, &body, &buttons, self.card_hover);
+            let at = *self.card_at.get_or_insert_with(std::time::Instant::now);
+            let a = (at.elapsed().as_secs_f32() / 0.25).min(1.0);
+            if a < 1.0 {
+                self.window.request_redraw();
+            }
+            self.card_hits = crate::ui::modal_card(&mut c, t, sf, &title, &body, &buttons, self.card_hover, a);
+        } else if self.card.is_none() {
+            self.card_at = None;
         }
         if self.mica {
             drawing::see_through(&mut c, sf);

@@ -375,6 +375,8 @@ pub struct App {
     modal: Option<crate::install::Card>,
     modal_hits: Vec<(f32, f32, f32, f32)>,
     modal_hover: Option<usize>,
+    /// When the modal card appeared, for its 250 ms fade-in.
+    modal_at: Option<Instant>,
     last_click: Option<(Instant, (f64, f64))>,
     wheel_acc: f64,
     /// Last pinch event: while set, the image is drawn by sampling only the visible pixels,
@@ -558,6 +560,7 @@ impl App {
             modal: None,
             modal_hits: Vec::new(),
             modal_hover: None,
+            modal_at: None,
             last_click: None,
             wheel_acc: 0.0,
             pinch_at: None,
@@ -1129,8 +1132,8 @@ impl App {
         }
         self.invalidate();
         self.msg(match self.cfg.double {
-            1 => "Smart Double page (Left->Right)",
-            2 => "Smart Double page (Left<-Right)",
+            1 => "Smart Double Page (Left->Right)",
+            2 => "Smart Double Page (Left<-Right)",
             _ => "Double page: Off",
         });
     }
@@ -1685,7 +1688,14 @@ impl App {
         }
         if let Some(m) = &self.modal {
             let (title, body, buttons) = m.content();
-            self.modal_hits = crate::ui::modal_card(c, &mut t, sf, &title, &body, &buttons, self.modal_hover);
+            let at = *self.modal_at.get_or_insert_with(Instant::now);
+            let a = (at.elapsed().as_secs_f32() / 0.25).min(1.0);
+            if a < 1.0 {
+                self.request_redraw();
+            }
+            self.modal_hits = crate::ui::modal_card(c, &mut t, sf, &title, &body, &buttons, self.modal_hover, a);
+        } else {
+            self.modal_at = None;
         }
         if let Some((a, b)) = self.zoom_rect {
             // zoom rectangle: a light blue tint with a 1 px edge
@@ -1749,7 +1759,6 @@ impl App {
             show_top,
             show_bottom,
             maximized: self.window.as_ref().map(|w| w.is_maximized()).unwrap_or(false),
-            lock_top: self.cfg.lock_top,
             lock_bottom: self.cfg.lock_bottom,
             hover_fx: &hover_fx,
             tip_fx: &tip_fx,
@@ -1760,6 +1769,7 @@ impl App {
             anim_fmt: &anim_fmt,
             anim_speed: self.anim_speed,
             anim_fps: self.anim_fps(),
+            page_drag: self.page_drag(),
         };
         // Keep the rows under a partly faded bar, draw the bar, then blend the two.
         let top_rows = ((chrome::top_zone(sf) + 2.0).ceil() as usize).min(c.h);
@@ -2169,6 +2179,17 @@ impl App {
         }
     }
 
+    /// While the page track is dragged: (cursor x, cursor y, 0-1 along the track).
+    fn page_drag(&self) -> Option<(f32, f32, f32)> {
+        if !self.slider_drag || self.len() < 2 {
+            return None;
+        }
+        let sz = self.window.as_ref()?.inner_size();
+        let (sx, _, sw, sh) = chrome::slider_rect(sz.width as f32, sz.height as f32, self.sf());
+        let f = ((self.cursor.0 as f32 - sx - sh / 2.0) / (sw - sh)).clamp(0.0, 1.0);
+        Some((self.cursor.0 as f32, self.cursor.1 as f32, f))
+    }
+
     fn slider_seek(&mut self) {
         let Some(w) = &self.window else { return };
         let sz = w.inner_size();
@@ -2262,8 +2283,8 @@ impl App {
                 C("mode0".into(), "Original Size (100%)".into(), "0", cfg.view_mode == 0),
                 C("mode1".into(), "Fit in Window".into(), "9", cfg.view_mode == 1),
                 C("mode2".into(), "Fit to Width".into(), "8", cfg.view_mode == 2),
-                C("dbl1".into(), "Smart Double page (Left->Right)".into(), "7", cfg.double == 1),
-                C("dbl2".into(), "Smart Double page (Left<-Right)".into(), "6", cfg.double == 2),
+                C("dbl1".into(), "Smart Double Page (Left->Right)".into(), "7", cfg.double == 1),
+                C("dbl2".into(), "Smart Double Page (Left<-Right)".into(), "6", cfg.double == 2),
             ]
         };
         match kind {
@@ -2279,7 +2300,7 @@ impl App {
                 let cur = self.slideshow.map(|s| s.0).unwrap_or(0);
                 let mut m = vec![C("ss:0".into(), "Stop Slideshow".into(), "Ctrl+0", cur == 0), S];
                 for s in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 60, 90] {
-                    let label = if s == 1 { "1 second".to_string() } else { format!("{s} seconds") };
+                    let label = if s == 1 { "1 Second".to_string() } else { format!("{s} Seconds") };
                     let key = if s < 10 { ["", "Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6", "Ctrl+7", "Ctrl+8", "Ctrl+9"][s as usize] } else { "" };
                     m.push(C(format!("ss:{s}"), label, key, cur == s));
                 }
@@ -2328,18 +2349,17 @@ impl App {
                 I("reveal".into(), if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in Windows Explorer" }.into(), "Ctrl+Enter", has),
                 I("reveal_all".into(), if cfg!(target_os = "macos") { "Show Open Images from Same Folder in Finder" } else { "Select Open Images from Same Folder in Explorer" }.into(), "", has),
                 S,
-                C("f0".into(), "No Filter".into(), "U", cfg.filter == 0),
-                C("f1".into(), "Soften".into(), "I", cfg.filter == 1),
-                C("f2".into(), "Soften+Sharpen".into(), "S", cfg.filter == 2),
-                Sub("Filter Presets".into(), {
+                // every preset, the three with hotkeys first (U, I, S)
+                Sub("Filters".into(), {
+                    let keys = ["U", "I", "S"];
                     let mut v: Vec<MenuEntry> = crate::filters::all(&cfg.filter_presets)
                         .into_iter()
                         .enumerate()
-                        .skip(3)
-                        .map(|(i, p)| C(format!("f{i}"), p.name, "", cfg.filter as usize == i))
+                        .map(|(i, p)| C(format!("f{i}"), p.name, keys.get(i).copied().unwrap_or(""), cfg.filter as usize == i))
                         .collect();
+                    v.insert(3, S);
                     v.push(S);
-                    v.push(I("fedit".into(), "Edit Filter Presets...".into(), "", true));
+                    v.push(I("fedit".into(), "Edit Filters...".into(), "", true));
                     v
                 }),
                 S,
@@ -2355,13 +2375,6 @@ impl App {
                     I("nextdir".into(), "Next Folder/Compressed File".into(), "]", has),
                     I("prevdir".into(), "Previous Folder/Compressed File".into(), "[", has),
                 ]),
-                Sub("Interpolation".into(), vec![
-                    C("ip0".into(), "Bilinear Interpolation (Fast)".into(), "", cfg.interp == 0),
-                    C("ip1".into(), "Bicubic Interpolation (Slow, High Quality)".into(), "", cfg.interp == 1),
-                    C("ip2".into(), "Lanczos Interpolation (Slow, High Quality)".into(), "", cfg.interp == 2),
-                    C("ip3".into(), "Lanczos4 Interpolation (Sharpest)".into(), "", cfg.interp == 3),
-                    C("ip4".into(), "Mitchell Interpolation (No Halos)".into(), "", cfg.interp == 4),
-                ]),
                 Sub("Image Effect".into(), vec![
                     C("neg".into(), "Reverse Image".into(), "Ctrl+I", v.negative),
                     C("gamma".into(), "Gamma Compensation".into(), "Ctrl+G", v.gamma),
@@ -2370,7 +2383,7 @@ impl App {
                 ]),
                 Sub("Sort by".into(), vec![
                     C("sort0".into(), "Name".into(), "", cfg.sort == 0),
-                    C("sort1".into(), "Date modified".into(), "", cfg.sort == 1),
+                    C("sort1".into(), "Date Modified".into(), "", cfg.sort == 1),
                     C("sort2".into(), "Size".into(), "", cfg.sort == 2),
                     C("sort3".into(), "Type".into(), "", cfg.sort == 3),
                     S,
@@ -2383,23 +2396,24 @@ impl App {
                     I("zout".into(), "Zoom Out".into(), "-", has),
                     C("zfix".into(), "Fix".into(), "Ctrl+K", v.zoom_fixed),
                     I("z100".into(), "100%".into(), "*", has),
-                    I("zin1".into(), "Zoom In(1%)".into(), "Ctrl++", has),
-                    I("zout1".into(), "Zoom Out(1%)".into(), "Ctrl+-", has),
+                    I("zin1".into(), "Zoom In (1%)".into(), "Ctrl++", has),
+                    I("zout1".into(), "Zoom Out (1%)".into(), "Ctrl+-", has),
                 ]),
                 Sub("Rotate".into(), vec![
-                    C("rot0".into(), "Do not rotate".into(), "Alt+Up", v.rotation == 0),
-                    C("rotl".into(), "Rotate 90˚ counter-clockwise".into(), "Alt+Left", v.rotation == 3),
-                    C("rotr".into(), "Rotate 90˚ clockwise".into(), "Alt+Right", v.rotation == 1),
-                    C("rot180".into(), "180˚".into(), "Alt+Down", v.rotation == 2),
+                    C("rot0".into(), "Do Not Rotate".into(), "Alt+Up", v.rotation == 0),
+                    C("rotl".into(), "Rotate 90° Counter-Clockwise".into(), "Alt+Left", v.rotation == 3),
+                    C("rotr".into(), "Rotate 90° Clockwise".into(), "Alt+Right", v.rotation == 1),
+                    C("rot180".into(), "Rotate 180°".into(), "Alt+Down", v.rotation == 2),
                 ]),
                 S,
-                C("info".into(), "File/EXIF information".into(), "TAB", self.show_info),
+                C("info".into(), "File/EXIF Information".into(), "Tab", self.show_info),
                 I("delete".into(), "Delete".into(), "Del", has),
                 I("copy1".into(), "Copy to Photo Folder".into(), "Ins", has),
                 I("editor".into(), "Open with Image Editor".into(), "Ctrl+E", has),
                 I("clip".into(), "Copy to Clipboard".into(), "Ctrl+C", has),
                 S,
                 I("config".into(), "Settings".into(), "F5", true),
+                I("closeall".into(), "Close All Instances".into(), "", true),
                 I("exit".into(), "Exit".into(), "X", true),
             ],
         }
@@ -3158,6 +3172,11 @@ impl App {
             }
             "config" => self.open_settings(el, 0),
             "exit" => self.exit(el),
+            "closeall" => {
+                self.modal = Some(crate::install::Card::CloseAll);
+                self.modal_hover = None;
+                self.request_redraw();
+            }
             "pageselect" => self.open_picker(),
             _ => {}
         }
@@ -3202,6 +3221,11 @@ impl App {
         let (x0, y0, x1, y1) = picker::close_rect(w, h, sf);
         let (px, py, pw, ph) = picker::panel_rect(w, h, sf);
         (x >= x0 && x < x1 && y >= y0 && y < y1, x < px || x >= px + pw || y < py || y >= py + ph)
+    }
+
+    fn picker_bar(&self) -> Option<picker::Bar> {
+        let sz = self.window.as_ref()?.inner_size();
+        self.picker.bar(sz.width as f32, sz.height as f32, self.sf(), self.len())
     }
 
     fn picker_index_at_cursor(&self) -> Option<usize> {
@@ -3289,7 +3313,7 @@ impl App {
     }
 
     /// Close this window. The master drops closed viewers and quits after the last one.
-    fn exit(&mut self, _el: &ActiveEventLoop) {
+    pub fn exit(&mut self, _el: &ActiveEventLoop) {
         self.store_geometry();
         self.cfg.save();
         self.closed = true;
@@ -3548,6 +3572,14 @@ impl App {
             }
             WindowEvent::CursorMoved { position, .. } if self.picker.open => {
                 self.cursor = (position.x, position.y);
+                // dragging the scroll handle: keep the grab point under the cursor
+                if let Some(grab) = self.picker.bar_drag {
+                    if let Some(b) = self.picker_bar() {
+                        self.picker.scroll = b.scroll_for(position.y as f32 - grab);
+                        self.request_redraw();
+                    }
+                    return;
+                }
                 let h = self.picker_index_at_cursor();
                 let ch = self.picker_close_at_cursor().0;
                 if h != self.picker.hover || ch != self.picker.close_hover {
@@ -3603,14 +3635,25 @@ impl App {
                 (MouseButton::Left, ElementState::Pressed) if self.picker.open => {
                     // the close button, or a click outside the panel, closes the grid
                     let (on_close, outside) = self.picker_close_at_cursor();
-                    if on_close || outside {
+                    let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
+                    if let Some(b) = self.picker_bar().filter(|b| b.hit(x, y, self.sf())) {
+                        // on the handle: grab it where pressed; on the track: centre it there
+                        let grab = if y >= b.y && y < b.y + b.h { y - b.y } else { b.h / 2.0 };
+                        self.picker.scroll = b.scroll_for(y - grab);
+                        self.picker.bar_drag = Some(grab);
+                        self.request_redraw();
+                    } else if on_close || outside {
                         self.close_picker();
                     } else if let Some(i) = self.picker_index_at_cursor() {
                         self.go_to(i);
                         self.close_picker();
                     }
                 }
-                (MouseButton::Left, ElementState::Released) if self.picker.open => {}
+                (MouseButton::Left, ElementState::Released) if self.picker.open => {
+                    if self.picker.bar_drag.take().is_some() {
+                        self.request_redraw();
+                    }
+                }
                 (MouseButton::Left, ElementState::Pressed) if self.modal.is_some() => {
                     let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
                     if let Some(i) = self.modal_hits.iter().position(|r| x >= r.0 && x < r.2 && y >= r.1 && y < r.3) {

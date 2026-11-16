@@ -202,7 +202,32 @@ pub fn message_card(c: &mut Canvas, t: &mut Text, sf: f32, lines: &[String], at:
 
 /// A modal card over a dimmed window: title, body lines, buttons on the right (the first
 /// is primary). Returns each button's rectangle (x0, y0, x1, y1), in button order.
-pub fn modal_card(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, body: &[String], buttons: &[&str], hover: Option<usize>) -> Vec<(f32, f32, f32, f32)> {
+/// Fades in over 250 ms: `alpha` 0-1 blends the finished card over the frame below it.
+pub fn modal_card(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, body: &[String], buttons: &[&str], hover: Option<usize>, alpha: f32) -> Vec<(f32, f32, f32, f32)> {
+    let below = (alpha < 1.0).then(|| c.buf.to_vec());
+    let rects = modal_card_solid(c, t, sf, title, body, buttons, hover);
+    if let Some(below) = below {
+        let k = (alpha.clamp(0.0, 1.0) * 255.0) as u32;
+        for (p, b) in c.buf.iter_mut().zip(below) {
+            *p = crate::render::mix(b, *p, k);
+        }
+    }
+    rects
+}
+
+/// The Tabler icon drawn before a modal button's label, if any.
+fn modal_icon(label: &str) -> Option<crate::icons::Icon> {
+    use crate::icons::Icon;
+    Some(match label {
+        "Close All" => Icon::Power,
+        "Cancel" | "Close" => Icon::Close,
+        "Install" => Icon::Download,
+        "Reinstall" => Icon::RotateCw2,
+        _ => return None,
+    })
+}
+
+fn modal_card_solid(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, body: &[String], buttons: &[&str], hover: Option<usize>) -> Vec<(f32, f32, f32, f32)> {
     let d = |v: f32| v * sf;
     let (bpx, blh) = (d(BODY.0), d(BODY.1));
     // backdrop: black at 70%, so the image still shows through
@@ -226,7 +251,10 @@ pub fn modal_card(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, body: &[St
     let mut right = x + w - d(24.0);
     let mut rects = vec![(0.0, 0.0, 0.0, 0.0); buttons.len()];
     for (i, label) in buttons.iter().enumerate() {
-        let bw = (width(t, Face::Medium, label, bpx) + d(24.0)).ceil().max(d(96.0));
+        // icon 16 px, 8 px before the label, as on the Settings buttons
+        let icon = modal_icon(label);
+        let cw = width(t, Face::Medium, label, bpx) + if icon.is_some() { d(24.0) } else { 0.0 };
+        let bw = (cw + d(24.0)).ceil().max(d(96.0));
         let bx = right - bw;
         let hv = hover == Some(i);
         if i == 0 {
@@ -235,8 +263,13 @@ pub fn modal_card(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, body: &[St
             c.fill_rrect(bx, by, bw, d(32.0), d(4.0), LINE, 1.0);
             c.fill_rrect(bx + sf, by + sf, bw - 2.0 * sf, d(32.0) - 2.0 * sf, d(3.0), if hv { PANEL2 } else { 0x10141D }, 1.0);
         }
-        let tw = width(t, Face::Medium, label, bpx);
-        line(c, t, Face::Medium, bx + (bw - tw) / 2.0, by + d(6.0), label, (bpx, blh), if i == 0 { 0xFFFFFF } else { SLATE200 });
+        let col = if i == 0 { 0xFFFFFF } else { SLATE200 };
+        let mut lx = (bx + (bw - cw) / 2.0).round();
+        if let Some(ic) = icon {
+            crate::icons::draw(c, ic, lx + d(8.0), by + d(16.0), d(16.0), col);
+            lx += d(24.0);
+        }
+        line(c, t, Face::Medium, lx, by + d(6.0), label, (bpx, blh), col);
         rects[i] = (bx, by, bx + bw, by + d(32.0));
         right = bx - d(8.0);
     }

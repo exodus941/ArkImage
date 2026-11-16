@@ -330,6 +330,16 @@ impl ApplicationHandler<UserEvent> for Master {
             el.exit();
             return;
         }
+        // Close All Instances (confirmed on a card): every window exits now; the last one
+        // ends the process through reap
+        if crate::install::CLOSE_ALL.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            crate::trace("close all instances");
+            for w in &mut self.windows {
+                w.exit(el);
+            }
+            self.reap(el);
+            return;
+        }
         // muda may deliver a menu choice after its popup returned; the focused window gets it
         let i = self.windows.iter().position(|w| w.is_focused()).or(self.windows.len().checked_sub(1));
         if let Some(i) = i {

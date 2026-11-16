@@ -10,9 +10,8 @@ use crate::text::Text;
 #[path = "chrome_bar.rs"]
 mod bar;
 use bar::draw_bottom;
-pub use bar::fmt_speed;
+pub use bar::{fmt_speed, page_label};
 /// Bottom-bar icon size, design px (menus align to the icon's edges).
-pub use bar::ICON_PX as BAR_ICON_PX;
 
 pub const TITLE_H: f32 = 24.0;
 /// Bottom bar: full window width minus BAR_GAP on each side; slider on top, icon row below.
@@ -55,7 +54,6 @@ pub struct State<'a> {
     pub show_top: bool,
     pub show_bottom: bool,
     pub maximized: bool,
-    pub lock_top: bool,
     pub lock_bottom: bool,
     /// Hover fade per control, 0-1: rises over 250 ms while hovered, falls over 250 ms after.
     pub hover_fx: &'a [(&'static str, f32)],
@@ -71,6 +69,9 @@ pub struct State<'a> {
     /// Playback speed (0.25-4) and the frame rate it gives, for the speed pill.
     pub anim_speed: f32,
     pub anim_fps: u32,
+    /// While the page track is dragged: the cursor (physical px) and how far along the
+    /// track it is, 0-1. Draws the page-number pill above the cursor.
+    pub page_drag: Option<(f32, f32, f32)>,
 }
 
 impl State<'_> {
