@@ -18,7 +18,7 @@ use crate::{
     app::UserEvent,
     render::{self, Canvas},
     source::Entry,
-    text::Text,
+    text::{Face, Text},
 };
 
 /// Design px: thumbnail box, cell size, gaps.
@@ -138,6 +138,32 @@ pub struct Picker {
     pub bg_dims: (usize, usize),
     /// Hover fade of the close button, 0 or 1.
     pub close_hover: bool,
+    /// While the scroll handle is dragged: the cursor's offset from the handle's top.
+    pub bar_drag: Option<f32>,
+}
+
+/// The scroll handle: its rectangle, and the track it moves on.
+pub struct Bar {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub track_top: f32,
+    pub track_h: f32,
+    pub max: f32,
+}
+
+impl Bar {
+    /// The grab area: the handle widened to 16 px, centred on it.
+    pub fn hit(&self, x: f32, y: f32, sf: f32) -> bool {
+        let pad = 6.0 * sf;
+        x >= self.x - pad && x < self.x + self.w + pad && y >= self.track_top && y < self.track_top + self.track_h
+    }
+    /// Scroll offset that puts the handle's top at `top`.
+    pub fn scroll_for(&self, top: f32) -> f32 {
+        let room = (self.track_h - self.h).max(1.0);
+        ((top - self.track_top) / room * self.max).clamp(0.0, self.max)
+    }
 }
 
 /// Panel rectangle (x, y, w, h) in physical px.
@@ -171,6 +197,21 @@ impl Picker {
         let x0 = (px + (pw - cols as f32 * cw) / 2.0).round();
         let top = py + TOP * sf;
         Grid { cols, cw, ch, x0, top, view_h: (py + ph - BOTTOM * sf - top).max(1.0) }
+    }
+
+    /// The scroll handle for `n` entries in a w x h window; None when nothing scrolls.
+    pub fn bar(&self, w: f32, h: f32, sf: f32, n: usize) -> Option<Bar> {
+        let g = self.grid(w, h, sf);
+        let max = self.max_scroll(&g, n);
+        if max <= 0.0 {
+            return None;
+        }
+        let (px, _, pw, _) = panel_rect(w, h, sf);
+        let track_top = g.top + 4.0 * sf;
+        let track_h = g.view_h - 8.0 * sf;
+        let thumb_h = (track_h * g.view_h / (g.view_h + max)).max(24.0 * sf);
+        let y = track_top + (track_h - thumb_h) * (self.scroll / max);
+        Some(Bar { x: px + pw - 12.0 * sf, y, w: 4.0 * sf, h: thumb_h, track_top, track_h, max })
     }
 
     fn max_scroll(&self, g: &Grid, n: usize) -> f32 {
@@ -347,24 +388,38 @@ impl Picker {
         let col = if self.close_hover { 0xFFFFFF } else { 0xC8C8C8 };
         crate::icons::draw(c, crate::icons::Icon::Close, (x0 + x1) / 2.0, (y0 + y1) / 2.0, 20.0 * sf, col);
         if let Some(t) = t.as_deref_mut() {
+            // One baseline for the whole header: the title's cap band is centred on the
+            // header, and the count and the hints sit on the title's baseline.
+            let prev = t.face(Face::Title);
             let fpx = 14.0 * sf;
-            let head = format!("Select Image   {} / {}", self.sel + 1, n);
-            let lh = t.line_height(fpx);
-            t.draw(c, (px + SIDE * sf).round(), (mid - lh / 2.0).round(), &head, fpx, 0xF0F0F0);
+            let base = (mid + t.cap_height(fpx) / 2.0).round();
+            let tx = (px + SIDE * sf).round();
+            t.draw_base(c, tx, base, "Select Image", fpx, 0xF0F0F0);
+            let tw = t.width("Select Image", fpx);
+            // the count: Geist Mono in the dark pill of the page-number popup, 12 px after
+            // the title; the pill is centred on the mono cap band, so its text keeps the line
+            t.face(Face::Mono);
+            let npx = 12.0 * sf;
+            let label = crate::chrome::page_label(self.sel + 1, n);
+            let (pad, ph) = ((8.0 * sf).round(), (24.0 * sf).round());
+            let pw = (t.width(&label, npx) + 2.0 * pad).round();
+            let pill_x = (tx + tw + 12.0 * sf).round();
+            let pill_y = (base - t.cap_height(npx) / 2.0 - ph / 2.0).round();
+            c.fill_rrect(pill_x, pill_y, pw, ph, 8.0 * sf, 0x101010, 0.92);
+            t.draw_base(c, pill_x + pad, base, &label, npx, 0xF0F0F0);
+            t.face(Face::Regular);
             let hint = "Enter open   Esc close   arrows, PgUp/PgDn, Home/End, wheel";
             let hpx = 12.0 * sf;
             let hw = t.width(hint, hpx);
-            let hl = t.line_height(hpx);
             // 16 px clear of the close button
-            t.draw(c, (x0 - 16.0 * sf - hw).round(), (mid - hl / 2.0).round(), hint, hpx, 0x9A9A9A);
+            t.draw_base(c, (x0 - 16.0 * sf - hw).round(), base, hint, hpx, 0x9A9A9A);
+            t.face(prev);
         }
         // scrollbar
-        let max = self.max_scroll(&g, n);
-        if max > 0.0 {
-            let track = g.view_h - 8.0 * sf;
-            let thumb_h = (track * g.view_h / (g.view_h + max)).max(24.0 * sf);
-            let y = g.top + 4.0 * sf + (track - thumb_h) * (self.scroll / max);
-            c.fill_rrect(px + pw - 12.0 * sf, y, 4.0 * sf, thumb_h, 2.0 * sf, 0xFFFFFF, 0.35);
+        if let Some(b) = self.bar(c.w as f32, c.h as f32, sf, n) {
+            // brighter while dragged
+            let a = if self.bar_drag.is_some() { 0.6 } else { 0.35 };
+            c.fill_rrect(b.x, b.y, b.w, b.h, 2.0 * sf, 0xFFFFFF, a);
         }
         // nearest the selection first; workers pop from the end, so sort farthest-first
         let pos: HashMap<&Entry, usize> = vis.clone().map(|i| (&entries[i], i)).collect();

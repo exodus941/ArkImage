@@ -318,7 +318,7 @@ impl Config {
             s.push_str(&format!("key{} = {}\n", i + 1, b.format(true)));
         }
         s.push_str("; your filter presets: name|kernel|amount|radius|threshold\n");
-        s.push_str("; kernel 0 interpolation setting, 1 none, 2 bilinear, 3 bicubic, 4 Lanczos3, 5 Lanczos4, 6 Mitchell;\n");
+        s.push_str("; kernel 1 none, 2 bilinear, 3 bicubic, 4 Lanczos3, 5 Lanczos4, 6 Mitchell;\n");
         s.push_str("; amount and radius in hundredths (60 = 0.60); threshold 0-64\n");
         for p in &self.filter_presets {
             s.push_str(&format!("filter_preset = {}\n", p.format()));

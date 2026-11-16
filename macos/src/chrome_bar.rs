@@ -38,20 +38,20 @@ const TIP_GAP: f32 = 8.0;
 /// Every button of the row: id, centre, icon, tooltip.
 fn row(s: &State) -> [(&'static str, f32, Icon, &'static str); 14] {
     [
-        ("bar_open", X_OPEN, Icon::Eject, "Open file"),
+        ("bar_open", X_OPEN, Icon::Eject, "Open File"),
         ("bar_menu", X_MENU, Icon::Menu, "Menu"),
-        ("tb_exif", X_EXIF, Icon::Camera, "File and EXIF info"),
-        ("tb_full", X_FULL, Icon::ArrowsMaximize, "Full screen"),
+        ("tb_exif", X_EXIF, Icon::Camera, "File and EXIF Info"),
+        ("tb_full", X_FULL, Icon::ArrowsMaximize, "Full Screen"),
         ("tb_view", X_VIEW, Icon::Eye, "View"),
         ("tb_edit", X_EDIT, Icon::Pencil, "Edit"),
         ("tb_copyto", X_COPY, Icon::Copy, "Copy to"),
-        ("bar_zin", X_ZIN, Icon::Plus, "Zoom in"),
-        ("bar_zout", X_ZOUT, Icon::Minus, "Zoom out"),
-        ("bar_rotl", X_ROTL, Icon::RotateLeft, "Rotate left"),
-        ("bar_rotr", X_ROTR, Icon::RotateRight, "Rotate right"),
-        ("bar_lock", X_LOCK, if s.lock_bottom { Icon::Lock } else { Icon::LockOpen }, if s.lock_bottom { "Unlock the bar" } else { "Keep the bar visible" }),
-        ("bar_prev", X_PREV, Icon::ChevronLeft, "Previous image"),
-        ("bar_next", X_NEXT, Icon::ChevronRight, "Next image"),
+        ("bar_zin", X_ZIN, Icon::Plus, "Zoom In"),
+        ("bar_zout", X_ZOUT, Icon::Minus, "Zoom Out"),
+        ("bar_rotl", X_ROTL, Icon::RotateLeft, "Rotate Left"),
+        ("bar_rotr", X_ROTR, Icon::RotateRight, "Rotate Right"),
+        ("bar_lock", X_LOCK, if s.lock_bottom { Icon::Lock } else { Icon::LockOpen }, if s.lock_bottom { "Unlock the Bar" } else { "Keep the Bar Visible" }),
+        ("bar_prev", X_PREV, Icon::ChevronLeft, "Previous Image"),
+        ("bar_next", X_NEXT, Icon::ChevronRight, "Next Image"),
     ]
 }
 /// Row centre below the bar top: 16 inset + 12 slider + 16 gap + 12 (half the 24 px row).
@@ -206,5 +206,38 @@ pub(super) fn draw_bottom(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, h
         let col = mix(0x101010, 0xF0F0F0, (a * 255.0) as u32);
         t.draw(c, (x + TIP_PAD * sf).round(), (y + (h - lh) / 2.0).round(), tip, px, col);
     }
+    // page-number pill while the page track is dragged: 8 px above the cursor's hotspot;
+    // at the left end its left edge is 8 px right of the cursor, at the centre it is
+    // centred over the cursor, at the right end its right edge is 8 px left of it
+    if let Some((px0, py0, f)) = s.page_drag {
+        t.face(crate::text::Face::Mono);
+        let label = page_label(s.index + 1, s.len);
+        let px = 12.0 * sf;
+        let w = (t.width(&label, px) + 2.0 * TIP_PAD * sf).round();
+        let h = (TIP_H * sf).round();
+        let g = TIP_GAP * sf;
+        let x = (px0 + g - f * (w + 2.0 * g)).round().clamp(0.0, (c.w as f32 - w).max(0.0));
+        let y = (py0 - g - h).round().max(0.0);
+        c.fill_rrect(x, y, w, h, 8.0 * sf, 0x101010, 0.92);
+        let lh = t.line_height(px);
+        t.draw(c, (x + TIP_PAD * sf).round(), (y + (h - lh) / 2.0).round(), &label, px, 0xF0F0F0);
+    }
     t.face(prev);
+}
+
+/// "593/5,492": the 1-based page and the count, with thousands separators.
+pub fn page_label(i: usize, n: usize) -> String {
+    format!("{}/{}", thousands(i), thousands(n))
+}
+
+fn thousands(v: usize) -> String {
+    let s = v.to_string();
+    let mut out = String::new();
+    for (k, ch) in s.chars().enumerate() {
+        if k > 0 && (s.len() - k) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
