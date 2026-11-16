@@ -153,6 +153,34 @@ pub unsafe fn popup_over(menu: *mut std::ffi::c_void, view: *mut std::ffi::c_voi
     }
 }
 
+/// A context menu at the pointer, placed by AppKit as Finder does: beside the pointer,
+/// flipped up or left to stay on screen, with no scroll arrows unless it is taller than
+/// the screen. Reads the pointer from the system, not from the app's cursor state.
+pub unsafe fn context_menu_at_pointer(menu: *mut std::ffi::c_void, view: *mut std::ffi::c_void) {
+    let (menu, view) = (menu as *mut AnyObject, view as *mut AnyObject);
+    if menu.is_null() || view.is_null() {
+        return;
+    }
+    unsafe {
+        let win: *mut AnyObject = msg_send![view, window];
+        if win.is_null() {
+            return;
+        }
+        let screen_pt: objc2_foundation::NSPoint = msg_send![class!(NSEvent), mouseLocation];
+        let pt: objc2_foundation::NSPoint = msg_send![win, convertPointFromScreen: screen_pt];
+        let num: isize = msg_send![win, windowNumber];
+        let none: *mut AnyObject = std::ptr::null_mut();
+        // NSEventTypeRightMouseDown = 3
+        let ev: *mut AnyObject = msg_send![class!(NSEvent),
+            mouseEventWithType: 3usize, location: pt, modifierFlags: 0usize, timestamp: 0.0f64,
+            windowNumber: num, context: none, eventNumber: 0isize, clickCount: 1isize, pressure: 1.0f32];
+        if ev.is_null() {
+            return;
+        }
+        let _: () = msg_send![class!(NSMenu), popUpContextMenu: menu, withEvent: ev, forView: view];
+    }
+}
+
 /// macOS full screen: the system's title bar slides down at the top edge. Show it as a
 /// standard bar there (title and material); outside full screen it stays transparent and
 /// untitled under the app's own title strip.

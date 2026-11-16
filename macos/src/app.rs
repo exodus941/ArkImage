@@ -476,6 +476,8 @@ pub struct App {
     /// macOS: open the next popup above its control, this many physical px wide (speed menu).
     #[cfg(target_os = "macos")]
     popup_select: Option<(f64, bool)>,
+    /// The next popup is a right-click menu: macOS places it at the pointer.
+    at_pointer: bool,
     /// A preset's name before renaming started (Esc puts it back).
     rename_orig: Option<String>,
     /// Hover fade per chrome control (0-1), and when it was last stepped.
@@ -661,6 +663,7 @@ impl App {
             popup_closed: None,
             #[cfg(target_os = "macos")]
             popup_select: None,
+            at_pointer: false,
             rename_orig: None,
             hover_fx: Vec::new(),
             tip_fx: Vec::new(),
@@ -2059,7 +2062,9 @@ impl App {
                 let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 // a menu at the cursor never takes a button's placement
                 self.popup_select = None;
+                self.at_pointer = true;
                 self.show_menu(el, "context", x, y);
+                self.at_pointer = false;
             }
             other => self.menu_action(el, other),
         }
@@ -2707,6 +2712,7 @@ impl App {
                     match self.popup_select.take() {
                         // a pop-up button: the chosen item opens over the control
                         Some((pw, left)) => crate::mac::popup_over(menu.ns_menu(), h.ns_view.as_ptr() as _, x as f64 / w.scale_factor(), y as f64 / w.scale_factor(), pw / w.scale_factor(), left),
+                        None if self.at_pointer => crate::mac::context_menu_at_pointer(menu.ns_menu(), h.ns_view.as_ptr() as _),
                         None => {
                             menu.show_context_menu_for_nsview(h.ns_view.as_ptr() as _, Some(pos));
                         }
