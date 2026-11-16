@@ -140,7 +140,27 @@ pub struct Picker {
     pub close_hover: bool,
     /// While the scroll handle is dragged: the cursor's offset from the handle's top.
     pub bar_drag: Option<f32>,
+    /// The cursor is over the handle's grab area (or dragging it), and when that last
+    /// changed: the handle's colour fades over 250 ms.
+    pub bar_hot: bool,
+    pub bar_hot_at: Option<std::time::Instant>,
+    /// True while the handle's colour is still fading: the window keeps drawing.
+    pub bar_anim: bool,
 }
+
+/// Scroll handle, a slim column scrollbar: a 4 px
+/// strip against the panel's right edge, rounded 4 px on its inner side only, no track,
+/// slate 600 (#475569) at rest and slate 500 (#64748B) under the cursor. It ends 16 px
+/// inside the scrolling area at the top and the bottom.
+const BAR_W: f32 = 4.0;
+const BAR_INSET: f32 = 16.0;
+/// Grab area: 28 px wide, from the panel's right edge inwards.
+const BAR_GRAB: f32 = 28.0;
+const BAR_REST: u32 = 0x475569;
+const BAR_HOT: u32 = 0x64748B;
+/// Edge fades: at most 16 px, and never more than the distance
+/// scrolled from that edge, so a list at rest has none.
+const EDGE_FADE: f32 = 16.0;
 
 /// The scroll handle: its rectangle, and the track it moves on.
 pub struct Bar {
@@ -154,10 +174,11 @@ pub struct Bar {
 }
 
 impl Bar {
-    /// The grab area: the handle widened to 16 px, centred on it.
+    /// The grab area: BAR_GRAB wide from the panel's right edge inwards, the full track
+    /// tall; the handle looks the same.
     pub fn hit(&self, x: f32, y: f32, sf: f32) -> bool {
-        let pad = 6.0 * sf;
-        x >= self.x - pad && x < self.x + self.w + pad && y >= self.track_top && y < self.track_top + self.track_h
+        let right = self.x + self.w;
+        x >= right - BAR_GRAB * sf && x < right && y >= self.track_top && y < self.track_top + self.track_h
     }
     /// Scroll offset that puts the handle's top at `top`.
     pub fn scroll_for(&self, top: f32) -> f32 {
@@ -207,11 +228,12 @@ impl Picker {
             return None;
         }
         let (px, _, pw, _) = panel_rect(w, h, sf);
-        let track_top = g.top + 4.0 * sf;
-        let track_h = g.view_h - 8.0 * sf;
-        let thumb_h = (track_h * g.view_h / (g.view_h + max)).max(24.0 * sf);
-        let y = track_top + (track_h - thumb_h) * (self.scroll / max);
-        Some(Bar { x: px + pw - 12.0 * sf, y, w: 4.0 * sf, h: thumb_h, track_top, track_h, max })
+        let track_top = (g.top + BAR_INSET * sf).round();
+        let track_h = (g.view_h - 2.0 * BAR_INSET * sf).round();
+        let thumb_h = (track_h * g.view_h / (g.view_h + max)).max(32.0 * sf).round();
+        let y = (track_top + (track_h - thumb_h) * (self.scroll / max)).round();
+        let bw = (BAR_W * sf).round();
+        Some(Bar { x: px + pw - bw, y, w: bw, h: thumb_h, track_top, track_h, max })
     }
 
     fn max_scroll(&self, g: &Grid, n: usize) -> f32 {
@@ -376,6 +398,30 @@ impl Picker {
         // clip: cells that scrolled past the grid's top or bottom are covered with the
         // cached background (panel header and bottom padding, and the margin around it)
         let (y_top, y_bot) = (g.top.max(0.0) as usize, ((g.top + g.view_h).ceil() as usize).min(c.h));
+        // edge fades: cells blend into the panel near an edge they scroll past, over at
+        // most 16 px, with a soft ramp (0, 40% at 0.38, 87% at 0.72, 100%)
+        let max = self.max_scroll(&g, n);
+        let fade_top = (EDGE_FADE * sf).min(self.scroll).round() as usize;
+        let fade_bot = (EDGE_FADE * sf).min((max - self.scroll).max(0.0)).round() as usize;
+        let ramp = |t: f32| -> u32 {
+            let a = if t < 0.38 { t / 0.38 * 0.4 } else if t < 0.72 { 0.4 + (t - 0.38) / 0.34 * 0.47 } else { 0.87 + (t - 0.72) / 0.28 * 0.13 };
+            (a.clamp(0.0, 1.0) * 255.0) as u32
+        };
+        let (fx0, fx1) = ((px.max(0.0)) as usize, ((px + pw) as usize).min(c.w));
+        for d in 0..fade_top {
+            let a = ramp(d as f32 / fade_top as f32);
+            let r = (y_top + d).min(c.h - 1) * c.w;
+            for x in fx0..fx1 {
+                c.buf[r + x] = crate::render::mix(self.bg[r + x], c.buf[r + x], a);
+            }
+        }
+        for d in 0..fade_bot {
+            let a = ramp(d as f32 / fade_bot as f32);
+            let r = y_bot.saturating_sub(1 + d) * c.w;
+            for x in fx0..fx1 {
+                c.buf[r + x] = crate::render::mix(self.bg[r + x], c.buf[r + x], a);
+            }
+        }
         c.buf[..y_top.min(c.h) * c.w].copy_from_slice(&self.bg[..y_top.min(c.h) * c.w]);
         c.buf[y_bot * c.w..].copy_from_slice(&self.bg[y_bot * c.w..]);
         c.rect_alpha(px as i32, g.top as i32 - 1, pw as i32, sf.max(1.0) as i32, 0xFFFFFF, 20);
@@ -415,11 +461,20 @@ impl Picker {
             t.draw_base(c, (x0 - 16.0 * sf - hw).round(), base, hint, hpx, 0x9A9A9A);
             t.face(prev);
         }
-        // scrollbar
+        // scrollbar: rounded on the inner side only. Drawn twice as wide with its radius,
+        // then the outer half (past the panel's edge) is restored from the background.
         if let Some(b) = self.bar(c.w as f32, c.h as f32, sf, n) {
-            // brighter while dragged
-            let a = if self.bar_drag.is_some() { 0.6 } else { 0.35 };
-            c.fill_rrect(b.x, b.y, b.w, b.h, 2.0 * sf, 0xFFFFFF, a);
+            let k = self.bar_hot_at.map(|t| (t.elapsed().as_secs_f32() / 0.25).min(1.0)).unwrap_or(1.0);
+            let hot = if self.bar_hot || self.bar_drag.is_some() { k } else { 1.0 - k };
+            let hot = if self.bar_hot_at.is_none() { 0.0 } else { hot };
+            let col = crate::render::mix(BAR_REST, BAR_HOT, (hot * 255.0) as u32);
+            c.fill_rrect(b.x, b.y, 2.0 * b.w, b.h, (4.0 * sf).round(), col, 1.0);
+            let (x0, x1) = ((b.x + b.w) as usize, ((b.x + 2.0 * b.w) as usize).min(c.w));
+            for y in (b.y as usize)..((b.y + b.h) as usize).min(c.h) {
+                let r = y * c.w;
+                c.buf[r + x0..r + x1].copy_from_slice(&self.bg[r + x0..r + x1]);
+            }
+            self.bar_anim = k < 1.0;
         }
         // nearest the selection first; workers pop from the end, so sort farthest-first
         let pos: HashMap<&Entry, usize> = vis.clone().map(|i| (&entries[i], i)).collect();

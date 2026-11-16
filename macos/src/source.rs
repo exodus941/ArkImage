@@ -155,21 +155,44 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// Explorer's order: the column (reversed when descending), then, for equal values, the
+/// name in Explorer's own comparison, always ascending. Sorting by name reverses the name.
 fn sort_items(v: &mut [Item], sort: u8, desc: bool) {
+    let flip = |o: Ordering| if desc { o.reverse() } else { o };
     v.sort_by(|a, b| {
-        let o = match sort {
+        let col = match sort {
             1 => a.mtime.cmp(&b.mtime),
             2 => a.size.cmp(&b.size),
-            3 => ext_of(&a.key).cmp(&ext_of(&b.key)),
-            _ => Ordering::Equal,
-        }
-        .then_with(|| natural_cmp(&a.key, &b.key));
-        if desc {
-            o.reverse()
-        } else {
-            o
-        }
+            3 => ext_of(&a.key).to_lowercase().cmp(&ext_of(&b.key).to_lowercase()),
+            _ => return flip(explorer_cmp(&a.key, &b.key)),
+        };
+        flip(col).then_with(|| explorer_cmp(&a.key, &b.key))
     });
+}
+
+/// Names as Explorer orders them: StrCmpLogicalW on Windows, natural_cmp elsewhere.
+pub fn explorer_cmp(a: &str, b: &str) -> Ordering {
+    #[cfg(windows)]
+    {
+        #[link(name = "shlwapi")]
+        extern "system" {
+            fn StrCmpLogicalW(a: *const u16, b: *const u16) -> i32;
+        }
+        let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (wa, wb) = (w(a), w(b));
+        unsafe { StrCmpLogicalW(wa.as_ptr(), wb.as_ptr()) }.cmp(&0)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Finder's order.
+        use objc2::msg_send;
+        use objc2_foundation::NSString;
+        let (na, nb) = (NSString::from_str(a), NSString::from_str(b));
+        let r: isize = unsafe { msg_send![&*na, localizedStandardCompare: &*nb] };
+        r.cmp(&0)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    natural_cmp(a, b)
 }
 
 fn list_dir(dir: &Path, sort: u8, desc: bool) -> io::Result<Vec<Entry>> {
@@ -226,7 +249,9 @@ fn list_zip(archive: &Path, sort: u8, desc: bool) -> io::Result<Vec<Entry>> {
             });
         }
     }
-    sort_items(&mut items, sort, desc);
+    // a comic book reads in page order: the sort setting does not apply inside an archive
+    let _ = (sort, desc);
+    sort_items(&mut items, 0, false);
     Ok(items.into_iter().map(|i| i.entry).collect())
 }
 
@@ -269,14 +294,15 @@ pub fn open(path: &Path, sort: u8, desc: bool) -> io::Result<Playlist> {
     Ok(Playlist { container: dir, entries, index })
 }
 
-/// The next or previous folder/archive beside `container` that holds images.
-pub fn sibling(container: &Path, forward: bool, sort: u8, desc: bool) -> Option<Playlist> {
+/// The next or previous folder (and archive, when `archives`) beside `container` that
+/// holds images. Moving on by itself from a folder passes false: a folder ignores archives.
+pub fn sibling(container: &Path, forward: bool, sort: u8, desc: bool, archives: bool) -> Option<Playlist> {
     let parent = container.parent()?;
     let mut cands: Vec<PathBuf> = fs::read_dir(parent)
         .ok()?
         .filter_map(|d| d.ok())
         .map(|d| d.path())
-        .filter(|p| p.is_dir() || is_archive(p))
+        .filter(|p| p.is_dir() || (archives && is_archive(p)) || same_name(p, container))
         .collect();
     cands.sort_by(|a, b| {
         natural_cmp(
@@ -304,6 +330,14 @@ pub fn sibling(container: &Path, forward: bool, sort: u8, desc: bool) -> Option<
 mod tests {
     use super::natural_cmp;
     use std::cmp::Ordering::*;
+
+    #[test]
+    fn finder_order() {
+        use super::explorer_cmp;
+        assert_eq!(explorer_cmp("img2.jpg", "img10.jpg"), Less);
+        assert_eq!(explorer_cmp("b.jpg", "A.jpg"), Greater);
+        assert_eq!(explorer_cmp("a.jpg", "a.jpg"), Equal);
+    }
 
     #[test]
     fn natural() {

@@ -41,6 +41,10 @@ pub enum Icon {
     Pencil,
     Copy,
     Power,
+    LayoutGrid,
+    TextRtl,
+    FlipH,
+    FlipV,
 }
 
 fn svg(i: Icon) -> &'static str {
@@ -79,6 +83,10 @@ fn svg(i: Icon) -> &'static str {
         Icon::Pencil => include_str!("../assets/icons/pencil.svg"),
         Icon::Copy => include_str!("../assets/icons/copy.svg"),
         Icon::Power => include_str!("../assets/icons/power.svg"),
+        Icon::LayoutGrid => include_str!("../assets/icons/layout-grid.svg"),
+        Icon::TextRtl => include_str!("../assets/icons/text-direction-rtl.svg"),
+        Icon::FlipH => include_str!("../assets/icons/flip-horizontal.svg"),
+        Icon::FlipV => include_str!("../assets/icons/flip-vertical.svg"),
     }
 }
 

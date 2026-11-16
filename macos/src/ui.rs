@@ -215,6 +215,28 @@ pub fn modal_card(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, body: &[St
     rects
 }
 
+/// Draw with `f`, then blend the result over the frame below at `alpha` 0-1: a card's
+/// 250 ms fade without giving every fill and glyph an alpha of its own.
+pub fn faded(c: &mut Canvas, alpha: f32, f: impl FnOnce(&mut Canvas)) {
+    if alpha <= 0.0 {
+        return;
+    }
+    let below = (alpha < 1.0).then(|| c.buf.to_vec());
+    f(c);
+    if let Some(below) = below {
+        let k = (alpha.clamp(0.0, 1.0) * 255.0) as u32;
+        for (p, b) in c.buf.iter_mut().zip(below) {
+            *p = crate::render::mix(b, *p, k);
+        }
+    }
+}
+
+/// How far a card that appeared (or left) at `at` has faded, over 250 ms; 0-1.
+pub fn fade_amount(at: std::time::Instant, shown: bool) -> f32 {
+    let k = (at.elapsed().as_secs_f32() / 0.25).min(1.0);
+    if shown { k } else { 1.0 - k }
+}
+
 /// The Tabler icon drawn before a modal button's label, if any.
 fn modal_icon(label: &str) -> Option<crate::icons::Icon> {
     use crate::icons::Icon;

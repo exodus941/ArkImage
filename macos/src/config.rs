@@ -45,6 +45,8 @@ pub struct Config {
     pub interp: u8,
     pub lock_top: bool,
     pub lock_bottom: bool,
+    /// Slide between images: 0 (off) or 250 ms (on).
+    pub slide_ms: u16,
     /// Window at last close: restored (not maximized) outer position and inner size in
     /// physical px (win_w 0 = never saved), maximized flag, and the monitor name.
     pub win_x: i32,
@@ -94,6 +96,7 @@ impl Default for Config {
             interp: 2,
             lock_top: false,
             lock_bottom: false,
+            slide_ms: 250,
             win_x: 0,
             win_y: 0,
             win_w: 0,
@@ -206,6 +209,7 @@ impl Config {
             "interp" => self.interp = n().unwrap_or(2).min(4) as u8,
             "lock_top" => self.lock_top = b(v),
             "lock_bottom" => self.lock_bottom = b(v),
+            "slide_ms" => self.slide_ms = if n() == Some(0) { 0 } else { 250 },
             "win_x" => self.win_x = v.parse().unwrap_or(0),
             "win_y" => self.win_y = v.parse().unwrap_or(0),
             "win_w" => self.win_w = v.parse().unwrap_or(0),
@@ -275,7 +279,9 @@ impl Config {
              interp = {}\n\
              ; keep the top menu / bottom control bar visible\n\
              lock_top = {}\n\
-             lock_bottom = {}\n",
+             lock_bottom = {}\n\
+             ; slide between images: 0 off, 250 on\n\
+             slide_ms = {}\n",
             self.bg_color,
             self.transparent_grid as u8,
             self.sort,
@@ -302,6 +308,7 @@ impl Config {
             self.interp,
             self.lock_top as u8,
             self.lock_bottom as u8,
+            self.slide_ms,
         );
         let mut s = s;
         s.push_str(&format!(
