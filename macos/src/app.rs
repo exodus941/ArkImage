@@ -917,23 +917,18 @@ impl App {
         let bg = self.cfg.bg_color;
         let m = |v: u32| ((v as f32) * t).round() as u32;
         let glass = a << 24 | m(bg >> 16 & 0xFF) << 16 | m(bg >> 8 & 0xFF) << 8 | m(bg & 0xFF);
-        // a marked pixel darker than the background is black over it at some strength s
-        // (a shadow): draw that black over the glass, premultiplied
-        let bsum = (bg >> 16 & 0xFF) + (bg >> 8 & 0xFF) + (bg & 0xFF);
-        let (gr, gg, gb) = (glass >> 16 & 0xFF, glass >> 8 & 0xFF, glass & 0xFF);
         for p in buf.iter_mut() {
-            *p = if *p >> 24 == 1 {
-                let psum = (*p >> 16 & 0xFF) + (*p >> 8 & 0xFF) + (*p & 0xFF);
-                if bsum == 0 || psum >= bsum {
-                    glass
-                } else {
-                    let k = psum as f32 / bsum as f32; // 1 - s
-                    let sc = |v: u32| (v as f32 * k).round() as u32;
-                    let al = (255.0 - (255.0 - a as f32) * k).round() as u32;
-                    al << 24 | sc(gr) << 16 | sc(gg) << 8 | sc(gb)
-                }
-            } else {
+            *p = if *p >> 24 != 1 {
                 0xFF00_0000 | (*p & 0xFF_FFFF)
+            } else if *p & 0xFF == 0xFF {
+                glass
+            } else {
+                // a shadow over the glass: black at strength s, with 1 - s in the blue
+                // byte (see render::GLASS_BG); premultiplied
+                let k = (*p & 0xFF) as f32 / 255.0;
+                let ga = 255.0 - (255.0 - a as f32) * k;
+                let c = |v: u32| (((glass >> v) & 0xFF) as f32 * k).round() as u32;
+                (ga.round() as u32) << 24 | c(16) << 16 | c(8) << 8 | c(0)
             };
         }
     }
@@ -1956,7 +1951,12 @@ impl App {
             }
             return;
         }
-        c.fill(self.cfg.bg_color | if self.glass_loaded { GLASS_MARK } else { 0 });
+        if self.glass_loaded {
+            crate::render::GLASS_BG.store(self.cfg.bg_color, std::sync::atomic::Ordering::Relaxed);
+            c.fill(GLASS_MARK | 0xFF_FFFF);
+        } else {
+            c.fill(self.cfg.bg_color);
+        }
         self.ensure_base();
         let bg = self.cfg.bg_color;
         let checker = self.cfg.transparent_grid;

@@ -322,9 +322,8 @@ impl Picker {
         } else {
             c.blur(0, 0, c.w as i32, c.h as i32, (12.0 * sf) as usize);
             c.rect_alpha(0, 0, c.w as i32, c.h as i32, 0x0C0C0C, 160);
-            // the panel: the icon's base grey, nearly opaque, with a faint edge
+            // the panel: the icon's base grey, nearly opaque, no outline
             c.fill_rrect(px, py, pw, ph, PANEL_R * sf, crate::ui::ICON_GREY, 0.94);
-            c.stroke_rrect(px, py, pw, ph, PANEL_R * sf, sf.max(1.0), 0xFFFFFF, 0.08);
             self.bg = c.buf.to_vec();
             self.bg_dims = (c.w, c.h);
         }
