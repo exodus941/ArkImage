@@ -99,6 +99,7 @@ impl Master {
         let id = self.next_id;
         self.next_id += 1;
         self.windows.push(App::new(&self.sh, id, self.cfg.clone(), arg));
+        self.update_glass();
         self.windows.len() - 1
     }
 
@@ -117,6 +118,17 @@ impl Master {
     }
 
     /// One config for all windows: a change made in any window reaches the others.
+    /// Frosted glass only while one window is open: a second window fades the first to
+    /// the solid colour, and the last one left fades back to glass. A new window starts
+    /// in its state at once.
+    fn update_glass(&mut self) {
+        let one = self.windows.len() == 1;
+        let n = self.windows.len();
+        for (i, w) in self.windows.iter_mut().enumerate() {
+            w.set_glass(one, i + 1 == n && w.is_new());
+        }
+    }
+
     /// Give every window in a folder whose list changed the master's new list.
     fn adopt_lists(&mut self) {
         for d in crate::source::changed() {
@@ -190,6 +202,7 @@ impl Master {
         });
         if self.windows.len() != before {
             self.evict();
+            self.update_glass();
         }
         if self.windows.is_empty() && self.started {
             el.exit();

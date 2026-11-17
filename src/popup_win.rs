@@ -113,18 +113,19 @@ pub fn dark_menus() {
     #[link(name = "kernel32")]
     extern "system" {
         fn LoadLibraryW(n: *const u16) -> isize;
-        fn GetProcAddress(m: isize, n: *const u8) -> Option<unsafe extern "system" fn(i32) -> i32>;
+        fn GetProcAddress(m: isize, n: *const u8) -> usize;
     }
     unsafe {
         let m = LoadLibraryW(wide("uxtheme.dll").as_ptr());
         if m == 0 {
             return;
         }
-        if let Some(f) = GetProcAddress(m, 135usize as *const u8) {
-            f(2);
-        }
-        if let Some(f) = GetProcAddress(m, 136usize as *const u8) {
-            f(0);
+        for (ord, arg) in [(135usize, 2), (136, 0)] {
+            let f = GetProcAddress(m, ord as *const u8);
+            if f != 0 {
+                let f: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+                f(arg);
+            }
         }
     }
 }

@@ -139,6 +139,64 @@ fn mica(_w: &Window) -> bool {
     false
 }
 
+/// Frosted glass behind a lone window: the acrylic blur-behind accent
+/// (SetWindowCompositionAttribute, WCA_ACCENT_POLICY = 19, ACCENT_ENABLE_ACRYLICBLURBEHIND
+/// = 4). Live content behind the window shows blurred through pixels drawn with alpha
+/// below 255. The frame is not extended: that drew the system caption buttons on the
+/// borderless window. `on` false sets ACCENT_DISABLED. Returns false if the call fails.
+#[cfg(windows)]
+fn acrylic(w: &Window, on: bool, bg: u32) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    #[repr(C)]
+    struct Accent {
+        state: u32,
+        flags: u32,
+        /// AABBGGRR tint over the blur
+        color: u32,
+        anim: u32,
+    }
+    #[repr(C)]
+    struct Data {
+        attr: u32,
+        data: *const Accent,
+        size: usize,
+    }
+    // not in the import library: look it up in user32 at run time
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(n: *const u16) -> isize;
+        fn GetProcAddress(m: isize, n: *const u8) -> usize;
+    }
+    let name: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+    let f = unsafe { GetProcAddress(GetModuleHandleW(name.as_ptr()), b"SetWindowCompositionAttribute\0".as_ptr()) };
+    if f == 0 {
+        return false;
+    }
+    let set: unsafe extern "system" fn(isize, *const Data) -> i32 = unsafe { std::mem::transmute(f) };
+    let Ok(h) = w.window_handle() else { return false };
+    let RawWindowHandle::Win32(h) = h.as_raw() else { return false };
+    // flags 0: no system tint. Its tint darkened far past its alpha (a 33% grey tint
+    // gave #1A310C over lime); the 33% grey is drawn in our own pixels instead.
+    let _ = bg;
+    let acc = Accent { state: if on { 4 } else { 0 }, flags: 0, color: 0, anim: 0 };
+    let d = Data { attr: 19, data: &acc, size: std::mem::size_of::<Accent>() };
+    unsafe { set(h.hwnd.get(), &d) != 0 }
+}
+
+#[cfg(not(windows))]
+fn acrylic(_w: &Window, _on: bool, _bg: u32) -> bool {
+    false
+}
+
+/// Background pixels while the glass is loaded: the background colour with a marker in
+/// the alpha byte. Everything drawn over them writes alpha 0, so after the draw the
+/// pixels still marked are background, and only those turn see-through.
+const GLASS_MARK: u32 = 0x0100_0000;
+/// The background grey over the blur at this alpha: 33%, the user's value (black at 38%
+/// read as too dark and grey).
+const GLASS_OPACITY: u32 = 84;
+const GLASS_FADE: Duration = Duration::from_millis(250);
+
 
 pub(crate) fn menu_label(text: &str, key: &str) -> String {
     // Windows right-aligns text after a tab; macOS would print it literally.
@@ -427,6 +485,12 @@ pub struct App {
     /// for during a paint is dropped on Windows; in a takeover of ~100 windows the image
     /// stayed grey until the cursor entered. about_to_wait retries every REPAINT_RETRY.
     unpainted: Option<Instant>,
+    /// Frosted glass: wanted (the only window), loaded (backdrop set), and the fade
+    /// from `glass_from` (0 glass, 1 solid) toward the wanted state, started at `glass_at`.
+    glass_on: bool,
+    glass_loaded: bool,
+    glass_from: f32,
+    glass_at: Instant,
     fullscreen: bool,
     on_top: bool,
     rng: u64,
@@ -617,6 +681,10 @@ impl App {
             rtl_for: None,
             slide_drawn: Instant::now(),
             unpainted: None,
+            glass_on: false,
+            glass_loaded: false,
+            glass_from: 1.0,
+            glass_at: Instant::now(),
             fullscreen: false,
             on_top: false,
             rng: seed,
@@ -728,6 +796,67 @@ impl App {
             Ok(pl) if pl.entries.is_empty() => self.msg("There is no image in this folder or file."),
             Ok(pl) => self.set_playlist(pl),
             Err(e) => self.msg(format!("Failed to open the file: {e}")),
+        }
+    }
+
+    /// How solid the background is now: 0 frosted glass, 1 the solid colour.
+    fn glass_solid(&self) -> f32 {
+        let to = if self.glass_on { 0.0 } else { 1.0 };
+        let k = (self.glass_at.elapsed().as_secs_f32() / GLASS_FADE.as_secs_f32()).min(1.0);
+        self.glass_from + (to - self.glass_from) * k
+    }
+
+    fn glass_fading(&self) -> bool {
+        self.glass_at.elapsed() < GLASS_FADE + Duration::from_millis(20)
+    }
+
+    /// True until the window exists on screen.
+    pub fn is_new(&self) -> bool {
+        self.window.is_none()
+    }
+
+    /// The master calls this when the window count changes: glass while this is the only
+    /// window. `instant` skips the fade (a window just opened).
+    pub fn set_glass(&mut self, on: bool, instant: bool) {
+        if on == self.glass_on {
+            return;
+        }
+        self.glass_from = if instant { if on { 0.0 } else { 1.0 } } else { self.glass_solid() };
+        self.glass_on = on;
+        self.glass_at = Instant::now();
+        self.request_redraw();
+    }
+
+    /// Before a draw: load the backdrop when glass is wanted, unload it once the fade to
+    /// solid has ended. Returns true while background pixels must be marked.
+    fn glass_prepare(&mut self) -> bool {
+        let Some(w) = self.window.clone() else { return false };
+        if self.glass_on && !self.glass_loaded {
+            self.glass_loaded = acrylic(&w, true, self.cfg.bg_color);
+            crate::trace(&format!("glass loaded: {}", self.glass_loaded));
+        }
+        if !self.glass_on && self.glass_loaded && !self.glass_fading() {
+            acrylic(&w, false, self.cfg.bg_color);
+            self.glass_loaded = false;
+            crate::trace("glass unloaded");
+        }
+        self.glass_loaded
+    }
+
+    /// After a draw: background pixels become the glass, faded toward the solid colour by
+    /// `glass_solid`; every other pixel is opaque. Alpha is premultiplied.
+    fn glass_finish(&self, buf: &mut [u32]) {
+        let t = self.glass_solid();
+        // the background grey at GLASS_OPACITY over the blur, faded to solid by t
+        let o = GLASS_OPACITY as f32 / 255.0;
+        let t = o + (1.0 - o) * t;
+        let a = 255.0 * t;
+        let a = a.round() as u32;
+        let bg = self.cfg.bg_color;
+        let m = |v: u32| ((v as f32) * t).round() as u32;
+        let glass = a << 24 | m(bg >> 16 & 0xFF) << 16 | m(bg >> 8 & 0xFF) << 8 | m(bg & 0xFF);
+        for p in buf.iter_mut() {
+            *p = if *p >> 24 == 1 { glass } else { 0xFF00_0000 | (*p & 0xFF_FFFF) };
         }
     }
 
@@ -1686,9 +1815,13 @@ impl App {
         if surface.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap()).is_ok() {
             if let Ok(mut buf) = surface.buffer_mut() {
                 {
+                    let glass = self.glass_prepare();
                     let mut c = Canvas { buf: &mut buf, w: w as usize, h: h as usize };
                     crate::trace("draw start");
                     self.draw(&mut c);
+                    if glass {
+                        self.glass_finish(c.buf);
+                    }
                 }
                 if buf.present().is_ok() {
                     self.unpainted = None;
@@ -1716,7 +1849,7 @@ impl App {
             }
             return;
         }
-        c.fill(self.cfg.bg_color);
+        c.fill(self.cfg.bg_color | if self.glass_loaded { GLASS_MARK } else { 0 });
         self.ensure_base();
         let bg = self.cfg.bg_color;
         let checker = self.cfg.transparent_grid;
@@ -4181,7 +4314,9 @@ impl App {
         let fading = self.picker.bar_anim
             || self.help_at.elapsed() < Duration::from_millis(260)
             || self.empty_at.is_some_and(|t| t.elapsed() < Duration::from_millis(260))
-            || self.modal_at.is_some_and(|t| t.elapsed() < Duration::from_millis(260));
+            || self.modal_at.is_some_and(|t| t.elapsed() < Duration::from_millis(260))
+            || self.glass_fading()
+            || (!self.glass_on && self.glass_loaded);
         let ui_at = fading.then(|| self.fade_last + Duration::from_millis(16));
         if ui_at.is_some_and(|t| now >= t) {
             self.fade_last = now;
