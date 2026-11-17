@@ -203,6 +203,8 @@ const SWIPE_PX: f64 = 64.0;
 const SWIPE_GAP: Duration = Duration::from_millis(300);
 /// The full-quality redraw follows the last pinch event after this long.
 const PINCH_SETTLE: Duration = Duration::from_millis(150);
+/// A stored image with no paint after this long gets its repaint asked for again.
+const REPAINT_RETRY: Duration = Duration::from_millis(250);
 const SWIPE_LINE_PX: f64 = 40.0;
 const SWIPE_SIGN: f64 = 1.0;
 
@@ -429,6 +431,11 @@ pub struct App {
     /// and the high-quality resize runs PINCH_SETTLE after the last event (or when a macOS
     /// pinch ends). (Added 2026-11-16 by Claude on the Mac, for both; see the handoff.)
     pinch_at: Option<Instant>,
+    /// Set when a new image is stored for display, cleared by the next finished paint. If no
+    /// paint follows within REPAINT_RETRY, the idle loop asks again: a repaint request can be
+    /// lost (Windows drops one made while that window paints; seen after a 100-window
+    /// crash takeover, where windows stayed grey until the cursor entered).
+    unpainted: Option<Instant>,
     /// The image layer of the last settled frame (before the chrome), and what it showed.
     last_frame: Vec<u32>,
     last_key: Option<(u64, u64, u64, u64, usize, usize)>,
@@ -634,6 +641,7 @@ impl App {
             last_click: None,
             wheel_acc: 0.0,
             pinch_at: None,
+            unpainted: None,
             last_frame: Vec::new(),
             last_key: None,
             slide: None,
@@ -876,6 +884,7 @@ impl App {
             None
         };
         self.current = Some((e, d));
+        self.unpainted = Some(Instant::now());
         self.invalidate();
         self.update_title();
     }
@@ -1709,6 +1718,7 @@ impl App {
                 }
                 let _ = buf.present();
                 crate::trace("present");
+                self.unpainted = None;
             }
         }
         self.surface = Some(surface);
@@ -4231,7 +4241,20 @@ impl App {
         if slide_at.is_some_and(|t| now >= t) {
             self.request_redraw();
         }
-        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at]
+        // failsafe: an image stored for display with no paint since; ask for the paint again
+        // a hidden or minimized window paints when shown, so it needs no retry
+        if self.window.as_ref().is_some_and(|w| w.is_visible() == Some(false) || w.is_minimized() == Some(true)) {
+            self.unpainted = None;
+        }
+        let retry_at = self.unpainted.map(|t| t + REPAINT_RETRY);
+        if retry_at.is_some_and(|t| now >= t) {
+            if std::env::var_os("ARKIMAGE_REDRAW_LOG").is_some() {
+                eprintln!("repaint retry: no paint {} ms after the image was stored", self.unpainted.map(|t| t.elapsed().as_millis()).unwrap_or(0));
+            }
+            self.unpainted = Some(now);
+            self.request_redraw();
+        }
+        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at, retry_at]
             .into_iter()
             .flatten()
             .min()
