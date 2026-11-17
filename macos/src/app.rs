@@ -514,6 +514,8 @@ pub struct App {
     /// Frosted glass: wanted (the only window), loaded (backdrop set), and the fade
     /// from `glass_from` (0 glass, 1 solid) toward the wanted state, started at `glass_at`.
     glass_on: bool,
+    /// What the master asked for (one window open), before the full-screen exception.
+    glass_want: bool,
     glass_loaded: bool,
     glass_from: f32,
     glass_at: Instant,
@@ -720,6 +722,7 @@ impl App {
             rtl_for: None,
             slide_drawn: Instant::now(),
             glass_on: false,
+            glass_want: false,
             glass_loaded: false,
             glass_from: 1.0,
             glass_at: Instant::now(),
@@ -871,6 +874,9 @@ impl App {
     /// The master calls this when the window count changes: glass while this is the only
     /// window. `instant` skips the fade (a window just opened).
     pub fn set_glass(&mut self, on: bool, instant: bool) {
+        self.glass_want = on;
+        // macOS full screen has nothing behind the window to blur
+        let on = on && !(cfg!(target_os = "macos") && self.fullscreen);
         if on == self.glass_on {
             return;
         }
@@ -908,8 +914,24 @@ impl App {
         let bg = self.cfg.bg_color;
         let m = |v: u32| ((v as f32) * t).round() as u32;
         let glass = a << 24 | m(bg >> 16 & 0xFF) << 16 | m(bg >> 8 & 0xFF) << 8 | m(bg & 0xFF);
+        // a marked pixel darker than the background is black over it at some strength s
+        // (a shadow): draw that black over the glass, premultiplied
+        let bsum = (bg >> 16 & 0xFF) + (bg >> 8 & 0xFF) + (bg & 0xFF);
+        let (gr, gg, gb) = (glass >> 16 & 0xFF, glass >> 8 & 0xFF, glass & 0xFF);
         for p in buf.iter_mut() {
-            *p = if *p >> 24 == 1 { glass } else { 0xFF00_0000 | (*p & 0xFF_FFFF) };
+            *p = if *p >> 24 == 1 {
+                let psum = (*p >> 16 & 0xFF) + (*p >> 8 & 0xFF) + (*p & 0xFF);
+                if bsum == 0 || psum >= bsum {
+                    glass
+                } else {
+                    let k = psum as f32 / bsum as f32; // 1 - s
+                    let sc = |v: u32| (v as f32 * k).round() as u32;
+                    let al = (255.0 - (255.0 - a as f32) * k).round() as u32;
+                    al << 24 | sc(gr) << 16 | sc(gg) << 8 | sc(gb)
+                }
+            } else {
+                0xFF00_0000 | (*p & 0xFF_FFFF)
+            };
         }
     }
 
@@ -2079,6 +2101,8 @@ impl App {
                 self.fs_was_max = false;
                 self.lights_on = None;
                 crate::mac::fullscreen_titlebar(&w, fs);
+                let want = self.glass_want;
+                self.set_glass(want, false);
             }
         }
         // macOS: the real traffic lights come and go with the top chrome

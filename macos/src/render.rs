@@ -20,7 +20,10 @@ pub fn mix(dst: u32, src: u32, a: u32) -> u32 {
     let r = (((src >> 16) & 255) * a + ((dst >> 16) & 255) * ia + 127) / 255;
     let g = (((src >> 8) & 255) * a + ((dst >> 8) & 255) * ia + 127) / 255;
     let b = ((src & 255) * a + (dst & 255) * ia + 127) / 255;
-    rgb(r, g, b)
+    // black (shadows, dim backdrops) keeps the destination's top byte: over the glass
+    // background it stays marked, and the glass turns it into a shadow over the blur
+    let keep = if src & 0xFF_FFFF == 0 { dst & 0xFF00_0000 } else { 0 };
+    rgb(r, g, b) | keep
 }
 
 #[inline]
