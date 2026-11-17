@@ -61,12 +61,12 @@ fn row(s: &State) -> Vec<(&'static str, Icon, &'static str)> {
         sep,
         ("bar_lock", if s.lock_bottom { Icon::Lock } else { Icon::LockOpen }, if s.lock_bottom { "Unlock the Bar" } else { "Keep the Bar Visible" }),
         sep,
-        ("bar_prev", Icon::ChevronLeft, "Previous Image"),
+        ("bar_prev", Icon::ChevronLeft, if s.rtl { "Next Image" } else { "Previous Image" }),
     ];
     if s.archive {
         v.push(("bar_rtl", Icon::TextRtl, if s.rtl { "Left-to-Right Order" } else { "Right-to-Left Order" }));
     }
-    v.push(("bar_next", Icon::ChevronRight, "Next Image"));
+    v.push(("bar_next", Icon::ChevronRight, if s.rtl { "Previous Image" } else { "Next Image" }));
     v
 }
 /// Row centre below the bar top: 16 inset + 12 slider + 16 gap + 12 (half the 24 px row).

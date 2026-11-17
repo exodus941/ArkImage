@@ -117,6 +117,15 @@ impl Master {
     }
 
     /// One config for all windows: a change made in any window reaches the others.
+    /// Give every window in a folder whose list changed the master's new list.
+    fn adopt_lists(&mut self) {
+        for d in crate::source::changed() {
+            for w in &mut self.windows {
+                w.adopt(&d);
+            }
+        }
+    }
+
     fn sync_config(&mut self) {
         let changed = self.windows.iter().position(|w| w.cfg != self.cfg);
         if let Some(i) = changed {
@@ -293,6 +302,7 @@ impl ApplicationHandler<UserEvent> for Master {
                         w.on_listed(e.clone(), r.clone());
                     }
                 }
+                self.adopt_lists();
             }
             UserEvent::Update(o, manual) => {
                 // shown once: in the window whose Settings asked, else the first window
@@ -319,11 +329,14 @@ impl ApplicationHandler<UserEvent> for Master {
             w.window_event(el, id, ev);
         }
         self.sync_config();
+        self.adopt_lists();
         self.reveal_all();
         self.reap(el);
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // a window found its file gone and read the folder again
+        self.adopt_lists();
         // After an update is in place: start the new exe, which reopens this session
         // once this process has ended, then end
         if crate::update::RESTART.swap(false, std::sync::atomic::Ordering::SeqCst) {

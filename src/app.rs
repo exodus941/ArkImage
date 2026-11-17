@@ -680,11 +680,11 @@ impl App {
     }
 
     fn cur_entry(&self) -> Option<Entry> {
-        self.playlist.as_ref().and_then(|p| p.entries.get(p.index).cloned())
+        self.playlist.as_ref().and_then(|p| p.get(p.index).cloned())
     }
 
     fn next_entry(&self) -> Option<Entry> {
-        self.playlist.as_ref().and_then(|p| p.entries.get(p.index + 1).cloned())
+        self.playlist.as_ref().and_then(|p| p.get(p.index + 1).cloned())
     }
 
     fn displaying_current(&self) -> bool {
@@ -709,12 +709,12 @@ impl App {
         if p.is_file() && !source::is_archive(p) {
             if let Ok(abs) = std::path::absolute(p) {
                 let dir = abs.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-                let first = Playlist { container: dir, entries: Arc::new(vec![Entry::File(abs.clone())]), index: 0 };
+                let first = Playlist { container: dir, entries: Arc::new(vec![Entry::File(abs.clone())]), rev: false, index: 0 };
                 self.set_playlist(first);
                 let (proxy, sort, desc) = (self.proxy.clone(), self.cfg.sort, self.cfg.sort_desc);
                 std::thread::spawn(move || {
                     crate::trace("list start");
-                    let r = source::open(&abs, sort, desc).map_err(|e| e.to_string());
+                    let r = source::open_fresh(&abs, sort, desc).map_err(|e| e.to_string());
                     crate::trace("listed");
                     let _ = proxy.send_event(UserEvent::Listed(Entry::File(abs), r));
                 });
@@ -728,6 +728,38 @@ impl App {
             Ok(pl) if pl.entries.is_empty() => self.msg("There is no image in this folder or file."),
             Ok(pl) => self.set_playlist(pl),
             Err(e) => self.msg(format!("Failed to open the file: {e}")),
+        }
+    }
+
+    /// Take the master's new list for folder `dir` (re-read or a file deleted elsewhere),
+    /// staying on the image shown.
+    pub fn adopt(&mut self, dir: &Path) {
+        let Some(pl) = &self.playlist else { return };
+        if pl.container != dir || pl.rev {
+            return;
+        }
+        let Some((l, pos)) = source::held(dir) else { return };
+        if Arc::ptr_eq(&l, &pl.entries) || l.is_empty() {
+            return;
+        }
+        let cur = self.cur_entry();
+        let at = cur.as_ref().and_then(|c| pos.get(c)).copied();
+        let old = pl.index;
+        let Some(pl) = &mut self.playlist else { return };
+        pl.entries = l;
+        self.pos_map = pos;
+        match at {
+            Some(i) => {
+                pl.index = i;
+                self.update_wanted();
+                self.preload();
+                self.update_title();
+                self.request_redraw();
+            }
+            None => {
+                let i = old.min(pl.entries.len() - 1);
+                self.go_to(i);
+            }
         }
     }
 
@@ -762,6 +794,11 @@ impl App {
         self.pos_map = source::pos_map(&pl.entries);
         self.failed.borrow_mut().clear();
         self.rand_hist.clear();
+        let mut pl = pl;
+        if self.rtl_for.as_deref() == Some(pl.container.as_path()) && source::is_archive(&pl.container) {
+            pl.rev = true;
+            pl.index = pl.flip(pl.index);
+        }
         let idx = pl.index;
         self.playlist = Some(pl);
         self.go_to(idx);
@@ -774,8 +811,8 @@ impl App {
             let d = self.dir as isize;
             for o in [-2isize, -1, 0, 1, 2, 3, 4, 5, 6, 7].map(|o| o * d) {
                 let j = i + o;
-                if j >= 0 && (j as usize) < pl.entries.len() {
-                    w.insert(pl.entries[j as usize].clone());
+                if let Some(e) = (j >= 0).then(|| pl.get(j as usize)).flatten() {
+                    w.insert(e.clone());
                 }
             }
         }
@@ -793,7 +830,8 @@ impl App {
     /// True if `e` is nearer the current index than the image now on screen.
     fn closer_than_shown(&self, e: &Entry) -> bool {
         let idx = self.index() as i64;
-        let dist = |x: &Entry| self.pos_map.get(x).map(|&p| (p as i64 - idx).abs()).unwrap_or(i64::MAX);
+        let Some(pl) = &self.playlist else { return true };
+        let dist = |x: &Entry| self.pos_map.get(x).map(|&p| (pl.flip(p) as i64 - idx).abs()).unwrap_or(i64::MAX);
         match &self.current {
             Some((shown, _)) => dist(e) < dist(shown),
             None => true,
@@ -815,7 +853,7 @@ impl App {
             .filter_map(|o| {
                 let j = i + o;
                 if j >= 0 {
-                    pl.entries.get(j as usize).cloned()
+                    pl.get(j as usize).cloned()
                 } else {
                     None
                 }
@@ -829,8 +867,8 @@ impl App {
     /// How far `e` is from this window's current image (i64::MAX if not in its list).
     /// The master evicts the shared cache by the smallest distance over all windows.
     pub fn distance(&self, e: &Entry) -> i64 {
-        let idx = self.playlist.as_ref().map(|p| p.index as i64).unwrap_or(0);
-        self.pos_map.get(e).map(|&p| (p as i64 - idx).abs()).unwrap_or(i64::MAX)
+        let Some(pl) = &self.playlist else { return i64::MAX };
+        self.pos_map.get(e).map(|&p| (pl.flip(p) as i64 - pl.index as i64).abs()).unwrap_or(i64::MAX)
     }
 
     fn set_current(&mut self, e: Entry, d: Arc<Decoded>) {
@@ -1306,7 +1344,7 @@ impl App {
         crate::trace(&format!("gone: {}", p.display()));
         self.cache.borrow_mut().remove(&e);
         let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
-        let entries = if dir.is_dir() { source::open(&dir, self.cfg.sort, self.cfg.sort_desc).map(|pl| pl.entries).unwrap_or_default() } else { Default::default() };
+        let entries = if dir.is_dir() { source::open_fresh(&dir, self.cfg.sort, self.cfg.sort_desc).map(|pl| pl.entries).unwrap_or_default() } else { Default::default() };
         if entries.is_empty() {
             crate::trace("gone: folder has no image left, closing the window");
             self.store_geometry();
@@ -1318,7 +1356,7 @@ impl App {
             }
             return;
         }
-        self.set_playlist(Playlist { container: dir, entries, index: 0 });
+        self.set_playlist(Playlist { container: dir, entries, rev: false, index: 0 });
     }
 
     fn remove_current_from_list(&mut self) {
@@ -1326,7 +1364,14 @@ impl App {
         if pl.index >= pl.entries.len() {
             return;
         }
-        let e = Arc::make_mut(&mut pl.entries).remove(pl.index);
+        let Some(e) = pl.get(pl.index).cloned() else { return };
+        match source::remove(&pl.container, &e) {
+            Some(l) => pl.entries = l,
+            None => {
+                let at = pl.flip(pl.index);
+                Arc::make_mut(&mut pl.entries).remove(at);
+            }
+        }
         self.cache.borrow_mut().remove(&e);
         if pl.entries.is_empty() {
             self.close();
@@ -1502,7 +1547,7 @@ impl App {
             Some((arch, name)) => {
                 self.open_path(Path::new(arch));
                 let pos = self.playlist.as_ref().and_then(|pl| {
-                    pl.entries.iter().position(|e| matches!(e, Entry::Zip { name: n, .. } if n == name))
+                    pl.iter().position(|e| matches!(e, Entry::Zip { name: n, .. } if n == name))
                 });
                 if let Some(i) = pos {
                     self.go_to(i);
@@ -1553,7 +1598,7 @@ impl App {
         let Some(w) = self.window.clone() else { return };
         let t = match &self.playlist {
             Some(pl) if !pl.entries.is_empty() => {
-                let e = &pl.entries[pl.index];
+                let Some(e) = pl.get(pl.index) else { return };
                 let dims = self
                     .current
                     .as_ref()
@@ -1576,7 +1621,7 @@ impl App {
         use crate::ui::Row;
         let row = |k: &str, v: String, mono: bool| Row { key: k.to_string(), value: v, mono };
         let pl = self.playlist.as_ref()?;
-        let e = pl.entries.get(pl.index)?;
+        let e = pl.get(pl.index)?;
         let mut secs = vec![vec![
             row("Folder", e.fs_path().parent().map(|p| p.display().to_string()).unwrap_or_default(), false),
             row("Index", format!("{} / {}", pl.index + 1, pl.entries.len()), true),
@@ -1607,7 +1652,7 @@ impl App {
     fn info_lines(&self) -> Vec<String> {
         let mut v = Vec::new();
         let Some(pl) = &self.playlist else { return v };
-        let Some(e) = pl.entries.get(pl.index) else { return v };
+        let Some(e) = pl.get(pl.index) else { return v };
         v.push(format!("File Name: {}", e.name()));
         v.push(format!("Path: {}", e.fs_path().display()));
         v.push(format!("Index: {} / {}", pl.index + 1, pl.entries.len()));
@@ -1663,7 +1708,7 @@ impl App {
             if let Some(pl) = &self.playlist {
                 let cache = &self.cache;
                 let mc = |e: &Entry| cache.borrow().get(e).map(|d| d.frames[0].img.clone());
-                self.picker.draw(c, t.as_mut(), &pl.entries, pl.index, sf, &self.thumb_jobs, &mc);
+                self.picker.draw(c, t.as_mut(), pl, pl.index, sf, &self.thumb_jobs, &mc);
             }
             *self.text.borrow_mut() = t;
             if self.picker.bar_anim {
@@ -1781,7 +1826,7 @@ impl App {
             if let Some(pl) = &self.playlist {
                 let cache = &self.cache;
                 let mc = |e: &Entry| cache.borrow().get(e).map(|d| d.frames[0].img.clone());
-                self.picker.draw(c, Some(&mut t), &pl.entries, pl.index, sf, &self.thumb_jobs, &mc);
+                self.picker.draw(c, Some(&mut t), pl, pl.index, sf, &self.thumb_jobs, &mc);
             }
             *self.text.borrow_mut() = Some(t);
             if self.picker.bar_anim {
@@ -2270,7 +2315,7 @@ impl App {
         match &self.playlist {
             Some(pl) if !pl.entries.is_empty() => {
                 let folder = pl.container.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                format!("{folder} > {} [{}/{}] - ArkImage", pl.entries[pl.index].name(), pl.index + 1, pl.entries.len())
+                format!("{folder} > {} [{}/{}] - ArkImage", pl.get(pl.index).map(|e| e.name()).unwrap_or_default(), pl.index + 1, pl.entries.len())
             }
             _ => "ArkImage".to_string(),
         }
@@ -3206,8 +3251,10 @@ impl App {
         }
         let on = self.rtl_on();
         let Some(pl) = &mut self.playlist else { return };
-        Arc::make_mut(&mut pl.entries).reverse();
-        pl.index = pl.entries.len().saturating_sub(1) - pl.index.min(pl.entries.len().saturating_sub(1));
+        // read the shared list backwards; the index stays on the same page
+        let last = pl.len().saturating_sub(1);
+        pl.index = last - pl.index.min(last);
+        pl.rev = !pl.rev;
         self.rtl_for = if on { None } else { Some(pl.container.clone()) };
         self.request_redraw();
     }
@@ -3221,7 +3268,7 @@ impl App {
         }
         let cur = self.cur_entry();
         if let Ok(mut np) = source::open(&c, self.cfg.sort, self.cfg.sort_desc) {
-            if let Some(i) = cur.and_then(|e| np.entries.iter().position(|x| *x == e)) {
+            if let Some(i) = cur.and_then(|e| np.iter().position(|x| *x == e)) {
                 np.index = i;
             }
             self.set_playlist(np);
@@ -3718,6 +3765,10 @@ impl App {
     pub fn set_config(&mut self, c: Config) {
         let before = std::mem::replace(&mut self.cfg, c);
         self.apply_settings(&before);
+        // the newest sort order holds for every window
+        if (before.sort, before.sort_desc) != (self.cfg.sort, self.cfg.sort_desc) {
+            self.resort();
+        }
     }
 
     /// True if this window's main window or settings dialog has id `id`.
