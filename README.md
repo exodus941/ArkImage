@@ -7,7 +7,8 @@ All windows share one process, one image cache and one file list per folder:
 100 windows open in a 46,000-file folder use about 1.1 GB.
 
 ArkImage brings together the best ideas of several image viewers, adds some of its own,
-and puts them in one small program.
+and combines them all into one tiny jet engine of a package that screams through your
+image folders at absurd speeds.
 
 ## Download
 
