@@ -54,6 +54,8 @@ pub struct Config {
     pub win_w: u32,
     pub win_h: u32,
     pub win_max: bool,
+    /// Closed in full screen: the next start opens in full screen.
+    pub win_fs: bool,
     pub win_monitor: String,
     /// 11 custom hotkey slots.
     pub keys: Vec<bindings::Bind>,
@@ -102,6 +104,7 @@ impl Default for Config {
             win_w: 0,
             win_h: 0,
             win_max: false,
+            win_fs: false,
             win_monitor: String::new(),
             keys: bindings::default_keys(),
             mouse: bindings::default_mouse(),
@@ -215,6 +218,7 @@ impl Config {
             "win_w" => self.win_w = v.parse().unwrap_or(0),
             "win_h" => self.win_h = v.parse().unwrap_or(0),
             "win_max" => self.win_max = b(v),
+            "win_fs" => self.win_fs = b(v),
             "win_monitor" => self.win_monitor = v.to_string(),
             _ if k.starts_with("key") && k[3..].parse::<usize>().is_ok() => {
                 let i = k[3..].parse::<usize>().unwrap();
@@ -312,9 +316,9 @@ impl Config {
         );
         let mut s = s;
         s.push_str(&format!(
-            "; window at last close: restored position/size (physical px), maximized, monitor\n\
-             win_x = {}\nwin_y = {}\nwin_w = {}\nwin_h = {}\nwin_max = {}\nwin_monitor = {}\n",
-            self.win_x, self.win_y, self.win_w, self.win_h, self.win_max as u8, self.win_monitor
+            "; window at last close: restored position/size (physical px), maximized, full screen, monitor\n\
+             win_x = {}\nwin_y = {}\nwin_w = {}\nwin_h = {}\nwin_max = {}\nwin_fs = {}\nwin_monitor = {}\n",
+            self.win_x, self.win_y, self.win_w, self.win_h, self.win_max as u8, self.win_fs as u8, self.win_monitor
         ));
         s.push_str(&format!(
             "; thumbnails kept on disk for the Select Image grid, megabytes (0 = off)\nthumb_cache_mb = {}\n",

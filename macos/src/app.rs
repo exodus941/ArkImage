@@ -514,6 +514,8 @@ pub struct App {
     /// Frosted glass: wanted (the only window), loaded (backdrop set), and the fade
     /// from `glass_from` (0 glass, 1 solid) toward the wanted state, started at `glass_at`.
     glass_on: bool,
+    /// Reopen in full screen at this time (closed in full screen, or a crash restore).
+    fs_restore_at: Option<Instant>,
     /// What the master asked for (one window open), before the full-screen exception.
     glass_want: bool,
     glass_loaded: bool,
@@ -722,6 +724,7 @@ impl App {
             rtl_for: None,
             slide_drawn: Instant::now(),
             glass_on: false,
+            fs_restore_at: None,
             glass_want: false,
             glass_loaded: false,
             glass_from: 1.0,
@@ -3818,6 +3821,7 @@ impl App {
             (self.cfg.win_x, self.cfg.win_y, self.cfg.win_w, self.cfg.win_h) = (x, y, gw, gh);
         }
         self.cfg.win_max = self.was_max;
+        self.cfg.win_fs = self.fullscreen;
         if let Some(name) = w.current_monitor().and_then(|m| m.name()) {
             self.cfg.win_monitor = name;
         }
@@ -4001,8 +4005,12 @@ impl App {
             self.render();
             cloak(&w, false);
         }
-        if exact.as_ref().map(|s| s.fs).unwrap_or(false) {
-            self.toggle_fullscreen();
+        // full screen: a crash restore uses the window's own state; a normal start (not a
+        // cascaded second window) reopens in full screen if it was closed so
+        if exact.as_ref().map(|s| s.fs).unwrap_or(cascade.is_none() && self.cfg.win_fs) {
+            // asked while the window is still appearing, macOS enters full screen and
+            // leaves it again within 2 s; so ask a moment after it is shown
+            self.fs_restore_at = Some(Instant::now() + Duration::from_millis(400));
         }
         self.request_redraw();
     }
@@ -4463,6 +4471,12 @@ impl App {
         if slide_at.is_some_and(|t| now >= t) {
             self.request_redraw();
         }
+        if self.fs_restore_at.is_some_and(|t| now >= t) {
+            self.fs_restore_at = None;
+            if !self.fullscreen {
+                self.toggle_fullscreen();
+            }
+        }
         // failsafe: an image stored for display with no paint since; ask for the paint again
         // a hidden or minimized window paints when shown, so it needs no retry
         if self.window.as_ref().is_some_and(|w| w.is_visible() == Some(false) || w.is_minimized() == Some(true)) {
@@ -4476,7 +4490,7 @@ impl App {
             self.unpainted = Some(now);
             self.request_redraw();
         }
-        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at, retry_at]
+        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at, retry_at, self.fs_restore_at]
             .into_iter()
             .flatten()
             .min()
