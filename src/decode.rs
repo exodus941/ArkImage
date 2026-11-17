@@ -308,7 +308,7 @@ mod tests {
         let pl = crate::source::open(dir, 0, false).unwrap();
         let names: Vec<String> = pl.entries.iter().map(|e| e.name()).collect();
         assert_eq!(names, ["01_alpha.png", "02_big.jpg", "2_bmp.bmp", "03_lossless.webp", "04_exif_rot6.jpg", "05_broken.jpg", "06_anim.gif", "07_photo.heic", "08_lossy.webp", "10_tga.tga"]);
-        for e in &pl.entries {
+        for e in pl.entries.iter() {
             let r = decode(e, true);
             match e.name().as_str() {
                 "05_broken.jpg" => assert!(r.is_err()),

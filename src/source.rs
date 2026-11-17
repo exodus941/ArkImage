@@ -2,10 +2,12 @@
 
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     fs,
     io,
     path::{Path, PathBuf},
-    time::SystemTime,
+    sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const IMAGE_EXTS: &[&str] = &[
@@ -99,7 +101,9 @@ impl Entry {
 pub struct Playlist {
     /// The folder or archive the entries come from.
     pub container: PathBuf,
-    pub entries: Vec<Entry>,
+    /// Shared by every window that listed the same folder in the same order at about
+    /// the same time; a window that changes its list gets its own copy (`Arc::make_mut`).
+    pub entries: Arc<Vec<Entry>>,
     pub index: usize,
 }
 
@@ -256,29 +260,83 @@ fn same_name(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Entry to list position, for nearest-first preloading.
+pub type PosMap = HashMap<Entry, usize>;
+
+/// One folder list shared by the windows that ask for it. In a crash takeover, 100
+/// windows in one 46,000-file folder each listed it and kept their own copy.
+struct Slot {
+    at: Instant,
+    list: Weak<Vec<Entry>>,
+    pos: Arc<PosMap>,
+}
+
+type Slots = HashMap<(PathBuf, u8, bool), Arc<Mutex<Option<Slot>>>>;
+static LISTS: Mutex<Option<Slots>> = Mutex::new(None);
+/// A list made longer ago than this is listed again, so new files show up.
+const SHARE_FOR: Duration = Duration::from_secs(10);
+
+fn build_pos(l: &[Entry]) -> PosMap {
+    l.iter().cloned().enumerate().map(|(i, e)| (e, i)).collect()
+}
+
+/// List `dir`, or reuse a list another window made from it in the last SHARE_FOR.
+/// Windows asking at the same moment wait for one listing.
+fn list_dir_shared(dir: &Path, sort: u8, desc: bool) -> io::Result<Arc<Vec<Entry>>> {
+    let slot = {
+        let mut g = LISTS.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        // drop slots no window holds any more (a slot being filled is locked: keep it)
+        m.retain(|_, s| s.try_lock().map(|s| s.as_ref().is_some_and(|s| s.list.strong_count() > 0)).unwrap_or(true));
+        m.entry((dir.to_path_buf(), sort, desc)).or_default().clone()
+    };
+    let mut s = slot.lock().unwrap();
+    if let Some(l) = s.as_ref().filter(|x| x.at.elapsed() < SHARE_FOR).and_then(|x| x.list.upgrade()) {
+        crate::trace("list shared");
+        return Ok(l);
+    }
+    let l = Arc::new(list_dir(dir, sort, desc)?);
+    *s = Some(Slot { at: Instant::now(), list: Arc::downgrade(&l), pos: Arc::new(build_pos(&l)) });
+    Ok(l)
+}
+
+/// The position map for `l`: the shared one when `l` is a shared list, else a new one.
+pub fn pos_map(l: &Arc<Vec<Entry>>) -> Arc<PosMap> {
+    if let Some(m) = LISTS.lock().unwrap().as_ref() {
+        for s in m.values() {
+            if let Ok(s) = s.try_lock() {
+                if let Some(s) = s.as_ref().filter(|s| std::ptr::eq(s.list.as_ptr(), Arc::as_ptr(l))) {
+                    return s.pos.clone();
+                }
+            }
+        }
+    }
+    Arc::new(build_pos(l))
+}
+
 /// Open a folder, an archive, or an image file (its folder becomes the list).
 pub fn open(path: &Path, sort: u8, desc: bool) -> io::Result<Playlist> {
     let path = std::path::absolute(path)?;
     if path.is_dir() {
-        let entries = list_dir(&path, sort, desc)?;
+        let entries = list_dir_shared(&path, sort, desc)?;
         return Ok(Playlist { container: path, entries, index: 0 });
     }
     if is_archive(&path) {
-        let entries = list_zip(&path, sort, desc)?;
+        let entries = Arc::new(list_zip(&path, sort, desc)?);
         return Ok(Playlist { container: path, entries, index: 0 });
     }
     if !path.is_file() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
     }
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let mut entries = list_dir(&dir, sort, desc).unwrap_or_default();
+    let mut entries = list_dir_shared(&dir, sort, desc).unwrap_or_default();
     let index = match entries
         .iter()
         .position(|e| matches!(e, Entry::File(p) if same_name(p, &path)))
     {
         Some(i) => i,
         None => {
-            entries.insert(0, Entry::File(path.clone()));
+            Arc::make_mut(&mut entries).insert(0, Entry::File(path.clone()));
             0
         }
     };

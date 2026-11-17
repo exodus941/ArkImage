@@ -285,8 +285,13 @@ impl ApplicationHandler<UserEvent> for Master {
                 }
             }
             UserEvent::Listed(e, r) => {
+                // Only the window still showing `e` alone takes the list. Cloning it for
+                // every window hung the master: 100 windows in a 46,000-file folder made
+                // 100 copies of the list per listing.
                 for w in &mut self.windows {
-                    w.on_listed(e.clone(), r.clone());
+                    if w.wants_listed(&e) {
+                        w.on_listed(e.clone(), r.clone());
+                    }
                 }
             }
             UserEvent::Update(o, manual) => {

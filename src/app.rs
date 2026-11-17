@@ -355,7 +355,7 @@ pub struct App {
     pub cfg: Config,
     pending_open: Option<PathBuf>,
     playlist: Option<Playlist>,
-    pos_map: HashMap<Entry, usize>,
+    pos_map: Arc<source::PosMap>,
     cache: Rc<RefCell<HashMap<Entry, Arc<Decoded>>>>,
     failed: Rc<RefCell<HashMap<Entry, String>>>,
     inflight: Rc<RefCell<HashSet<Entry>>>,
@@ -423,6 +423,10 @@ pub struct App {
     rtl_for: Option<PathBuf>,
     /// When the last slide frame was drawn; the next one is due 8 ms later.
     slide_drawn: Instant,
+    /// Set when a new image is stored, cleared when a frame is presented. A redraw asked
+    /// for during a paint is dropped on Windows; in a takeover of ~100 windows the image
+    /// stayed grey until the cursor entered. about_to_wait retries every REPAINT_RETRY.
+    unpainted: Option<Instant>,
     fullscreen: bool,
     on_top: bool,
     rng: u64,
@@ -564,7 +568,7 @@ impl App {
             cfg,
             pending_open: arg,
             playlist: None,
-            pos_map: HashMap::new(),
+            pos_map: Default::default(),
             cache: sh.cache.clone(),
             failed: sh.failed.clone(),
             inflight: sh.inflight.clone(),
@@ -612,6 +616,7 @@ impl App {
             nav_hint: None,
             rtl_for: None,
             slide_drawn: Instant::now(),
+            unpainted: None,
             fullscreen: false,
             on_top: false,
             rng: seed,
@@ -704,7 +709,7 @@ impl App {
         if p.is_file() && !source::is_archive(p) {
             if let Ok(abs) = std::path::absolute(p) {
                 let dir = abs.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-                let first = Playlist { container: dir, entries: vec![Entry::File(abs.clone())], index: 0 };
+                let first = Playlist { container: dir, entries: Arc::new(vec![Entry::File(abs.clone())]), index: 0 };
                 self.set_playlist(first);
                 let (proxy, sort, desc) = (self.proxy.clone(), self.cfg.sort, self.cfg.sort_desc);
                 std::thread::spawn(move || {
@@ -726,17 +731,21 @@ impl App {
         }
     }
 
+    /// True while this window shows `e` as a one-entry list, waiting for its folder list.
+    pub fn wants_listed(&self, e: &Entry) -> bool {
+        self.playlist.as_ref().is_some_and(|pl| pl.entries.len() == 1 && pl.entries[0] == *e)
+    }
+
     /// Swap the one-entry list for the full folder list, keeping the view as it is.
     pub fn on_listed(&mut self, e: Entry, r: Result<Playlist, String>) {
-        let still_here = self.playlist.as_ref().map(|pl| pl.entries.len() == 1 && pl.entries[0] == e).unwrap_or(false);
-        if !still_here {
+        if !self.wants_listed(&e) {
             return;
         }
         let Ok(np) = r else { return };
         if np.entries.is_empty() {
             return;
         }
-        self.pos_map = np.entries.iter().cloned().enumerate().map(|(i, e)| (e, i)).collect();
+        self.pos_map = source::pos_map(&np.entries);
         self.playlist = Some(np);
         self.update_wanted();
         self.preload();
@@ -750,7 +759,7 @@ impl App {
         } else {
             pl.container.parent().map(|d| d.display().to_string()).unwrap_or_default()
         };
-        self.pos_map = pl.entries.iter().cloned().enumerate().map(|(i, e)| (e, i)).collect();
+        self.pos_map = source::pos_map(&pl.entries);
         self.failed.borrow_mut().clear();
         self.rand_hist.clear();
         let idx = pl.index;
@@ -833,6 +842,7 @@ impl App {
             None
         };
         self.current = Some((e, d));
+        self.unpainted = Some(Instant::now());
         self.invalidate();
         self.update_title();
     }
@@ -1279,7 +1289,7 @@ impl App {
         self.current = None;
         self.slideshow = None;
         self.next_frame_at = None;
-        self.pos_map.clear();
+        self.pos_map = Default::default();
         self.update_wanted();
         self.invalidate();
         self.update_title();
@@ -1296,7 +1306,7 @@ impl App {
         crate::trace(&format!("gone: {}", p.display()));
         self.cache.borrow_mut().remove(&e);
         let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
-        let entries = if dir.is_dir() { source::open(&dir, self.cfg.sort, self.cfg.sort_desc).map(|pl| pl.entries).unwrap_or_default() } else { Vec::new() };
+        let entries = if dir.is_dir() { source::open(&dir, self.cfg.sort, self.cfg.sort_desc).map(|pl| pl.entries).unwrap_or_default() } else { Default::default() };
         if entries.is_empty() {
             crate::trace("gone: folder has no image left, closing the window");
             self.store_geometry();
@@ -1316,14 +1326,14 @@ impl App {
         if pl.index >= pl.entries.len() {
             return;
         }
-        let e = pl.entries.remove(pl.index);
+        let e = Arc::make_mut(&mut pl.entries).remove(pl.index);
         self.cache.borrow_mut().remove(&e);
         if pl.entries.is_empty() {
             self.close();
             return;
         }
         let idx = pl.index.min(pl.entries.len() - 1);
-        self.pos_map = pl.entries.iter().cloned().enumerate().map(|(i, e)| (e, i)).collect();
+        self.pos_map = source::pos_map(&pl.entries);
         self.go_to(idx);
     }
 
@@ -1635,7 +1645,9 @@ impl App {
                     crate::trace("draw start");
                     self.draw(&mut c);
                 }
-                let _ = buf.present();
+                if buf.present().is_ok() {
+                    self.unpainted = None;
+                }
                 crate::trace("present");
             }
         }
@@ -3194,7 +3206,7 @@ impl App {
         }
         let on = self.rtl_on();
         let Some(pl) = &mut self.playlist else { return };
-        pl.entries.reverse();
+        Arc::make_mut(&mut pl.entries).reverse();
         pl.index = pl.entries.len().saturating_sub(1) - pl.index.min(pl.entries.len().saturating_sub(1));
         self.rtl_for = if on { None } else { Some(pl.container.clone()) };
         self.request_redraw();
@@ -4073,6 +4085,7 @@ impl App {
 
     /// Timers for this window (animation, slideshow, toast, fade); returns the next deadline.
     pub fn about_to_wait(&mut self) -> Option<Instant> {
+        const REPAINT_RETRY: Duration = Duration::from_millis(250);
         let now = Instant::now();
         if let Some(t) = self.next_frame_at {
             if now >= t {
@@ -4128,7 +4141,18 @@ impl App {
         if slide_at.is_some_and(|t| now >= t) {
             self.request_redraw();
         }
-        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at]
+        // repaint failsafe: a stored image not yet presented is redrawn every REPAINT_RETRY
+        let hidden = self.window.as_ref().is_none_or(|w| w.is_visible() == Some(false) || w.is_minimized() == Some(true));
+        if hidden {
+            self.unpainted = None;
+        }
+        if self.unpainted.is_some_and(|t| now >= t + REPAINT_RETRY) {
+            crate::trace("repaint retry");
+            self.unpainted = Some(now);
+            self.request_redraw();
+        }
+        let repaint_at = self.unpainted.map(|t| t + REPAINT_RETRY);
+        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at, repaint_at]
             .into_iter()
             .flatten()
             .min()
