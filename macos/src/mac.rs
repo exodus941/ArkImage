@@ -96,6 +96,8 @@ pub fn glass(w: &Window) -> bool {
             return false;
         }
         let _: () = msg_send![fx, setAutoresizingMask: 18usize]; // width + height sizable
+        let ident = NSString::from_str("arkimage.glass");
+        let _: () = msg_send![fx, setIdentifier: &*ident];
         let _: () = msg_send![frame_view, addSubview: fx, positioned: -1isize, relativeTo: view]; // below
         let _: () = msg_send![fx, release];
         let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
@@ -111,6 +113,61 @@ pub fn glass(w: &Window) -> bool {
         let _: () = msg_send![layer, setOpaque: false];
     }
     true
+}
+
+/// Frosted glass behind a main window, on or off. On: the glass view from `glass` (made
+/// once, then shown again), the content layer keeping alpha. Off: the glass hidden and the
+/// window and layer opaque again, so pixels whose alpha byte is not set draw solid.
+pub fn window_glass(w: &Window, on: bool) -> bool {
+    let Some(view) = ns_view(w) else { return false };
+    unsafe {
+        let win: *mut AnyObject = msg_send![view, window];
+        let frame_view: *mut AnyObject = msg_send![view, superview];
+        if win.is_null() || frame_view.is_null() {
+            return false;
+        }
+        let subs: *mut AnyObject = msg_send![frame_view, subviews];
+        let n: usize = msg_send![subs, count];
+        let mut fx: *mut AnyObject = std::ptr::null_mut();
+        for i in 0..n {
+            let v: *mut AnyObject = msg_send![subs, objectAtIndex: i];
+            let id: *mut AnyObject = msg_send![v, identifier];
+            if !id.is_null() {
+                let id = &*(id as *const NSString);
+                if id.to_string() == "arkimage.glass" {
+                    fx = v;
+                }
+            }
+        }
+        if on {
+            if fx.is_null() {
+                return glass(w);
+            }
+            let _: () = msg_send![fx, setHidden: false];
+            let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+            let _: () = msg_send![win, setOpaque: false];
+            let _: () = msg_send![win, setBackgroundColor: clear];
+            let layer: *mut AnyObject = msg_send![view, layer];
+            if !layer.is_null() {
+                let name = NSString::from_str("arkimage.alpha");
+                let _: () = msg_send![layer, setName: &*name];
+                let _: () = msg_send![layer, setOpaque: false];
+            }
+            true
+        } else {
+            if !fx.is_null() {
+                let _: () = msg_send![fx, setHidden: true];
+            }
+            let _: () = msg_send![win, setOpaque: true];
+            let layer: *mut AnyObject = msg_send![view, layer];
+            if !layer.is_null() {
+                let none: *mut AnyObject = std::ptr::null_mut();
+                let _: () = msg_send![layer, setName: none];
+                let _: () = msg_send![layer, setOpaque: true];
+            }
+            true
+        }
+    }
 }
 
 /// Show or hide the window's close, minimize and zoom buttons (the traffic lights).

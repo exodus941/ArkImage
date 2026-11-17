@@ -2,9 +2,11 @@
 
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     fs,
     io,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, Weak},
     time::SystemTime,
 };
 
@@ -99,8 +101,32 @@ impl Entry {
 pub struct Playlist {
     /// The folder or archive the entries come from.
     pub container: PathBuf,
-    pub entries: Vec<Entry>,
+    /// In folder order, shared by every window in the folder (see `Slot`).
+    pub entries: Arc<Vec<Entry>>,
+    /// Read the list backwards (an archive read right to left). Every read of the list
+    /// goes through `get`, `len` and `iter`, so `index` is always in reading order.
+    pub rev: bool,
+    /// Position in reading order.
     pub index: usize,
+}
+
+impl Playlist {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    /// Reading-order position to folder-order position, and back (the map is its own inverse).
+    pub fn flip(&self, i: usize) -> usize {
+        if self.rev { self.entries.len().saturating_sub(1).saturating_sub(i) } else { i }
+    }
+    pub fn get(&self, i: usize) -> Option<&Entry> {
+        if i >= self.entries.len() {
+            return None;
+        }
+        self.entries.get(self.flip(i))
+    }
+    pub fn iter(&self) -> Box<dyn Iterator<Item = &Entry> + '_> {
+        if self.rev { Box::new(self.entries.iter().rev()) } else { Box::new(self.entries.iter()) }
+    }
 }
 
 struct Item {
@@ -265,33 +291,151 @@ fn same_name(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Open a folder, an archive, or an image file (its folder becomes the list).
+/// Entry to position in the list (folder order).
+pub type PosMap = HashMap<Entry, usize>;
+
+/// The master's one list per folder. Every window showing an image from the folder
+/// holds the same `Arc`; the slot keeps only a weak reference, so a list goes away with
+/// its last window. A new listing that differs replaces the list, and `changed()` hands
+/// the folder to the master, which gives the new list to every window in that folder.
+struct Slot {
+    sort: (u8, bool),
+    /// Counts listings, so a window that waited for another's listing reuses it.
+    gen: u64,
+    list: Weak<Vec<Entry>>,
+    pos: Arc<PosMap>,
+}
+
+static LISTS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<Slot>>>>> = Mutex::new(None);
+static CHANGED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn build_pos(l: &[Entry]) -> PosMap {
+    l.iter().cloned().enumerate().map(|(i, e)| (e, i)).collect()
+}
+
+fn slot(dir: &Path) -> Arc<Mutex<Slot>> {
+    let mut g = LISTS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    // drop folders no window shows any more (a slot being filled is locked: keep it)
+    m.retain(|_, s| s.try_lock().map(|s| s.list.strong_count() > 0).unwrap_or(true));
+    m.entry(dir.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(Slot { sort: (u8::MAX, false), gen: 0, list: Weak::new(), pos: Arc::default() })))
+        .clone()
+}
+
+/// The folder's list in this sort order. `fresh` reads the folder even when a list is
+/// held (a window opening an image, a file gone); otherwise a held list is used as is.
+/// Windows asking at the same moment share one read.
+fn list_dir_shared(dir: &Path, sort: u8, desc: bool, fresh: bool) -> io::Result<Arc<Vec<Entry>>> {
+    let slot = slot(dir);
+    let seen = slot.try_lock().map(|s| s.gen).ok();
+    let mut s = slot.lock().unwrap();
+    let held = s.list.upgrade().filter(|_| s.sort == (sort, desc));
+    if let Some(l) = &held {
+        // not asked to re-read, or another window read it while this one waited
+        if !fresh || seen != Some(s.gen) {
+            crate::trace("list shared");
+            return Ok(l.clone());
+        }
+    }
+    let new = list_dir(dir, sort, desc)?;
+    s.gen += 1;
+    if let Some(l) = held {
+        if *l == new {
+            return Ok(l);
+        }
+    }
+    let had = s.list.strong_count() > 0;
+    let l = Arc::new(new);
+    s.pos = Arc::new(build_pos(&l));
+    s.list = Arc::downgrade(&l);
+    s.sort = (sort, desc);
+    if had {
+        CHANGED.lock().unwrap().push(dir.to_path_buf());
+    }
+    Ok(l)
+}
+
+/// The held list of `dir` and its position map, if any window holds one.
+pub fn held(dir: &Path) -> Option<(Arc<Vec<Entry>>, Arc<PosMap>)> {
+    let g = LISTS.lock().unwrap();
+    let s = g.as_ref()?.get(dir)?.lock().unwrap();
+    Some((s.list.upgrade()?, s.pos.clone()))
+}
+
+/// Folders whose list was replaced since the last call.
+pub fn changed() -> Vec<PathBuf> {
+    std::mem::take(&mut *CHANGED.lock().unwrap())
+}
+
+/// Remove `e` from the held list of `dir`, for every window in it (a file deleted).
+pub fn remove(dir: &Path, e: &Entry) -> Option<Arc<Vec<Entry>>> {
+    let slot = slot(dir);
+    let mut s = slot.lock().unwrap();
+    let l = s.list.upgrade()?;
+    if !l.contains(e) {
+        return None;
+    }
+    let l = Arc::new(l.iter().filter(|x| *x != e).cloned().collect::<Vec<_>>());
+    s.gen += 1;
+    s.pos = Arc::new(build_pos(&l));
+    s.list = Arc::downgrade(&l);
+    // the caller takes it at once; the other windows through changed()
+    CHANGED.lock().unwrap().push(dir.to_path_buf());
+    Some(l)
+}
+
+/// The position map for `l`: the held one when `l` is a folder's held list, else a new one.
+pub fn pos_map(l: &Arc<Vec<Entry>>) -> Arc<PosMap> {
+    if let Some(m) = LISTS.lock().unwrap().as_ref() {
+        for s in m.values() {
+            if let Ok(s) = s.try_lock() {
+                if std::ptr::eq(s.list.as_ptr(), Arc::as_ptr(l)) {
+                    return s.pos.clone();
+                }
+            }
+        }
+    }
+    Arc::new(build_pos(l))
+}
+
+/// Open a folder, an archive, or an image file (its folder becomes the list), using the
+/// folder's held list when there is one.
 pub fn open(path: &Path, sort: u8, desc: bool) -> io::Result<Playlist> {
+    open_list(path, sort, desc, false)
+}
+
+/// As `open`, but read the folder again; a changed list goes to every window in it.
+pub fn open_fresh(path: &Path, sort: u8, desc: bool) -> io::Result<Playlist> {
+    open_list(path, sort, desc, true)
+}
+
+fn open_list(path: &Path, sort: u8, desc: bool, fresh: bool) -> io::Result<Playlist> {
     let path = std::path::absolute(path)?;
     if path.is_dir() {
-        let entries = list_dir(&path, sort, desc)?;
-        return Ok(Playlist { container: path, entries, index: 0 });
+        let entries = list_dir_shared(&path, sort, desc, fresh)?;
+        return Ok(Playlist { container: path, entries, rev: false, index: 0 });
     }
     if is_archive(&path) {
-        let entries = list_zip(&path, sort, desc)?;
-        return Ok(Playlist { container: path, entries, index: 0 });
+        let entries = Arc::new(list_zip(&path, sort, desc)?);
+        return Ok(Playlist { container: path, entries, rev: false, index: 0 });
     }
     if !path.is_file() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
     }
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let mut entries = list_dir(&dir, sort, desc).unwrap_or_default();
+    let mut entries = list_dir_shared(&dir, sort, desc, fresh).unwrap_or_default();
     let index = match entries
         .iter()
         .position(|e| matches!(e, Entry::File(p) if same_name(p, &path)))
     {
         Some(i) => i,
         None => {
-            entries.insert(0, Entry::File(path.clone()));
+            Arc::make_mut(&mut entries).insert(0, Entry::File(path.clone()));
             0
         }
     };
-    Ok(Playlist { container: dir, entries, index })
+    Ok(Playlist { container: dir, entries, rev: false, index })
 }
 
 /// The next or previous folder (and archive, when `archives`) beside `container` that
@@ -324,6 +468,72 @@ pub fn sibling(container: &Path, forward: bool, sort: u8, desc: bool, archives: 
         }
     }
     None
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    fn folder(tag: &str, names: &[&str]) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ark-store-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        for n in names {
+            fs::write(d.join(n), b"x").unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn one_list_per_folder() {
+        let d = folder("share", &["a.png", "b.png", "c.png"]);
+        let a = open_fresh(&d.join("a.png"), 0, false).unwrap();
+        let b = open_fresh(&d.join("c.png"), 0, false).unwrap();
+        let c = open(&d, 0, false).unwrap();
+        assert!(Arc::ptr_eq(&a.entries, &b.entries) && Arc::ptr_eq(&a.entries, &c.entries));
+        assert_eq!((a.index, b.index), (0, 2));
+        assert!(Arc::ptr_eq(&pos_map(&a.entries), &pos_map(&b.entries)));
+        let _ = changed();
+        // a new file: the next fresh read replaces the list and names the folder
+        fs::write(d.join("d.png"), b"x").unwrap();
+        let n = open_fresh(&d.join("a.png"), 0, false).unwrap();
+        assert_eq!(n.len(), 4);
+        assert!(changed().contains(&d));
+        assert!(Arc::ptr_eq(&held(&d).unwrap().0, &n.entries));
+        // a delete: one list without it, for everyone
+        let e = n.get(1).unwrap().clone();
+        let r = remove(&d, &e).unwrap();
+        assert_eq!(r.len(), 3);
+        assert!(!r.contains(&e) && changed().contains(&d));
+        drop((a, b, c, n));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn newest_sort_replaces_the_list() {
+        let d = folder("sort", &["a.png", "b.png"]);
+        let a = open(&d, 0, false).unwrap();
+        let z = open(&d, 0, true).unwrap();
+        assert!(!Arc::ptr_eq(&a.entries, &z.entries));
+        assert_eq!(z.get(0).unwrap().name(), "b.png");
+        assert!(Arc::ptr_eq(&held(&d).unwrap().0, &z.entries));
+        drop((a, z));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn reversed_reading() {
+        let d = folder("rev", &["a.png", "b.png", "c.png"]);
+        let mut p = open(&d, 0, false).unwrap();
+        p.rev = true;
+        let names: Vec<String> = p.iter().map(|e| e.name()).collect();
+        assert_eq!(names, ["c.png", "b.png", "a.png"]);
+        assert_eq!(p.get(0).unwrap().name(), "c.png");
+        assert_eq!((p.flip(0), p.flip(2)), (2, 0));
+        assert!(p.get(3).is_none());
+        drop(p);
+        let _ = fs::remove_dir_all(&d);
+    }
 }
 
 #[cfg(test)]

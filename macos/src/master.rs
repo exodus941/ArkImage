@@ -102,6 +102,7 @@ impl Master {
         let id = self.next_id;
         self.next_id += 1;
         self.windows.push(App::new(&self.sh, id, self.cfg.clone(), arg));
+        self.update_glass();
         self.windows.len() - 1
     }
 
@@ -120,6 +121,26 @@ impl Master {
     }
 
     /// One config for all windows: a change made in any window reaches the others.
+    /// Frosted glass only while one window is open: a second window fades the first to
+    /// the solid colour, and the last one left fades back to glass. A new window starts
+    /// in its state at once.
+    fn update_glass(&mut self) {
+        let one = self.windows.len() == 1;
+        let n = self.windows.len();
+        for (i, w) in self.windows.iter_mut().enumerate() {
+            w.set_glass(one, i + 1 == n && w.is_new());
+        }
+    }
+
+    /// Give every window in a folder whose list changed the master's new list.
+    fn adopt_lists(&mut self) {
+        for d in crate::source::changed() {
+            for w in &mut self.windows {
+                w.adopt(&d);
+            }
+        }
+    }
+
     fn sync_config(&mut self) {
         let changed = self.windows.iter().position(|w| w.cfg != self.cfg);
         if let Some(i) = changed {
@@ -184,6 +205,7 @@ impl Master {
         });
         if self.windows.len() != before {
             self.evict();
+            self.update_glass();
         }
         if self.windows.is_empty() && self.started {
             el.exit();
@@ -306,9 +328,15 @@ impl ApplicationHandler<UserEvent> for Master {
                 }
             }
             UserEvent::Listed(e, r) => {
+                // Only the window still showing `e` alone takes the list. Cloning it for
+                // every window hung the master: 100 windows in a 46,000-file folder made
+                // 100 copies of the list per listing.
                 for w in &mut self.windows {
-                    w.on_listed(e.clone(), r.clone());
+                    if w.wants_listed(&e) {
+                        w.on_listed(e.clone(), r.clone());
+                    }
                 }
+                self.adopt_lists();
             }
             UserEvent::Update(o, manual) => {
                 // shown once: in the window whose Settings asked, else the first window
@@ -352,11 +380,14 @@ impl ApplicationHandler<UserEvent> for Master {
             w.window_event(el, id, ev);
         }
         self.sync_config();
+        self.adopt_lists();
         self.reveal_all();
         self.reap(el);
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // a window found its file gone and read the folder again
+        self.adopt_lists();
         if self.speed_menu_at.is_some_and(|t| Instant::now() >= t) {
             self.speed_menu_at = None;
             if std::env::var("ARKIMAGE_TEST_FULLSCREEN").as_deref() == Ok("3") {

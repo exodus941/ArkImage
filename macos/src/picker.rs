@@ -303,7 +303,7 @@ impl Picker {
 
     /// Draw the overlay and queue the thumbnails it still needs.
     #[allow(clippy::too_many_arguments)]
-    pub fn draw(&mut self, c: &mut Canvas, t: Option<&mut Text>, entries: &[Entry], current: usize, sf: f32, jobs: &Jobs, main_cache: &dyn Fn(&Entry) -> Option<Arc<RgbaImage>>) {
+    pub fn draw(&mut self, c: &mut Canvas, t: Option<&mut Text>, entries: &crate::source::Playlist, current: usize, sf: f32, jobs: &Jobs, main_cache: &dyn Fn(&Entry) -> Option<Arc<RgbaImage>>) {
         self.frame += 1;
         let size = (THUMB * sf).round() as u32;
         if size != self.size {
@@ -333,7 +333,7 @@ impl Picker {
         let mut want = Vec::new();
         let mut t = t;
         for i in vis.clone() {
-            let e = &entries[i];
+            let Some(e) = entries.get(i) else { continue };
             let (col, row) = (i % g.cols, i / g.cols);
             let cx = g.x0 + col as f32 * g.cw;
             let cy = g.top + row as f32 * g.ch - self.scroll;
@@ -477,7 +477,7 @@ impl Picker {
             self.bar_anim = k < 1.0;
         }
         // nearest the selection first; workers pop from the end, so sort farthest-first
-        let pos: HashMap<&Entry, usize> = vis.clone().map(|i| (&entries[i], i)).collect();
+        let pos: HashMap<&Entry, usize> = vis.clone().filter_map(|i| entries.get(i).map(|e| (e, i))).collect();
         let sel = self.sel;
         want.sort_by_key(|e| std::cmp::Reverse(pos.get(e).map(|&i| i.abs_diff(sel)).unwrap_or(usize::MAX)));
         let mut g2 = jobs.list.lock().unwrap();

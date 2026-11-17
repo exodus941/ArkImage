@@ -140,6 +140,71 @@ fn mica(_w: &Window) -> bool {
     false
 }
 
+/// Frosted glass behind a lone window: the acrylic blur-behind accent
+/// (SetWindowCompositionAttribute, WCA_ACCENT_POLICY = 19, ACCENT_ENABLE_ACRYLICBLURBEHIND
+/// = 4). Live content behind the window shows blurred through pixels drawn with alpha
+/// below 255. The frame is not extended: that drew the system caption buttons on the
+/// borderless window. `on` false sets ACCENT_DISABLED. Returns false if the call fails.
+#[cfg(windows)]
+fn acrylic(w: &Window, on: bool, bg: u32) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    #[repr(C)]
+    struct Accent {
+        state: u32,
+        flags: u32,
+        /// AABBGGRR tint over the blur
+        color: u32,
+        anim: u32,
+    }
+    #[repr(C)]
+    struct Data {
+        attr: u32,
+        data: *const Accent,
+        size: usize,
+    }
+    // not in the import library: look it up in user32 at run time
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(n: *const u16) -> isize;
+        fn GetProcAddress(m: isize, n: *const u8) -> usize;
+    }
+    let name: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+    let f = unsafe { GetProcAddress(GetModuleHandleW(name.as_ptr()), b"SetWindowCompositionAttribute\0".as_ptr()) };
+    if f == 0 {
+        return false;
+    }
+    let set: unsafe extern "system" fn(isize, *const Data) -> i32 = unsafe { std::mem::transmute(f) };
+    let Ok(h) = w.window_handle() else { return false };
+    let RawWindowHandle::Win32(h) = h.as_raw() else { return false };
+    // flags 0: no system tint. Its tint darkened far past its alpha (a 33% grey tint
+    // gave #1A310C over lime); the 33% grey is drawn in our own pixels instead.
+    let _ = bg;
+    let acc = Accent { state: if on { 4 } else { 0 }, flags: 0, color: 0, anim: 0 };
+    let d = Data { attr: 19, data: &acc, size: std::mem::size_of::<Accent>() };
+    unsafe { set(h.hwnd.get(), &d) != 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn acrylic(w: &Window, on: bool, _bg: u32) -> bool {
+    // on: true when the glass is now behind the window; off: always reports false (unloaded)
+    crate::mac::window_glass(w, on) && on
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn acrylic(_w: &Window, _on: bool, _bg: u32) -> bool {
+    false
+}
+
+/// Background pixels while the glass is loaded: the background colour with a marker in
+/// the alpha byte. Everything drawn over them writes alpha 0, so after the draw the
+/// pixels still marked are background, and only those turn see-through.
+const GLASS_MARK: u32 = 0x0100_0000;
+/// The background grey over the blur at this alpha: 33%, the user's value (black at 38%
+/// read as too dark and grey).
+const GLASS_OPACITY: u32 = 84;
+const GLASS_FADE: Duration = Duration::from_millis(250);
+
+
 
 /// Whether the window is maximized (zoomed). On macOS this asks AppKit directly: winit's
 /// is_maximized() adds a title bar for a moment to a window without one (in full screen,
@@ -373,7 +438,7 @@ pub struct App {
     /// macOS: whether the traffic-light buttons are shown (None: not set yet).
     #[cfg(target_os = "macos")]
     lights_on: Option<bool>,
-    pos_map: HashMap<Entry, usize>,
+    pos_map: Arc<source::PosMap>,
     cache: Rc<RefCell<HashMap<Entry, Arc<Decoded>>>>,
     failed: Rc<RefCell<HashMap<Entry, String>>>,
     inflight: Rc<RefCell<HashSet<Entry>>>,
@@ -446,6 +511,12 @@ pub struct App {
     rtl_for: Option<PathBuf>,
     /// When the last slide frame was drawn; the next one is due 8 ms later.
     slide_drawn: Instant,
+    /// Frosted glass: wanted (the only window), loaded (backdrop set), and the fade
+    /// from `glass_from` (0 glass, 1 solid) toward the wanted state, started at `glass_at`.
+    glass_on: bool,
+    glass_loaded: bool,
+    glass_from: f32,
+    glass_at: Instant,
     fullscreen: bool,
     /// macOS: the window's full-screen flag as last seen (see render)
     fs_native: Option<bool>,
@@ -599,7 +670,7 @@ impl App {
             playlist: None,
             #[cfg(target_os = "macos")]
             lights_on: None,
-            pos_map: HashMap::new(),
+            pos_map: Default::default(),
             cache: sh.cache.clone(),
             failed: sh.failed.clone(),
             inflight: sh.inflight.clone(),
@@ -648,6 +719,10 @@ impl App {
             nav_hint: None,
             rtl_for: None,
             slide_drawn: Instant::now(),
+            glass_on: false,
+            glass_loaded: false,
+            glass_from: 1.0,
+            glass_at: Instant::now(),
             fullscreen: false,
             fs_native: None,
             on_top: false,
@@ -716,11 +791,11 @@ impl App {
     }
 
     fn cur_entry(&self) -> Option<Entry> {
-        self.playlist.as_ref().and_then(|p| p.entries.get(p.index).cloned())
+        self.playlist.as_ref().and_then(|p| p.get(p.index).cloned())
     }
 
     fn next_entry(&self) -> Option<Entry> {
-        self.playlist.as_ref().and_then(|p| p.entries.get(p.index + 1).cloned())
+        self.playlist.as_ref().and_then(|p| p.get(p.index + 1).cloned())
     }
 
     fn displaying_current(&self) -> bool {
@@ -755,12 +830,12 @@ impl App {
         if p.is_file() && !source::is_archive(p) {
             if let Ok(abs) = std::path::absolute(p) {
                 let dir = abs.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-                let first = Playlist { container: dir, entries: vec![Entry::File(abs.clone())], index: 0 };
+                let first = Playlist { container: dir, entries: Arc::new(vec![Entry::File(abs.clone())]), rev: false, index: 0 };
                 self.set_playlist(first);
                 let (proxy, sort, desc) = (self.proxy.clone(), self.cfg.sort, self.cfg.sort_desc);
                 std::thread::spawn(move || {
                     crate::trace("list start");
-                    let r = source::open(&abs, sort, desc).map_err(|e| e.to_string());
+                    let r = source::open_fresh(&abs, sort, desc).map_err(|e| e.to_string());
                     crate::trace("listed");
                     let _ = proxy.send_event(UserEvent::Listed(Entry::File(abs), r));
                 });
@@ -777,17 +852,114 @@ impl App {
         }
     }
 
+    /// How solid the background is now: 0 frosted glass, 1 the solid colour.
+    fn glass_solid(&self) -> f32 {
+        let to = if self.glass_on { 0.0 } else { 1.0 };
+        let k = (self.glass_at.elapsed().as_secs_f32() / GLASS_FADE.as_secs_f32()).min(1.0);
+        self.glass_from + (to - self.glass_from) * k
+    }
+
+    fn glass_fading(&self) -> bool {
+        self.glass_at.elapsed() < GLASS_FADE + Duration::from_millis(20)
+    }
+
+    /// True until the window exists on screen.
+    pub fn is_new(&self) -> bool {
+        self.window.is_none()
+    }
+
+    /// The master calls this when the window count changes: glass while this is the only
+    /// window. `instant` skips the fade (a window just opened).
+    pub fn set_glass(&mut self, on: bool, instant: bool) {
+        if on == self.glass_on {
+            return;
+        }
+        self.glass_from = if instant { if on { 0.0 } else { 1.0 } } else { self.glass_solid() };
+        self.glass_on = on;
+        self.glass_at = Instant::now();
+        self.request_redraw();
+    }
+
+    /// Before a draw: load the backdrop when glass is wanted, unload it once the fade to
+    /// solid has ended. Returns true while background pixels must be marked.
+    fn glass_prepare(&mut self) -> bool {
+        let Some(w) = self.window.clone() else { return false };
+        if self.glass_on && !self.glass_loaded {
+            self.glass_loaded = acrylic(&w, true, self.cfg.bg_color);
+            crate::trace(&format!("glass loaded: {}", self.glass_loaded));
+        }
+        if !self.glass_on && self.glass_loaded && !self.glass_fading() {
+            acrylic(&w, false, self.cfg.bg_color);
+            self.glass_loaded = false;
+            crate::trace("glass unloaded");
+        }
+        self.glass_loaded
+    }
+
+    /// After a draw: background pixels become the glass, faded toward the solid colour by
+    /// `glass_solid`; every other pixel is opaque. Alpha is premultiplied.
+    fn glass_finish(&self, buf: &mut [u32]) {
+        let t = self.glass_solid();
+        // the background grey at GLASS_OPACITY over the blur, faded to solid by t
+        let o = GLASS_OPACITY as f32 / 255.0;
+        let t = o + (1.0 - o) * t;
+        let a = 255.0 * t;
+        let a = a.round() as u32;
+        let bg = self.cfg.bg_color;
+        let m = |v: u32| ((v as f32) * t).round() as u32;
+        let glass = a << 24 | m(bg >> 16 & 0xFF) << 16 | m(bg >> 8 & 0xFF) << 8 | m(bg & 0xFF);
+        for p in buf.iter_mut() {
+            *p = if *p >> 24 == 1 { glass } else { 0xFF00_0000 | (*p & 0xFF_FFFF) };
+        }
+    }
+
+    /// Take the master's new list for folder `dir` (re-read or a file deleted elsewhere),
+    /// staying on the image shown.
+    pub fn adopt(&mut self, dir: &Path) {
+        let Some(pl) = &self.playlist else { return };
+        if pl.container != dir || pl.rev {
+            return;
+        }
+        let Some((l, pos)) = source::held(dir) else { return };
+        if Arc::ptr_eq(&l, &pl.entries) || l.is_empty() {
+            return;
+        }
+        let cur = self.cur_entry();
+        let at = cur.as_ref().and_then(|c| pos.get(c)).copied();
+        let old = pl.index;
+        let Some(pl) = &mut self.playlist else { return };
+        pl.entries = l;
+        self.pos_map = pos;
+        match at {
+            Some(i) => {
+                pl.index = i;
+                self.update_wanted();
+                self.preload();
+                self.update_title();
+                self.request_redraw();
+            }
+            None => {
+                let i = old.min(pl.entries.len() - 1);
+                self.go_to(i);
+            }
+        }
+    }
+
+    /// True while this window shows `e` as a one-entry list, waiting for its folder list.
+    pub fn wants_listed(&self, e: &Entry) -> bool {
+        self.playlist.as_ref().is_some_and(|pl| pl.entries.len() == 1 && pl.entries[0] == *e)
+    }
+
     /// Swap the one-entry list for the full folder list, keeping the view as it is.
     pub fn on_listed(&mut self, e: Entry, r: Result<Playlist, String>) {
-        let still_here = self.playlist.as_ref().map(|pl| pl.entries.len() == 1 && pl.entries[0] == e).unwrap_or(false);
-        if !still_here {
+        if !self.wants_listed(&e) {
             return;
         }
         let Ok(np) = r else { return };
         if np.entries.is_empty() {
             return;
         }
-        self.pos_map = np.entries.iter().cloned().enumerate().map(|(i, e)| (e, i)).collect();
+        self.pos_map = source::pos_map(&np.entries);
         self.playlist = Some(np);
         self.update_wanted();
         self.preload();
@@ -801,9 +973,14 @@ impl App {
         } else {
             pl.container.parent().map(|d| d.display().to_string()).unwrap_or_default()
         };
-        self.pos_map = pl.entries.iter().cloned().enumerate().map(|(i, e)| (e, i)).collect();
+        self.pos_map = source::pos_map(&pl.entries);
         self.failed.borrow_mut().clear();
         self.rand_hist.clear();
+        let mut pl = pl;
+        if self.rtl_for.as_deref() == Some(pl.container.as_path()) && source::is_archive(&pl.container) {
+            pl.rev = true;
+            pl.index = pl.flip(pl.index);
+        }
         let idx = pl.index;
         self.playlist = Some(pl);
         self.go_to(idx);
@@ -816,8 +993,8 @@ impl App {
             let d = self.dir as isize;
             for o in [-2isize, -1, 0, 1, 2, 3, 4, 5, 6, 7].map(|o| o * d) {
                 let j = i + o;
-                if j >= 0 && (j as usize) < pl.entries.len() {
-                    w.insert(pl.entries[j as usize].clone());
+                if let Some(e) = (j >= 0).then(|| pl.get(j as usize)).flatten() {
+                    w.insert(e.clone());
                 }
             }
         }
@@ -835,7 +1012,8 @@ impl App {
     /// True if `e` is nearer the current index than the image now on screen.
     fn closer_than_shown(&self, e: &Entry) -> bool {
         let idx = self.index() as i64;
-        let dist = |x: &Entry| self.pos_map.get(x).map(|&p| (p as i64 - idx).abs()).unwrap_or(i64::MAX);
+        let Some(pl) = &self.playlist else { return true };
+        let dist = |x: &Entry| self.pos_map.get(x).map(|&p| (pl.flip(p) as i64 - idx).abs()).unwrap_or(i64::MAX);
         match &self.current {
             Some((shown, _)) => dist(e) < dist(shown),
             None => true,
@@ -857,7 +1035,7 @@ impl App {
             .filter_map(|o| {
                 let j = i + o;
                 if j >= 0 {
-                    pl.entries.get(j as usize).cloned()
+                    pl.get(j as usize).cloned()
                 } else {
                     None
                 }
@@ -871,8 +1049,8 @@ impl App {
     /// How far `e` is from this window's current image (i64::MAX if not in its list).
     /// The master evicts the shared cache by the smallest distance over all windows.
     pub fn distance(&self, e: &Entry) -> i64 {
-        let idx = self.playlist.as_ref().map(|p| p.index as i64).unwrap_or(0);
-        self.pos_map.get(e).map(|&p| (p as i64 - idx).abs()).unwrap_or(i64::MAX)
+        let Some(pl) = &self.playlist else { return i64::MAX };
+        self.pos_map.get(e).map(|&p| (pl.flip(p) as i64 - pl.index as i64).abs()).unwrap_or(i64::MAX)
     }
 
     fn set_current(&mut self, e: Entry, d: Arc<Decoded>) {
@@ -1360,7 +1538,7 @@ impl App {
         self.current = None;
         self.slideshow = None;
         self.next_frame_at = None;
-        self.pos_map.clear();
+        self.pos_map = Default::default();
         self.update_wanted();
         self.invalidate();
         self.update_title();
@@ -1377,7 +1555,7 @@ impl App {
         crate::trace(&format!("gone: {}", p.display()));
         self.cache.borrow_mut().remove(&e);
         let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
-        let entries = if dir.is_dir() { source::open(&dir, self.cfg.sort, self.cfg.sort_desc).map(|pl| pl.entries).unwrap_or_default() } else { Vec::new() };
+        let entries = if dir.is_dir() { source::open_fresh(&dir, self.cfg.sort, self.cfg.sort_desc).map(|pl| pl.entries).unwrap_or_default() } else { Default::default() };
         if entries.is_empty() {
             crate::trace("gone: folder has no image left, closing the window");
             self.store_geometry();
@@ -1389,7 +1567,7 @@ impl App {
             }
             return;
         }
-        self.set_playlist(Playlist { container: dir, entries, index: 0 });
+        self.set_playlist(Playlist { container: dir, entries, rev: false, index: 0 });
     }
 
     fn remove_current_from_list(&mut self) {
@@ -1397,14 +1575,21 @@ impl App {
         if pl.index >= pl.entries.len() {
             return;
         }
-        let e = pl.entries.remove(pl.index);
+        let Some(e) = pl.get(pl.index).cloned() else { return };
+        match source::remove(&pl.container, &e) {
+            Some(l) => pl.entries = l,
+            None => {
+                let at = pl.flip(pl.index);
+                Arc::make_mut(&mut pl.entries).remove(at);
+            }
+        }
         self.cache.borrow_mut().remove(&e);
         if pl.entries.is_empty() {
             self.close();
             return;
         }
         let idx = pl.index.min(pl.entries.len() - 1);
-        self.pos_map = pl.entries.iter().cloned().enumerate().map(|(i, e)| (e, i)).collect();
+        self.pos_map = source::pos_map(&pl.entries);
         self.go_to(idx);
     }
 
@@ -1573,7 +1758,7 @@ impl App {
             Some((arch, name)) => {
                 self.open_path(Path::new(arch));
                 let pos = self.playlist.as_ref().and_then(|pl| {
-                    pl.entries.iter().position(|e| matches!(e, Entry::Zip { name: n, .. } if n == name))
+                    pl.iter().position(|e| matches!(e, Entry::Zip { name: n, .. } if n == name))
                 });
                 if let Some(i) = pos {
                     self.go_to(i);
@@ -1624,7 +1809,7 @@ impl App {
         let Some(w) = self.window.clone() else { return };
         let t = match &self.playlist {
             Some(pl) if !pl.entries.is_empty() => {
-                let e = &pl.entries[pl.index];
+                let Some(e) = pl.get(pl.index) else { return };
                 let dims = self
                     .current
                     .as_ref()
@@ -1647,7 +1832,7 @@ impl App {
         use crate::ui::Row;
         let row = |k: &str, v: String, mono: bool| Row { key: k.to_string(), value: v, mono };
         let pl = self.playlist.as_ref()?;
-        let e = pl.entries.get(pl.index)?;
+        let e = pl.get(pl.index)?;
         let mut secs = vec![vec![
             row("Folder", e.fs_path().parent().map(|p| p.display().to_string()).unwrap_or_default(), false),
             row("Index", format!("{} / {}", pl.index + 1, pl.entries.len()), true),
@@ -1678,7 +1863,7 @@ impl App {
     fn info_lines(&self) -> Vec<String> {
         let mut v = Vec::new();
         let Some(pl) = &self.playlist else { return v };
-        let Some(e) = pl.entries.get(pl.index) else { return v };
+        let Some(e) = pl.get(pl.index) else { return v };
         v.push(format!("File Name: {}", e.name()));
         v.push(format!("Path: {}", e.fs_path().display()));
         v.push(format!("Index: {} / {}", pl.index + 1, pl.entries.len()));
@@ -1712,13 +1897,18 @@ impl App {
         if surface.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap()).is_ok() {
             if let Ok(mut buf) = surface.buffer_mut() {
                 {
+                    let glass = self.glass_prepare();
                     let mut c = Canvas { buf: &mut buf, w: w as usize, h: h as usize };
                     crate::trace("draw start");
                     self.draw(&mut c);
+                    if glass {
+                        self.glass_finish(c.buf);
+                    }
                 }
-                let _ = buf.present();
+                if buf.present().is_ok() {
+                    self.unpainted = None;
+                }
                 crate::trace("present");
-                self.unpainted = None;
             }
         }
         self.surface = Some(surface);
@@ -1733,7 +1923,7 @@ impl App {
             if let Some(pl) = &self.playlist {
                 let cache = &self.cache;
                 let mc = |e: &Entry| cache.borrow().get(e).map(|d| d.frames[0].img.clone());
-                self.picker.draw(c, t.as_mut(), &pl.entries, pl.index, sf, &self.thumb_jobs, &mc);
+                self.picker.draw(c, t.as_mut(), pl, pl.index, sf, &self.thumb_jobs, &mc);
             }
             *self.text.borrow_mut() = t;
             if self.picker.bar_anim {
@@ -1741,7 +1931,7 @@ impl App {
             }
             return;
         }
-        c.fill(self.cfg.bg_color);
+        c.fill(self.cfg.bg_color | if self.glass_loaded { GLASS_MARK } else { 0 });
         self.ensure_base();
         let bg = self.cfg.bg_color;
         let checker = self.cfg.transparent_grid;
@@ -1851,7 +2041,7 @@ impl App {
             if let Some(pl) = &self.playlist {
                 let cache = &self.cache;
                 let mc = |e: &Entry| cache.borrow().get(e).map(|d| d.frames[0].img.clone());
-                self.picker.draw(c, Some(&mut t), &pl.entries, pl.index, sf, &self.thumb_jobs, &mc);
+                self.picker.draw(c, Some(&mut t), pl, pl.index, sf, &self.thumb_jobs, &mc);
             }
             *self.text.borrow_mut() = Some(t);
             if self.picker.bar_anim {
@@ -2374,7 +2564,7 @@ impl App {
         match &self.playlist {
             Some(pl) if !pl.entries.is_empty() => {
                 let folder = pl.container.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                format!("{folder} > {} [{}/{}] - ArkImage", pl.entries[pl.index].name(), pl.index + 1, pl.entries.len())
+                format!("{folder} > {} [{}/{}] - ArkImage", pl.get(pl.index).map(|e| e.name()).unwrap_or_default(), pl.index + 1, pl.entries.len())
             }
             _ => "ArkImage".to_string(),
         }
@@ -3291,8 +3481,10 @@ impl App {
         }
         let on = self.rtl_on();
         let Some(pl) = &mut self.playlist else { return };
-        pl.entries.reverse();
-        pl.index = pl.entries.len().saturating_sub(1) - pl.index.min(pl.entries.len().saturating_sub(1));
+        // read the shared list backwards; the index stays on the same page
+        let last = pl.len().saturating_sub(1);
+        pl.index = last - pl.index.min(last);
+        pl.rev = !pl.rev;
         self.rtl_for = if on { None } else { Some(pl.container.clone()) };
         self.request_redraw();
     }
@@ -3306,7 +3498,7 @@ impl App {
         }
         let cur = self.cur_entry();
         if let Ok(mut np) = source::open(&c, self.cfg.sort, self.cfg.sort_desc) {
-            if let Some(i) = cur.and_then(|e| np.entries.iter().position(|x| *x == e)) {
+            if let Some(i) = cur.and_then(|e| np.iter().position(|x| *x == e)) {
                 np.index = i;
             }
             self.set_playlist(np);
@@ -3817,6 +4009,10 @@ impl App {
     pub fn set_config(&mut self, c: Config) {
         let before = std::mem::replace(&mut self.cfg, c);
         self.apply_settings(&before);
+        // the newest sort order holds for every window
+        if (before.sort, before.sort_desc) != (self.cfg.sort, self.cfg.sort_desc) {
+            self.resort();
+        }
     }
 
     /// True if this window's main window or settings dialog has id `id`.
@@ -4230,7 +4426,9 @@ impl App {
         let fading = self.picker.bar_anim
             || self.help_at.elapsed() < Duration::from_millis(260)
             || self.empty_at.is_some_and(|t| t.elapsed() < Duration::from_millis(260))
-            || self.modal_at.is_some_and(|t| t.elapsed() < Duration::from_millis(260));
+            || self.modal_at.is_some_and(|t| t.elapsed() < Duration::from_millis(260))
+            || self.glass_fading()
+            || (!self.glass_on && self.glass_loaded);
         let ui_at = fading.then(|| self.fade_last + Duration::from_millis(16));
         if ui_at.is_some_and(|t| now >= t) {
             self.fade_last = now;
