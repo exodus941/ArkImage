@@ -2,9 +2,7 @@
 
 # ArkImage
 
-A fast, lightweight and aggressively optimized image viewer for Windows and macOS, written in Rust.
-All windows share one process, one image cache and one file list per folder:
-100 windows open in a 46,000-file folder use about 1.1 GB.
+A lightweight, aggressively optimized image viewer for Windows and macOS, written in Rust.
 
 ArkImage brings together the best ideas of several image viewers, adds some of its own,
 and combines them all into one tiny jet engine of a package that screams through your
