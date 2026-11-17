@@ -13,9 +13,31 @@ fn rgb(r: u32, g: u32, b: u32) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
+/// The background colour while the glass is loaded. A glass pixel (top byte 1) holds
+/// in its blue byte how much of the glass is left after shadows, 255 none darkened;
+/// that keeps a shadow's 256 levels instead of the few between #202020 and black.
+pub static GLASS_BG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+pub fn glass_real(p: u32) -> u32 {
+    let bg = GLASS_BG.load(std::sync::atomic::Ordering::Relaxed);
+    let f = p & 0xFF;
+    let s = |v: u32| ((v & 0xFF) * f + 127) / 255;
+    rgb(s(bg >> 16), s(bg >> 8), s(bg))
+}
+
 /// Blend `src` over `dst` with alpha `a` (0-255).
 #[inline]
 pub fn mix(dst: u32, src: u32, a: u32) -> u32 {
+    let (dm, sm) = (dst >> 24 == 1, src >> 24 == 1);
+    if dm && (sm || src & 0xFF_FFFF == 0) {
+        // glass under glass or under black (a shadow): stays glass, the fraction mixed
+        let sf = if sm { src & 0xFF } else { 0 };
+        let f = (sf * a + (dst & 0xFF) * (255 - a) + 127) / 255;
+        return 0x0100_0000 | f << 16 | f << 8 | f;
+    }
+    let dst = if dm { glass_real(dst) } else { dst };
+    let src = if sm { glass_real(src) } else { src };
     let ia = 255 - a;
     let r = (((src >> 16) & 255) * a + ((dst >> 16) & 255) * ia + 127) / 255;
     let g = (((src >> 8) & 255) * a + ((dst >> 8) & 255) * ia + 127) / 255;
@@ -75,6 +97,8 @@ impl Canvas<'_> {
                         let (px, py) = (x0 + sx * BLUR_F + dx, y0 + sy * BLUR_F + dy);
                         if px < x1 && py < y1 {
                             let p = self.buf[py * self.w + px];
+                            // a window-glass pixel holds a fraction, not a colour
+                            let p = if p >> 24 == 1 { glass_real(p) } else { p };
                             r_ += (p >> 16) & 255;
                             g += (p >> 8) & 255;
                             b += p & 255;
@@ -116,7 +140,12 @@ impl Canvas<'_> {
                     let bot = p[yb * sw + xa] as f32 * (1.0 - tx) + p[yb * sw + xb] as f32 * tx;
                     (top * (1.0 - ty) + bot * ty) as u32
                 };
-                self.buf[py * self.w + px] = rgb(s(&ch[0]), s(&ch[1]), s(&ch[2]));
+                // window glass stays glass: the blur is a rectangle, and its corners
+                // outside a rounded shape drew opaque squares over the glass
+                let i = py * self.w + px;
+                if self.buf[i] >> 24 != 1 {
+                    self.buf[i] = rgb(s(&ch[0]), s(&ch[1]), s(&ch[2]));
+                }
             }
         }
     }
@@ -276,8 +305,12 @@ pub fn blit(c: &mut Canvas, img: &RgbaImage, ox: i64, oy: i64, bg: u32, checker:
             let sx = (x - ox) as usize * 4;
             let a = srow[sx + 3] as u32;
             let px = rgb(srow[sx] as u32, srow[sx + 1] as u32, srow[sx + 2] as u32);
+            let d = drow[x as usize];
             drow[x as usize] = if a == 255 {
                 px
+            } else if !checker && d >> 24 == 1 {
+                // over the window glass: a clear pixel stays glass (SVG, Lottie, PNG)
+                if a == 0 { d } else { mix(d, px, a) }
             } else {
                 mix(bg_at(x as usize, y as usize, bg, checker), px, a)
             };
@@ -314,8 +347,12 @@ pub fn blit_sample(
     let stride = iw * 4;
     let put = |drow: &mut [u32], x: usize, y: usize, r: u32, g: u32, b: u32, a: u32| {
         let px = rgb(r, g, b);
+        let d = drow[x];
         drow[x] = if a >= 255 {
             px
+        } else if !checker && d >> 24 == 1 {
+            // over the window glass: a clear pixel stays glass (SVG, Lottie, PNG)
+            if a == 0 { d } else { mix(d, px, a) }
         } else {
             mix(bg_at(x, y, bg, checker), px, a)
         };

@@ -856,7 +856,18 @@ impl App {
         let m = |v: u32| ((v as f32) * t).round() as u32;
         let glass = a << 24 | m(bg >> 16 & 0xFF) << 16 | m(bg >> 8 & 0xFF) << 8 | m(bg & 0xFF);
         for p in buf.iter_mut() {
-            *p = if *p >> 24 == 1 { glass } else { 0xFF00_0000 | (*p & 0xFF_FFFF) };
+            *p = if *p >> 24 != 1 {
+                0xFF00_0000 | (*p & 0xFF_FFFF)
+            } else if *p & 0xFF == 0xFF {
+                glass
+            } else {
+                // a shadow over the glass: black at strength s, with 1 - s in the blue
+                // byte (see render::GLASS_BG); premultiplied
+                let k = (*p & 0xFF) as f32 / 255.0;
+                let ga = 255.0 - (255.0 - a as f32) * k;
+                let c = |v: u32| (((glass >> v) & 0xFF) as f32 * k).round() as u32;
+                (ga.round() as u32) << 24 | c(16) << 16 | c(8) << 8 | c(0)
+            };
         }
     }
 
@@ -1849,7 +1860,12 @@ impl App {
             }
             return;
         }
-        c.fill(self.cfg.bg_color | if self.glass_loaded { GLASS_MARK } else { 0 });
+        if self.glass_loaded {
+            crate::render::GLASS_BG.store(self.cfg.bg_color, std::sync::atomic::Ordering::Relaxed);
+            c.fill(GLASS_MARK | 0xFF_FFFF);
+        } else {
+            c.fill(self.cfg.bg_color);
+        }
         self.ensure_base();
         let bg = self.cfg.bg_color;
         let checker = self.cfg.transparent_grid;
@@ -3697,6 +3713,7 @@ impl App {
             (self.cfg.win_x, self.cfg.win_y, self.cfg.win_w, self.cfg.win_h) = (x, y, gw, gh);
         }
         self.cfg.win_max = self.was_max;
+        self.cfg.win_fs = self.fullscreen;
         if let Some(name) = w.current_monitor().and_then(|m| m.name()) {
             self.cfg.win_monitor = name;
         }
@@ -3866,7 +3883,13 @@ impl App {
             self.render();
             cloak(&w, false);
         }
-        if exact.as_ref().map(|s| s.fs).unwrap_or(false) {
+        // full screen: a crash restore uses the window's own state; a first window
+        // reopens in full screen if it was closed in it (a cascaded window never does)
+        let fs = match &exact {
+            Some(s) => s.fs,
+            None => cascade.is_none() && self.cfg.win_fs,
+        };
+        if fs {
             self.toggle_fullscreen();
         }
         self.request_redraw();

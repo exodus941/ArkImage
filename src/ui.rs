@@ -63,16 +63,101 @@ pub fn width(t: &mut Text, face: Face, s: &str, px: f32) -> f32 {
     w
 }
 
-/// Card surface: two-layer drop shadow, fill, 1 px border.
+/// Cards are dark frosted glass with no shadow (the user's call: shadows banded over
+/// the window glass). What is under a card shows blurred over 64 px, under the card's
+/// fill at CARD_TINT.
+const CARD_BLUR: f32 = 64.0;
+const CARD_TINT: f32 = 0.6;
+
+/// One box-blur pass of radius `r` along rows (`step` 1) or columns (`step` = width)
+/// over `v` (3 channels per pixel), `n` lines of `len` pixels.
+fn box_pass(v: &mut [f32], tmp: &mut [f32], len: usize, n: usize, step: usize, line: usize, r: usize) {
+    let k = 1.0 / (2 * r + 1) as f32;
+    for l in 0..n {
+        let at = |i: usize| (l * line + i * step) * 3;
+        let mut acc = [0f32; 3];
+        // edge pixels repeat outward
+        for j in 0..=2 * r {
+            let i = j.saturating_sub(r).min(len - 1);
+            for ch in 0..3 {
+                acc[ch] += v[at(i) + ch];
+            }
+        }
+        for i in 0..len {
+            for ch in 0..3 {
+                tmp[at(i) + ch] = acc[ch] * k;
+            }
+            let out = i.saturating_sub(r);
+            let inn = (i + r + 1).min(len - 1);
+            for ch in 0..3 {
+                acc[ch] += v[at(inn) + ch] - v[at(out) + ch];
+            }
+        }
+    }
+    v.copy_from_slice(tmp);
+}
+
+/// Dark frosted glass in the rounded rect: what is drawn under it, blurred over `blur`
+/// px (three box passes), under `tint` at `ta`. Over the window glass the pixels stay
+/// glass, darkened by `ta`.
+#[allow(clippy::too_many_arguments)]
+fn frost(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, blur: f32, tint: u32, ta: f32) {
+    use crate::render::{glass_real, mix, sd_rrect};
+    let (x0, y0) = (x.floor().max(0.0) as usize, y.floor().max(0.0) as usize);
+    let (x1, y1) = (((x + w).ceil() as usize).min(c.w), ((y + h).ceil() as usize).min(c.h));
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    // the source reaches `blur` past the card so its edge blurs what is beside it
+    let e = blur.ceil() as usize;
+    let (sx0, sy0, sx1, sy1) = (x0.saturating_sub(e), y0.saturating_sub(e), (x1 + e).min(c.w), (y1 + e).min(c.h));
+    let (sw, sh) = (sx1 - sx0, sy1 - sy0);
+    let mut v = vec![0f32; sw * sh * 3];
+    for yy in 0..sh {
+        for xx in 0..sw {
+            let mut p = c.buf[(sy0 + yy) * c.w + sx0 + xx];
+            if p >> 24 == 1 {
+                p = glass_real(p);
+            }
+            let i = (yy * sw + xx) * 3;
+            v[i] = (p >> 16 & 0xFF) as f32;
+            v[i + 1] = (p >> 8 & 0xFF) as f32;
+            v[i + 2] = (p & 0xFF) as f32;
+        }
+    }
+    let mut tmp = vec![0f32; v.len()];
+    let br = ((blur / 3.0).round() as usize).max(1);
+    for _ in 0..3 {
+        box_pass(&mut v, &mut tmp, sw, sh, 1, sw, br);
+        box_pass(&mut v, &mut tmp, sh, sw, sw, 1, br);
+    }
+    let ka = (ta * 255.0).round() as u32;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let cov = (0.5 - sd_rrect(px as f32 + 0.5, py as f32 + 0.5, x, y, w, h, r)).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                continue;
+            }
+            let i = py * c.w + px;
+            let orig = c.buf[i];
+            let out = if orig >> 24 == 1 {
+                mix(orig, 0, ka)
+            } else {
+                let j = ((py - sy0) * sw + px - sx0) * 3;
+                let q = |k: usize| v[j + k].round().clamp(0.0, 255.0) as u32;
+                mix(q(0) << 16 | q(1) << 8 | q(2), tint, ka)
+            };
+            c.buf[i] = if cov >= 1.0 { out } else { mix(orig, out, (cov * 255.0) as u32) };
+        }
+    }
+}
+
+/// Card surface: dark frosted glass, no outline, no shadow.
 pub fn card(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, sf: f32, fill: u32, border: u32) {
     let r = RADIUS * sf;
-    // Approximates `0 2px 8px rgb(0 0 0 / .88), 0 12px 32px rgb(0 0 0 / .66)` with stacked rings.
-    for (dy, spread, a) in [(12.0, 16.0, 0.05), (8.0, 10.0, 0.08), (4.0, 6.0, 0.12), (2.0, 3.0, 0.18), (1.0, 1.0, 0.25)] {
-        let (d, s) = (dy * sf, spread * sf);
-        c.fill_rrect(x - s, y - s + d, w + 2.0 * s, h + 2.0 * s, r + s, 0x000000, a);
-    }
-    c.fill_rrect(x, y, w, h, r, fill, 0.96);
-    c.stroke_rrect(x, y, w, h, r, 1.0 * sf, border, 1.0);
+    // no outline: the user's call
+    let _ = border;
+    frost(c, x, y, w, h, r, CARD_BLUR * sf, fill, CARD_TINT);
 }
 
 /// Shorten `s` from the middle with "…" until it fits `max` px.
