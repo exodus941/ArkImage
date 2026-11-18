@@ -5,6 +5,25 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=VCPKG_ROOT");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo::rustc-check-cfg=cfg(lottie)");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        // rlottie (Lottie playback), static, from scripts/build-rlottie-macos.sh. Without it
+        // the app builds and simply does not open Lottie files.
+        println!("cargo:rerun-if-env-changed=RLOTTIE_LIB_DIR");
+        let dir = env::var("RLOTTIE_LIB_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+            PathBuf::from(env::var("HOME").unwrap_or_default()).join("Library/Caches/rlottie/build")
+        });
+        if dir.join("librlottie.a").exists() {
+            println!("cargo:rerun-if-changed={}", dir.join("librlottie.a").display());
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=rlottie");
+            println!("cargo:rustc-link-lib=dylib=c++");
+            println!("cargo:rustc-cfg=lottie");
+        } else {
+            println!("cargo:warning=rlottie not found in {}; Lottie is off (run scripts/build-rlottie-macos.sh)", dir.display());
+        }
+        return;
+    }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -21,6 +40,7 @@ fn main() {
         return;
     };
     // rlottie (Lottie playback): static, from the same vcpkg tree; the C API is in src/lottie.rs.
+    println!("cargo:rustc-cfg=lottie");
     let triplet = env::var("VCPKGRS_TRIPLET").unwrap_or_else(|_| "x64-windows-static-md".into());
     let lib = PathBuf::from(&root).join("installed").join(&triplet).join("lib");
     println!("cargo:rustc-link-search=native={}", lib.display());

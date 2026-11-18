@@ -37,6 +37,8 @@ pub struct Master {
     last_save: Instant,
     /// Test hook: ARKIMAGE_CRASH_AFTER_MS makes the master panic after that long.
     crash_at: Option<Instant>,
+    /// Test hook: ARKIMAGE_TEST_SPEED_MENU opens the speed menu of the first window after 3 s.
+    speed_menu_at: Option<Instant>,
     hang_at: Option<Instant>,
 }
 
@@ -66,6 +68,7 @@ impl Master {
             last_session: Vec::new(),
             last_save: Instant::now(),
             crash_at,
+            speed_menu_at: std::env::var_os("ARKIMAGE_TEST_SPEED_MENU").or(std::env::var_os("ARKIMAGE_TEST_CHOICE")).or(std::env::var_os("ARKIMAGE_TEST_CLICK")).or(std::env::var_os("ARKIMAGE_TEST_PICKER")).or(std::env::var("ARKIMAGE_TEST_FULLSCREEN").ok().filter(|v| v == "3").map(Into::into)).map(|_| Instant::now() + Duration::from_secs(3)),
             hang_at,
         };
         if m.restore.is_empty() {
@@ -132,8 +135,12 @@ impl Master {
     /// Give every window in a folder whose list changed the master's new list.
     fn adopt_lists(&mut self) {
         for d in crate::source::changed() {
+            let mut busy = false;
             for w in &mut self.windows {
-                w.adopt(&d);
+                busy |= !w.adopt(&d);
+            }
+            if busy {
+                crate::source::retry_changed(&d);
             }
         }
     }
@@ -150,9 +157,9 @@ impl Master {
         }
     }
 
-    /// Keep the shared cache under cache_mb, dropping the images farthest from every window.
+    /// Keep the shared cache under config::cache_mb(), dropping the images farthest from every window.
     fn evict(&mut self) {
-        let budget = self.cfg.cache_mb * 1024 * 1024;
+        let budget = crate::config::cache_mb() * 1024 * 1024;
         let mut cache = self.sh.cache.borrow_mut();
         let mut total: u64 = cache.values().map(|d| d.bytes()).sum();
         if total <= budget {
@@ -231,7 +238,7 @@ impl ApplicationHandler<UserEvent> for Master {
         // Every start of the master: check GitHub for a newer version (in the background).
         // Later launches hand their files to this master and exit, so they never check;
         // a backup taking over after a crash is not a new start and does not check either.
-        if cfg!(windows) && self.cfg.auto_update && !takeover {
+        if self.cfg.auto_update && !takeover {
             crate::trace("update check at master start");
             let now = crate::update::now_unix();
             self.cfg.update_checked = now;
@@ -240,6 +247,24 @@ impl ApplicationHandler<UserEvent> for Master {
             }
             self.cfg.save();
             crate::update::spawn_check(self.sh.proxy.clone(), false);
+        }
+        // Test hook: ARKIMAGE_TEST_MAKE_DEFAULT runs Settings' "Make Default".
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("ARKIMAGE_TEST_MAKE_DEFAULT").is_some() {
+            crate::mac::spawn_make_default(self.sh.proxy.clone());
+        }
+        // Test hook: ARKIMAGE_TEST_FULLSCREEN=1 enters full screen, =2 maximizes (zooms),
+        // in the first window, as the toolbar button and a title double-click do.
+        if let Ok(v) = std::env::var("ARKIMAGE_TEST_FULLSCREEN") {
+            if let Some(w) = self.windows.first_mut() {
+                // =4 presses the green title-bar button instead
+                if v == "4" {
+                    #[cfg(target_os = "macos")]
+                    w.test_press_green();
+                } else {
+                    w.test_fullscreen(v == "2");
+                }
+            }
         }
         // Test hook: ARKIMAGE_TEST_SETTINGS opens Settings > General in the first window.
         if std::env::var_os("ARKIMAGE_TEST_SETTINGS").is_some() {
@@ -271,6 +296,8 @@ impl ApplicationHandler<UserEvent> for Master {
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
+        #[cfg(windows)]
+        crate::stackdump::beat();
         match ev {
             UserEvent::Loaded(e, res) => {
                 self.sh.inflight.borrow_mut().remove(&e);
@@ -295,7 +322,7 @@ impl ApplicationHandler<UserEvent> for Master {
             }
             UserEvent::Font(t) => {
                 *self.sh.text.borrow_mut() = t;
-                for w in &self.windows {
+                for w in &mut self.windows {
                     w.request_redraw();
                 }
             }
@@ -324,7 +351,24 @@ impl ApplicationHandler<UserEvent> for Master {
                     w.on_update(&o, manual);
                 }
             }
+            UserEvent::MadeDefault(msg) => {
+                // the test hook only traces; a click in Settings shows the result
+                if std::env::var_os("ARKIMAGE_TEST_MAKE_DEFAULT").is_none() {
+                    crate::dialog::tell(None, "Default App", &msg, crate::dialog::Kind::Info);
+                }
+            }
             UserEvent::Open(arg) => {
+                // Finder launches the app first and sends the file after: fill the blank
+                // first window instead of opening a second one beside it.
+                if let (true, Some(p)) = (self.started, arg.as_ref()) {
+                    if let [w] = self.windows.as_mut_slice() {
+                        if w.is_blank() {
+                            w.open_external(p);
+                            w.focus();
+                            return;
+                        }
+                    }
+                }
                 if self.started {
                     self.open(el, arg);
                 } else {
@@ -338,6 +382,8 @@ impl ApplicationHandler<UserEvent> for Master {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, ev: WindowEvent) {
+        #[cfg(windows)]
+        crate::stackdump::beat();
         if let Some(w) = self.windows.iter_mut().find(|w| w.owns(id)) {
             w.window_event(el, id, ev);
         }
@@ -348,8 +394,36 @@ impl ApplicationHandler<UserEvent> for Master {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        #[cfg(windows)]
+        crate::stackdump::beat();
+        // Test hook: ARKIMAGE_TEST_STALL stops the main thread once for 5 s (the watchdog's check)
+        static STALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var_os("ARKIMAGE_TEST_STALL").is_some() && self.started && !STALLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(5));
+        }
         // a window found its file gone and read the folder again
         self.adopt_lists();
+        if self.speed_menu_at.is_some_and(|t| Instant::now() >= t) {
+            self.speed_menu_at = None;
+            if std::env::var("ARKIMAGE_TEST_FULLSCREEN").as_deref() == Ok("3") {
+                // mode 3: leave full screen again after 3 s
+                if let Some(w) = self.windows.first_mut() {
+                    w.test_fullscreen(false);
+                }
+            } else {
+                if std::env::var_os("ARKIMAGE_TEST_CHOICE").is_some() {
+                    if let Some(w) = self.windows.first_mut() {
+                        w.test_choice(el);
+                    }
+                    return;
+                }
+                let click = std::env::var("ARKIMAGE_TEST_CLICK").ok().map(|v| &*Box::leak(v.into_boxed_str()));
+                let id = if let Some(c) = click { c } else if std::env::var_os("ARKIMAGE_TEST_PICKER").is_some() { "picker" } else { "anim_speed" };
+                if let Some(w) = self.windows.first_mut() {
+                    w.test_click(el, id);
+                }
+            }
+        }
         // After an update is in place: start the new exe, which reopens this session
         // once this process has ended, then end
         if crate::update::RESTART.swap(false, std::sync::atomic::Ordering::SeqCst) {

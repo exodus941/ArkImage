@@ -208,7 +208,16 @@ pub fn explorer_cmp(a: &str, b: &str) -> Ordering {
         let (wa, wb) = (w(a), w(b));
         unsafe { StrCmpLogicalW(wa.as_ptr(), wb.as_ptr()) }.cmp(&0)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // Finder's order.
+        use objc2::msg_send;
+        use objc2_foundation::NSString;
+        let (na, nb) = (NSString::from_str(a), NSString::from_str(b));
+        let r: isize = unsafe { msg_send![&*na, localizedStandardCompare: &*nb] };
+        r.cmp(&0)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     natural_cmp(a, b)
 }
 
@@ -347,11 +356,19 @@ fn list_dir_shared(dir: &Path, sort: u8, desc: bool, fresh: bool) -> io::Result<
     Ok(l)
 }
 
-/// The held list of `dir` and its position map, if any window holds one.
-pub fn held(dir: &Path) -> Option<(Arc<Vec<Entry>>, Arc<PosMap>)> {
-    let g = LISTS.lock().unwrap();
-    let s = g.as_ref()?.get(dir)?.lock().unwrap();
-    Some((s.list.upgrade()?, s.pos.clone()))
+/// The held list of `dir` and its position map, if any window holds one. Err: the slot
+/// is busy (a folder being read); the main thread never waits for it, so ask again later.
+/// Waiting here, with LISTS held, froze the master behind a queue of 5 s listings.
+pub fn held(dir: &Path) -> Result<Option<(Arc<Vec<Entry>>, Arc<PosMap>)>, ()> {
+    let slot = { LISTS.lock().unwrap().as_ref().and_then(|m| m.get(dir).cloned()) };
+    let Some(slot) = slot else { return Ok(None) };
+    let Ok(s) = slot.try_lock() else { return Err(()) };
+    Ok(s.list.upgrade().map(|l| (l, s.pos.clone())))
+}
+
+/// Hand `dir` to `changed()` again (its slot was busy).
+pub fn retry_changed(dir: &Path) {
+    CHANGED.lock().unwrap().push(dir.to_path_buf());
 }
 
 /// Folders whose list was replaced since the last call.
@@ -490,7 +507,7 @@ mod store_tests {
         let n = open_fresh(&d.join("a.png"), 0, false).unwrap();
         assert_eq!(n.len(), 4);
         assert!(changed().contains(&d));
-        assert!(Arc::ptr_eq(&held(&d).unwrap().0, &n.entries));
+        assert!(Arc::ptr_eq(&held(&d).unwrap().unwrap().0, &n.entries));
         // a delete: one list without it, for everyone
         let e = n.get(1).unwrap().clone();
         let r = remove(&d, &e).unwrap();
@@ -507,7 +524,7 @@ mod store_tests {
         let z = open(&d, 0, true).unwrap();
         assert!(!Arc::ptr_eq(&a.entries, &z.entries));
         assert_eq!(z.get(0).unwrap().name(), "b.png");
-        assert!(Arc::ptr_eq(&held(&d).unwrap().0, &z.entries));
+        assert!(Arc::ptr_eq(&held(&d).unwrap().unwrap().0, &z.entries));
         drop((a, z));
         let _ = fs::remove_dir_all(&d);
     }
@@ -531,6 +548,14 @@ mod store_tests {
 mod tests {
     use super::natural_cmp;
     use std::cmp::Ordering::*;
+
+    #[test]
+    fn finder_order() {
+        use super::explorer_cmp;
+        assert_eq!(explorer_cmp("img2.jpg", "img10.jpg"), Less);
+        assert_eq!(explorer_cmp("b.jpg", "A.jpg"), Greater);
+        assert_eq!(explorer_cmp("a.jpg", "a.jpg"), Equal);
+    }
 
     #[test]
     fn natural() {

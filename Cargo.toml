@@ -1,11 +1,14 @@
-﻿[package]
+[package]
 name = "arkimage"
-version = "1.1.9"
+version = "1.2.0"
 edition = "2021"
 description = "Fast, lightweight, multi-instance image viewer"
 license = "MIT"
 
 [dependencies]
+# WebP: libwebp decodes straight into one buffer for the GPU path (all platforms), and
+# the lossy fast path on Windows.
+libwebp-sys = "0.14"
 resvg = { version = "0.50.0", default-features = false, features = ["text", "system-fonts", "svgz", "raster-images"] }
 winit = "0.30"
 softbuffer = "0.4"
@@ -26,13 +29,28 @@ interprocess = "2.4.8"
 ureq = "2"
 serde_json = "1"
 sha2 = "0.10"
+pollster = "0.4"
+png = "0.18"
+mozjpeg = "0.10"
 
 # HEIC/HEIF. Windows: libheif linked statically from vcpkg (see .cargo/config.toml). Linux: system libheif.
 # macOS uses the system ImageIO framework instead.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
+# GPU image layer: DirectX 12 only on Windows (per-pixel see-through windows for the glass)
+wgpu = { version = "30", default-features = false, features = ["dx12", "wgsl"] }
 libheif-rs = "2"
 # Lossy WebP fast path (macOS uses ImageIO instead).
-libwebp-sys = "0.14"
+
+# macOS: AppKit through the Objective-C runtime (Liquid Glass, Finder events, reveal).
+[target.'cfg(target_os = "macos")'.dependencies]
+# The app's own heap: returns freed image buffers to the system within milliseconds.
+# macOS's allocator caches freed large blocks (measured: 350 MB kept after one photo).
+mimalloc = { version = "0.1.52", default-features = false }
+# GPU image layer: Metal only
+wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL", "NSGeometry", "NSObject", "NSEnumerator"] }
 
 [target."cfg(windows)".dependencies]
 mslnk = "0.1"
@@ -51,3 +69,8 @@ opt-level = 3
 
 [build-dependencies]
 winresource = "0.1.34"
+
+# winit with one patch: no ITaskbarList::AddTab while a window is created (it waits for
+# Explorer and hung the master with many windows). See vendor/winit/src/platform_impl/windows/window.rs.
+[patch.crates-io]
+winit = { path = "vendor/winit" }

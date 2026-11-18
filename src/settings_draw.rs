@@ -200,6 +200,7 @@ fn button_icon(label: &str) -> Option<Icon> {
         "Browse…" => Icon::FolderOpen,
         "Clear" => Icon::Eraser,
         "Open" => Icon::FileText,
+        "Make Default" => Icon::Check,
         _ => return None,
     })
 }
@@ -375,6 +376,7 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                     Act::Install if crate::install::is_installed() => "Reinstall…",
                     Act::Install => "Install…",
                     Act::CheckUpdate => "Check now",
+                    Act::MakeDefault => "Make Default",
                     _ => "Clear",
                 };
                 let bw = button_w(t, sf, verb);

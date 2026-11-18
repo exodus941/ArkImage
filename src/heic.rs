@@ -18,8 +18,10 @@ pub fn is_heif(bytes: &[u8]) -> bool {
         .any(|i| BRANDS.iter().any(|b| &bytes[i..i + 4] == *b))
 }
 
+/// Decode, then hand libheif's interleaved RGBA plane to `f` (width, height, row stride,
+/// bytes), while libheif still holds it: no copy of the whole image is made here.
 #[cfg(not(target_os = "macos"))]
-pub fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
+pub fn with_plane<R>(bytes: &[u8], f: impl FnOnce(usize, usize, usize, &[u8]) -> R) -> Result<R, String> {
     use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
     let lib = LibHeif::new();
     let ctx = HeifContext::read_from_bytes(bytes).map_err(|e| e.to_string())?;
@@ -29,12 +31,18 @@ pub fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
         .map_err(|e| e.to_string())?;
     let planes = img.planes();
     let p = planes.interleaved.ok_or("no interleaved plane")?;
-    let (w, h, stride) = (p.width as usize, p.height as usize, p.stride);
-    let mut out = Vec::with_capacity(w * h * 4);
-    for y in 0..h {
-        out.extend_from_slice(&p.data[y * stride..y * stride + w * 4]);
-    }
-    RgbaImage::from_raw(w as u32, h as u32, out).ok_or_else(|| "bad HEIF buffer".to_string())
+    Ok(f(p.width as usize, p.height as usize, p.stride, p.data))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
+    with_plane(bytes, |w, h, stride, data| {
+        let mut out = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            out.extend_from_slice(&data[y * stride..y * stride + w * 4]);
+        }
+        RgbaImage::from_raw(w as u32, h as u32, out).ok_or_else(|| "bad HEIF buffer".to_string())
+    })?
 }
 
 #[cfg(target_os = "macos")]
@@ -59,13 +67,20 @@ mod mac {
 
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
-        fn CFDataCreate(alloc: CFTypeRef, bytes: *const u8, len: isize) -> CFTypeRef;
+        fn CFDataCreateWithBytesNoCopy(alloc: CFTypeRef, bytes: *const u8, len: isize, dealloc: CFTypeRef) -> CFTypeRef;
+        fn CFDictionaryCreate(alloc: CFTypeRef, keys: *const CFTypeRef, values: *const CFTypeRef, n: isize, kcb: *const c_void, vcb: *const c_void) -> CFTypeRef;
         fn CFRelease(cf: CFTypeRef);
+        static kCFAllocatorNull: CFTypeRef;
+        static kCFBooleanFalse: CFTypeRef;
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
     }
     #[link(name = "ImageIO", kind = "framework")]
     extern "C" {
         fn CGImageSourceCreateWithData(data: CFTypeRef, opts: CFTypeRef) -> CFTypeRef;
         fn CGImageSourceCreateImageAtIndex(src: CFTypeRef, i: usize, opts: CFTypeRef) -> CFTypeRef;
+        static kCGImageSourceShouldCache: CFTypeRef;
+        static kCGImageSourceShouldCacheImmediately: CFTypeRef;
     }
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
@@ -86,17 +101,25 @@ mod mac {
 
     pub fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
         unsafe {
-            let data = CFDataCreate(std::ptr::null(), bytes.as_ptr(), bytes.len() as isize);
+            // read the file where it is (no copy into a CFData); `bytes` outlives the decode
+            let data = CFDataCreateWithBytesNoCopy(std::ptr::null(), bytes.as_ptr(), bytes.len() as isize, kCFAllocatorNull);
             if data.is_null() {
                 return Err("CFDataCreate failed".into());
             }
-            let src = CGImageSourceCreateWithData(data, std::ptr::null());
-            CFRelease(data);
+            // ImageIO must not keep its own decoded copy: it draws into our buffer below
+            let keys = [kCGImageSourceShouldCache, kCGImageSourceShouldCacheImmediately];
+            let vals = [kCFBooleanFalse, kCFBooleanFalse];
+            let opts = CFDictionaryCreate(std::ptr::null(), keys.as_ptr(), vals.as_ptr(), 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            let src = CGImageSourceCreateWithData(data, opts);
             if src.is_null() {
+                CFRelease(data);
+                CFRelease(opts);
                 return Err("ImageIO can't read this file".into());
             }
-            let img = CGImageSourceCreateImageAtIndex(src, 0, std::ptr::null());
+            let img = CGImageSourceCreateImageAtIndex(src, 0, opts);
+            CFRelease(opts);
             CFRelease(src);
+            CFRelease(data);
             if img.is_null() {
                 return Err("ImageIO can't decode this file".into());
             }

@@ -15,7 +15,7 @@ use crate::app::UserEvent;
 
 fn name() -> io::Result<Name<'static>> {
     let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default();
-    format!("arkimage-{user}.sock").to_ns_name::<GenericNamespaced>()
+    format!("arkimage-{user}{}.sock", crate::config::Config::instance_tag()).to_ns_name::<GenericNamespaced>()
 }
 
 /// Send the request line `line` to the running master; true if it answered "ok".
@@ -39,9 +39,32 @@ pub fn forward(arg: &Option<PathBuf>) -> bool {
     send(&line)
 }
 
+/// Unix: decide who is the master with an exclusive lock on a file. The socket alone could
+/// not: a launch that finds no master answering overwrites the socket file, so two launches
+/// started 0.1 s apart could both become masters, the later one taking the socket from the
+/// earlier (seen on the Mac in a burst of 20 launches: one image went to a second copy).
+/// The lock is held for the life of the process and released by the system when it ends,
+/// so the backup can take it after a crash. None: another live process holds it.
+#[cfg(unix)]
+pub fn claim_master() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn flock(fd: i32, op: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    let dir = crate::config::Config::dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let p = dir.join(format!("master{}.lock", crate::config::Config::instance_tag()));
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(p).ok()?;
+    (unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(f)
+}
+
 /// Claim the master socket; None if another process holds it.
 pub fn listen() -> Option<Listener> {
-    ListenerOptions::new().name(name().ok()?).create_sync().ok()
+    // macOS: a crashed master leaves its socket file; callers only listen after
+    // `forward` found no master answering, so taking the file over is safe
+    ListenerOptions::new().name(name().ok()?).try_overwrite(cfg!(unix)).create_sync().ok()
 }
 
 /// Serve requests on a background thread, turning them into events for the master.

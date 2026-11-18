@@ -1,6 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+/// macOS: decoded images are freed after upload to the GPU, but the system allocator keeps
+/// large freed blocks cached (350 MB stayed after one 6016 px photo); mimalloc returns them.
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod app;
+mod gpu;
 mod archive;
 mod backup;
 mod bindings;
@@ -14,7 +21,9 @@ mod icon;
 mod install;
 mod icons;
 mod ipc;
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
+mod mac;
+#[cfg(lottie)]
 mod lottie;
 mod master;
 mod picker;
@@ -25,6 +34,10 @@ mod render;
 mod reveal;
 mod settings;
 mod source;
+#[cfg(windows)]
+mod occl;
+#[cfg(windows)]
+mod stackdump;
 mod text;
 mod thumbcache;
 mod ui;
@@ -55,6 +68,10 @@ fn main() {
     T0.get_or_init(Instant::now);
     #[cfg(windows)]
     popup_win::dark_menus();
+    #[cfg(windows)]
+    if std::env::var_os("ARKIMAGE_TRACE").is_some() {
+        stackdump::start();
+    }
     TRACE.get_or_init(|| {
         std::env::var_os("ARKIMAGE_TRACE").and_then(|p| {
             std::fs::OpenOptions::new().create(true).append(true).open(p).ok().map(Mutex::new)
@@ -108,6 +125,11 @@ fn main() {
     }
     // A finished update leaves the previous exe as <name>.exe.old: remove it.
     update::cleanup();
+    // macOS: started from a disk image or a download folder, offer to move to Applications
+    #[cfg(target_os = "macos")]
+    if arg.as_deref().is_none_or(|a| !a.to_string_lossy().starts_with("--")) && mac::offer_move_to_applications(arg.as_deref()) {
+        return;
+    }
     // Run as the backup master; on a crash of the master, become the master.
     let mut takeover = None;
     // `--resume <pid>`: restarted after an update; wait for the old process, then
@@ -138,7 +160,29 @@ fn main() {
         trace("forwarded to master");
         return;
     }
+    // Unix: the lock holder is the master and listens; every other launch hands over, and
+    // waits for a master that is still starting (up to 15 s, then runs on its own).
+    #[cfg(unix)]
+    let listener = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(lock) = ipc::claim_master() {
+                // held until the process ends
+                std::mem::forget(lock);
+                break ipc::listen();
+            }
+            if ipc::forward(&arg) {
+                trace("forwarded to master");
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
     // Become the master. If another launch claimed the socket first, hand over to it.
+    #[cfg(not(unix))]
     let listener = loop {
         if let Some(l) = ipc::listen() {
             break Some(l);
@@ -156,6 +200,8 @@ fn main() {
         .build()
         .expect("create event loop");
     let proxy = event_loop.create_proxy();
+    #[cfg(target_os = "macos")]
+    mac::hook_open_files(proxy.clone());
     if let Some(l) = listener {
         ipc::serve(l, proxy.clone());
     }

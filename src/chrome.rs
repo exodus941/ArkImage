@@ -10,10 +10,31 @@ use crate::text::Text;
 #[path = "chrome_bar.rs"]
 mod bar;
 use bar::draw_bottom;
+pub use bar::draw_anim_row;
+
+thread_local! {
+    /// The animation row's band (rows y0..y1) from the last full draw, if one was drawn.
+    static ANIM_BAND: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Forget the band (a draw that may not reach the chrome starts with this).
+pub fn reset_anim_band() {
+    ANIM_BAND.with(|b| b.set(None));
+}
+
+/// The animation row's band from the last full draw.
+pub fn last_anim_band() -> Option<(usize, usize)> {
+    ANIM_BAND.with(|b| b.get())
+}
 pub use bar::{fmt_speed, page_label};
 /// Bottom-bar icon size, design px (menus align to the icon's edges).
 
+/// Title bar height: Windows draws its own 24 px bar; macOS uses the system's 28 pt bar
+/// height so the real traffic-light buttons sit centred in it.
+#[cfg(not(target_os = "macos"))]
 pub const TITLE_H: f32 = 24.0;
+#[cfg(target_os = "macos")]
+pub const TITLE_H: f32 = 28.0;
 /// Bottom bar: full window width minus BAR_GAP on each side; slider on top, icon row below.
 /// 16 inset + 12 slider + 16 gap + 24 icon row + 16 below.
 pub const BAR_H: f32 = 84.0;
@@ -23,7 +44,7 @@ pub const SLIDER_INSET: f32 = 16.0;
 /// Slider and scrub track height, design px.
 pub const TRACK_H: f32 = 12.0;
 /// Frosted glass: blur radius (design px) and tint opacities (0-255).
-const GLASS_BLUR: f32 = 32.0;
+pub const GLASS_BLUR: f32 = 32.0;
 const GLASS_TITLE_A: u32 = 205;
 const GLASS_BAR_A: u32 = 150;
 
@@ -96,9 +117,8 @@ pub fn top_zone(sf: f32) -> f32 {
     TITLE_H * sf
 }
 
-/// Animation scrub row above the bottom bar: a bare 4 px track beside the pills, which
-/// are 24 px tall and set the row height. (Pills added 2026-11-16 by Claude on the Mac,
-/// see docs/windows-handoff.md.)
+/// Animation scrub row above the bottom bar: a bare 4 px track between the pills, which
+/// are 24 px tall and set the row height.
 pub const ANIM_H: f32 = 24.0;
 
 /// The bottom hover zone; it grows by the scrub bar and its gap when one shows.
@@ -140,6 +160,7 @@ pub fn slider_rect(w: f32, h: f32, sf: f32) -> (f32, f32, f32, f32) {
 
 pub fn draw(c: &mut Canvas, t: Option<&mut Text>, s: &State, hits: &mut Vec<Hit>) {
     let mut t = t;
+    ANIM_BAND.with(|b| b.set(None));
     if s.show_top {
         draw_top(c, t.as_deref_mut(), s, hits);
     }
@@ -160,8 +181,29 @@ fn draw_top(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, hits: &mut Vec<
     let th = (TITLE_H * sf).round();
 
     // Frosted glass: blur what is under the top chrome, then tint it.
-    c.blur(0, 0, w as i32, th as i32 + 1, (GLASS_BLUR * sf).round() as usize);
+    c.blur(0, 0, w as i32, th as i32 + 1, (GLASS_BLUR * sf).round() as usize, crate::render::BLUR_BAR);
+    let isz = 16.0 * sf;
     // --- title bar ---
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: the system's traffic lights (shown by the app with the chrome) and a
+        // centred title on the icon's base grey, as a standard dark title bar.
+        c.rect_alpha(0, 0, w as i32, th as i32, crate::ui::ICON_GREY, GLASS_TITLE_A);
+        hits.push(Hit { x0: 0.0, y0: 0.0, x1: w, y1: th, id: "title" });
+        if let Some(t) = t.as_deref_mut() {
+            let px = 13.0 * sf;
+            // clear of the traffic lights (72 pt) on both sides, so the title stays centred
+            let max_w = w - 2.0 * 80.0 * sf;
+            let mut title = s.title.to_string();
+            while t.width(&title, px) > max_w && title.chars().count() > 4 {
+                title.pop();
+            }
+            let tw = t.width(&title, px);
+            text_mid(c, t, ((w - tw) / 2.0).round(), th / 2.0, &title, px, 0xDCDCDC);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     c.rect_alpha(0, 0, w as i32, th as i32, BLUE, GLASS_TITLE_A);
     hits.push(Hit { x0: 0.0, y0: 0.0, x1: w, y1: th, id: "title" });
     // app icon (assets/icon.svg), 16 px, 8 px from the left, vertically centred
@@ -170,7 +212,6 @@ fn draw_top(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, hits: &mut Vec<
     crate::render::blit_over(c, &logo, (8.0 * sf).round() as i64, ly);
     // window buttons, right to left: close (48 px), maximize, minimize, full screen (32 px);
     // Tabler icons, 16 px, white on the blue bar
-    let isz = 16.0 * sf;
     let close_w = 48.0 * sf;
     let bw = 32.0 * sf;
     let cx0 = w - close_w;
@@ -202,6 +243,7 @@ fn draw_top(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, hits: &mut Vec<
         }
         text_mid(c, t, 32.0 * sf, th / 2.0, &title, px, 0xFFFFFF);
     }
+    }
 
 }
 
@@ -216,6 +258,8 @@ mod tests {
         assert_eq!(super::fmt_speed(1.0), "1");
         assert_eq!(super::fmt_speed(1.75), "1.75");
         assert_eq!(super::fmt_speed(4.0), "4");
+        let steps: Vec<f32> = (1..=16).map(|q| q as f32 / 4.0).collect();
+        assert_eq!((steps[0], steps[15], steps.len()), (0.25, 4.0, 16));
     }
 
     /// The frame counter pads the current frame to the digits of the count.

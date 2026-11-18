@@ -3,7 +3,6 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    io::Write as _,
     num::NonZeroU32,
     path::{Path, PathBuf},
     process::Command,
@@ -60,12 +59,6 @@ struct Slide {
     start: Option<Instant>,
 }
 
-/// Which edge of a bar menu lines up with its button.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MenuEdge {
-    Left,
-    Right,
-}
 
 pub enum MenuEntry {
     Item(String, String, &'static str, bool),
@@ -108,7 +101,9 @@ fn dark_title_bar(w: &Window) {
 }
 
 #[cfg(not(windows))]
-fn dark_title_bar(_w: &Window) {}
+fn dark_title_bar(w: &Window) {
+    w.set_theme(Some(winit::window::Theme::Dark));
+}
 
 /// Mica backdrop (Windows 11 22H2+): DWMWA_SYSTEMBACKDROP_TYPE = 38, DWMSBT_MAINWINDOW = 2,
 /// with the frame extended over the whole client area so it shows through pixels drawn
@@ -134,7 +129,12 @@ fn mica(w: &Window) -> bool {
     unsafe { DwmExtendFrameIntoClientArea(hwnd, &Margins(-1, -1, -1, -1)) >= 0 }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn mica(w: &Window) -> bool {
+    crate::mac::glass(w)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn mica(_w: &Window) -> bool {
     false
 }
@@ -183,7 +183,13 @@ fn acrylic(w: &Window, on: bool, bg: u32) -> bool {
     unsafe { set(h.hwnd.get(), &d) != 0 }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn acrylic(w: &Window, on: bool, _bg: u32) -> bool {
+    // on: true when the glass is now behind the window; off: always reports false (unloaded)
+    crate::mac::window_glass(w, on) && on
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn acrylic(_w: &Window, _on: bool, _bg: u32) -> bool {
     false
 }
@@ -197,6 +203,17 @@ const GLASS_MARK: u32 = 0x0100_0000;
 const GLASS_OPACITY: u32 = 84;
 const GLASS_FADE: Duration = Duration::from_millis(250);
 
+
+
+/// Whether the window is maximized (zoomed). On macOS this asks AppKit directly: winit's
+/// is_maximized() adds a title bar for a moment to a window without one (in full screen,
+/// for instance), which moved the window and sent Moved events in a loop, 64 px up and down.
+fn is_maximized(w: &Window) -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::mac::is_zoomed(w);
+    #[cfg(not(target_os = "macos"))]
+    w.is_maximized()
+}
 
 pub(crate) fn menu_label(text: &str, key: &str) -> String {
     // Windows right-aligns text after a tab; macOS would print it literally.
@@ -237,6 +254,8 @@ pub enum UserEvent {
     Thumb(Entry, Option<Arc<RgbaImage>>),
     /// Another launch asked the running master to open a window (with this file, if any).
     Open(Option<PathBuf>),
+    /// macOS: "Make Default" finished; the message to show.
+    MadeDefault(String),
     /// An update check finished; true when the user asked for it (Settings).
     Update(crate::update::Outcome, bool),
 }
@@ -248,6 +267,8 @@ const SWIPE_PX: f64 = 64.0;
 const SWIPE_GAP: Duration = Duration::from_millis(300);
 /// The full-quality redraw follows the last pinch event after this long.
 const PINCH_SETTLE: Duration = Duration::from_millis(150);
+/// A stored image with no paint after this long gets its repaint asked for again.
+const REPAINT_RETRY: Duration = Duration::from_millis(250);
 const SWIPE_LINE_PX: f64 = 40.0;
 const SWIPE_SIGN: f64 = 1.0;
 
@@ -255,6 +276,31 @@ const SWIPE_SIGN: f64 = 1.0;
 const FADE_SECS: f32 = 0.25;
 /// How often a window checks that its file was not deleted outside the app.
 const GONE_EVERY: Duration = Duration::from_millis(2500);
+
+/// The next tick of a clock shared by every window, `every` apart. Periodic checks wait for
+/// it, so all windows wake together: each on its own timer, 100 windows woke the loop about
+/// 200 times a second at idle, and each wake ran every window's timers.
+/// Whether another window covers `w` now (macOS: mac::is_occluded; Windows: occl).
+#[cfg(target_os = "macos")]
+fn covered_now(w: &Arc<Window>) -> bool {
+    crate::mac::is_occluded(w)
+}
+
+#[cfg(windows)]
+fn covered_now(w: &Arc<Window>) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(h) = w.window_handle() else { return false };
+    let RawWindowHandle::Win32(h) = h.as_raw() else { return false };
+    crate::occl::is_covered(h.hwnd.get())
+}
+
+fn shared_tick(now: Instant, every: Duration) -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let e = *EPOCH.get_or_init(Instant::now);
+    let p = every.as_nanos().max(1);
+    let n = now.saturating_duration_since(e).as_nanos() / p + 1;
+    e + Duration::from_nanos((n * p) as u64)
+}
 
 /// Zoom In/Out stops, as Honeyview 5.53 measured (drawn width of a test square):
 /// 5%, then 10-300% by 10, 320-500% by 20, 550-2000% by 50.
@@ -273,9 +319,7 @@ const HELP: &[(&str, &str)] = &[
     ("Ctrl+PgDn  Ctrl+PgUp", "10 images forward / back"),
     ("Ctrl+Alt+PgDn  Ctrl+Alt+PgUp", "Random image"),
     ("]  [", "Next / previous folder or archive"),
-    ("Shift+Right  Shift+Left", "1 page in double view"),
     ("0  9  8", "Original size / fit window / fit width"),
-    ("7  6", "Double page left-to-right / right-to-left"),
     ("Z", "Stretch small images"),
     ("+  -  *", "Zoom in / out / 100%"),
     ("Ctrl++  Ctrl+-", "Zoom 1%"),
@@ -291,8 +335,6 @@ const HELP: &[(&str, &str)] = &[
     ("Del", "Delete"),
     ("Ins  Shift+Ins  Ctrl+Ins", "Copy to photo folder 1 / 2, move to 1"),
     ("Ctrl+C  Ctrl+E", "Copy image / open in editor"),
-    ("Ctrl+1..9  Ctrl+0", "Slideshow seconds / stop"),
-    ("B  Shift+B  F3", "Bookmark / open last / edit bookmarks"),
     ("Alt+Enter  F11  Middle click", "Full screen"),
     ("Ctrl+A", "Always on top"),
     ("F5  Shift+F5", "Settings / reload settings file"),
@@ -356,6 +398,10 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(proxy: EventLoopProxy<UserEvent>, cfg: &Config) -> Self {
+        // the first image decodes before any window has a GPU surface: upload from the
+        // start when the setting is on (a GPU that then fails turns this off again)
+        let gpu_on = cfg.gpu && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0");
+        crate::gpu::DECODE_TO_GPU.store(gpu_on, Ordering::Relaxed);
         let wanted = Arc::new(Mutex::new(HashMap::new()));
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 3);
         let exif_flag = Arc::new(AtomicBool::new(cfg.exif_rotate));
@@ -410,9 +456,46 @@ pub struct App {
     window: Option<Arc<Window>>,
     _context: Option<softbuffer::Context<Arc<Window>>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// The GPU image layer; None draws everything on the processor (no GPU, the setting
+    /// off, or the GPU lost).
+    gpu: Option<crate::gpu::GpuWin>,
+    /// The interface frame the GPU path draws into (kept between frames).
+    gpu_buf: Vec<u32>,
+    /// Something other than an animation frame asked for a redraw: the whole interface is
+    /// drawn again. False: only the frame advanced, and the animation row is redrawn alone
+    /// when `anim_band` allows it.
+    ui_dirty: bool,
+    /// The animation row's rows (y0..y1), checked after the last full draw to come out the
+    /// same when drawn on its own (no card, toast or fade over it); (0, 0) when no row is
+    /// on screen; None otherwise.
+    anim_band: Option<(usize, usize)>,
+    /// The GPU setting this window last acted on (a change switches the path).
+    gpu_cfg: bool,
+    /// macOS reports the window covered (or minimized): nothing of it is on screen.
+    occluded: bool,
+    /// GPU path: this window gave its full texture back (covered, or past the budget) and
+    /// shows its screen-sized copy, or the thumbnail; it decodes again when used.
+    stripped: bool,
+    /// When the covered check last ran (macOS polls it).
+    occ_checked: Instant,
+    /// This frame's image placement for the GPU: (ox, oy, z, smooth), slide shift of the
+    /// old layer, and whether the frame is a settled one.
+    gpu_img: Option<(f64, f64, f64, bool)>,
+    gpu_hq: Option<crate::gpu::Hq>,
+    gpu_slide: Option<f64>,
+    /// The decoded image the GPU base is (its address), so a transform does not re-upload.
+    gpu_src: u64,
+    /// The decoder's shared texture of the base (the base itself is then a thumbnail).
+    base_tex: Option<Arc<crate::gpu::Tex>>,
+    gpu_settle: bool,
+    /// This frame's slide motion blur (half-length of the smear, px).
+    gpu_motion: f32,
     pub cfg: Config,
     pending_open: Option<PathBuf>,
     playlist: Option<Playlist>,
+    /// macOS: whether the traffic-light buttons are shown (None: not set yet).
+    #[cfg(target_os = "macos")]
+    lights_on: Option<bool>,
     pos_map: Arc<source::PosMap>,
     cache: Rc<RefCell<HashMap<Entry, Arc<Decoded>>>>,
     failed: Rc<RefCell<HashMap<Entry, String>>>,
@@ -432,7 +515,6 @@ pub struct App {
     view: View,
     base: Option<Arc<RgbaImage>>,
     base_gen: u64,
-    shown: usize,
     scaled: Option<(ScaledKey, RgbaImage)>,
     scaled_hq: bool,
     layout: Option<Layout>,
@@ -445,7 +527,6 @@ pub struct App {
     help_at: Instant,
     /// When the "Drop an image" card appeared, for its fade-in.
     empty_at: Option<Instant>,
-    slideshow: Option<(u32, Instant)>,
     mods: ModifiersState,
     cursor: (f64, f64),
     drag: Option<((f64, f64), (f64, f64), bool)>,
@@ -471,6 +552,11 @@ pub struct App {
     /// and the high-quality resize runs PINCH_SETTLE after the last event (or when a macOS
     /// pinch ends). (Added 2026-11-16 by Claude on the Mac, for both; see the handoff.)
     pinch_at: Option<Instant>,
+    /// Set when a new image is stored for display, cleared by the next finished paint. If no
+    /// paint follows within REPAINT_RETRY, the idle loop asks again: a repaint request can be
+    /// lost (Windows drops one made while that window paints; seen after a 100-window
+    /// crash takeover, where windows stayed grey until the cursor entered).
+    unpainted: Option<Instant>,
     /// The image layer of the last settled frame (before the chrome), and what it showed.
     last_frame: Vec<u32>,
     last_key: Option<(u64, u64, u64, u64, usize, usize)>,
@@ -481,17 +567,19 @@ pub struct App {
     rtl_for: Option<PathBuf>,
     /// When the last slide frame was drawn; the next one is due 8 ms later.
     slide_drawn: Instant,
-    /// Set when a new image is stored, cleared when a frame is presented. A redraw asked
-    /// for during a paint is dropped on Windows; in a takeover of ~100 windows the image
-    /// stayed grey until the cursor entered. about_to_wait retries every REPAINT_RETRY.
-    unpainted: Option<Instant>,
     /// Frosted glass: wanted (the only window), loaded (backdrop set), and the fade
     /// from `glass_from` (0 glass, 1 solid) toward the wanted state, started at `glass_at`.
     glass_on: bool,
+    /// Reopen in full screen at this time (closed in full screen, or a crash restore).
+    fs_restore_at: Option<Instant>,
+    /// What the master asked for (one window open), before the full-screen exception.
+    glass_want: bool,
     glass_loaded: bool,
     glass_from: f32,
     glass_at: Instant,
     fullscreen: bool,
+    /// macOS: the window's full-screen flag as last seen (see render)
+    fs_native: Option<bool>,
     on_top: bool,
     rng: u64,
     rand_hist: Vec<usize>,
@@ -517,12 +605,19 @@ pub struct App {
     was_max: bool,
     /// Maximized when full screen was entered; restored on leaving it.
     fs_was_max: bool,
-    bm_cache: Vec<String>,
     settings: Option<settings::Dialog>,
     /// The choice box whose popup menu is open in the settings dialog.
     pending_choice: Option<settings::ChoiceF>,
     /// When a popup last closed, which control opened it, and whether the cursor moved since.
     popup_closed: Option<(Instant, String, bool)>,
+    /// Open the next popup above its control, this many physical px wide; true: the main
+    /// menu, left-aligned with the button (Windows: popup_win; macOS: mac::popup_over).
+    popup_select: Option<(f64, bool)>,
+    /// The next popup is a dropdown of this width (physical px): macOS opens it under the
+    /// field, exactly as wide.
+    below_w: Option<f64>,
+    /// The next popup is a right-click menu: macOS places it at the pointer.
+    at_pointer: bool,
     /// A preset's name before renaming started (Esc puts it back).
     rename_orig: Option<String>,
     /// Hover fade per chrome control (0-1), and when it was last stepped.
@@ -562,7 +657,8 @@ fn spawn_workers(
                 }
                 continue;
             }
-            let res = decode::decode(&e, exif_rotate.load(Ordering::Relaxed)).map(Arc::new);
+            let to_gpu = crate::gpu::DECODE_TO_GPU.load(Ordering::Relaxed);
+            let res = decode::decode(&e, exif_rotate.load(Ordering::Relaxed), to_gpu).map(Arc::new);
             if proxy.send_event(UserEvent::Loaded(e, res)).is_err() {
                 break;
             }
@@ -629,9 +725,26 @@ impl App {
             window: None,
             _context: None,
             surface: None,
+            gpu: None,
+            gpu_buf: Vec::new(),
+            ui_dirty: true,
+            anim_band: None,
+            gpu_cfg: true,
+            occluded: false,
+            stripped: false,
+            occ_checked: Instant::now(),
+            gpu_img: None,
+            gpu_hq: None,
+            gpu_slide: None,
+            gpu_src: 0,
+            base_tex: None,
+            gpu_settle: false,
+            gpu_motion: 0.0,
             cfg,
             pending_open: arg,
             playlist: None,
+            #[cfg(target_os = "macos")]
+            lights_on: None,
             pos_map: Default::default(),
             cache: sh.cache.clone(),
             failed: sh.failed.clone(),
@@ -648,7 +761,6 @@ impl App {
             view: View::default(),
             base: None,
             base_gen: 0,
-            shown: 1,
             scaled: None,
             scaled_hq: true,
             layout: None,
@@ -659,7 +771,6 @@ impl App {
             show_help: false,
             help_at: Instant::now() - Duration::from_secs(1),
             empty_at: None,
-            slideshow: None,
             mods: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             drag: None,
@@ -674,18 +785,21 @@ impl App {
             last_click: None,
             wheel_acc: 0.0,
             pinch_at: None,
+            unpainted: None,
             last_frame: Vec::new(),
             last_key: None,
             slide: None,
             nav_hint: None,
             rtl_for: None,
             slide_drawn: Instant::now(),
-            unpainted: None,
             glass_on: false,
+            fs_restore_at: None,
+            glass_want: false,
             glass_loaded: false,
             glass_from: 1.0,
             glass_at: Instant::now(),
             fullscreen: false,
+            fs_native: None,
             on_top: false,
             rng: seed,
             rand_hist: Vec::new(),
@@ -704,10 +818,12 @@ impl App {
             geom: None,
             was_max: false,
             fs_was_max: false,
-            bm_cache: Vec::new(),
             settings: None,
             pending_choice: None,
             popup_closed: None,
+            popup_select: None,
+            below_w: None,
+            at_pointer: false,
             rename_orig: None,
             hover_fx: Vec::new(),
             tip_fx: Vec::new(),
@@ -730,7 +846,8 @@ impl App {
         }
     }
 
-    pub fn request_redraw(&self) {
+    pub fn request_redraw(&mut self) {
+        self.ui_dirty = true;
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -751,10 +868,6 @@ impl App {
         self.playlist.as_ref().and_then(|p| p.get(p.index).cloned())
     }
 
-    fn next_entry(&self) -> Option<Entry> {
-        self.playlist.as_ref().and_then(|p| p.get(p.index + 1).cloned())
-    }
-
     fn displaying_current(&self) -> bool {
         match (&self.current, self.cur_entry()) {
             (Some((e, _)), Some(c)) => *e == c,
@@ -770,6 +883,16 @@ impl App {
     }
 
     // ---------- loading ----------
+
+    /// True for a window showing no file (the one a Finder launch opens before its files arrive).
+    pub fn is_blank(&self) -> bool {
+        self.playlist.is_none() && self.current.is_none()
+    }
+
+    pub fn open_external(&mut self, p: &Path) {
+        self.open_path(p);
+        self.request_redraw();
+    }
 
     fn open_path(&mut self, p: &Path) {
         // A single image: show it at once and list its folder on a thread.
@@ -800,6 +923,12 @@ impl App {
     }
 
     /// How solid the background is now: 0 frosted glass, 1 the solid colour.
+    /// The background's opacity over the window glass, as `glass_finish` draws it.
+    fn glass_bg_alpha(&self) -> f32 {
+        let o = GLASS_OPACITY as f32 / 255.0;
+        o + (1.0 - o) * self.glass_solid()
+    }
+
     fn glass_solid(&self) -> f32 {
         let to = if self.glass_on { 0.0 } else { 1.0 };
         let k = (self.glass_at.elapsed().as_secs_f32() / GLASS_FADE.as_secs_f32()).min(1.0);
@@ -818,6 +947,9 @@ impl App {
     /// The master calls this when the window count changes: glass while this is the only
     /// window. `instant` skips the fade (a window just opened).
     pub fn set_glass(&mut self, on: bool, instant: bool) {
+        self.glass_want = on;
+        // macOS full screen has nothing behind the window to blur
+        let on = on && !(cfg!(target_os = "macos") && self.fullscreen);
         if on == self.glass_on {
             return;
         }
@@ -873,19 +1005,21 @@ impl App {
 
     /// Take the master's new list for folder `dir` (re-read or a file deleted elsewhere),
     /// staying on the image shown.
-    pub fn adopt(&mut self, dir: &Path) {
-        let Some(pl) = &self.playlist else { return };
+    /// False: the folder's slot was busy; ask again later.
+    pub fn adopt(&mut self, dir: &Path) -> bool {
+        let Some(pl) = &self.playlist else { return true };
         if pl.container != dir || pl.rev {
-            return;
+            return true;
         }
-        let Some((l, pos)) = source::held(dir) else { return };
+        let Ok(h) = source::held(dir) else { return false };
+        let Some((l, pos)) = h else { return true };
         if Arc::ptr_eq(&l, &pl.entries) || l.is_empty() {
-            return;
+            return true;
         }
         let cur = self.cur_entry();
         let at = cur.as_ref().and_then(|c| pos.get(c)).copied();
         let old = pl.index;
-        let Some(pl) = &mut self.playlist else { return };
+        let Some(pl) = &mut self.playlist else { return true };
         pl.entries = l;
         self.pos_map = pos;
         match at {
@@ -901,6 +1035,7 @@ impl App {
                 self.go_to(i);
             }
         }
+        true
     }
 
     /// True while this window shows `e` as a one-entry list, waiting for its folder list.
@@ -949,7 +1084,8 @@ impl App {
         if let Some(pl) = &self.playlist {
             let i = pl.index as isize;
             let d = self.dir as isize;
-            for o in [-2isize, -1, 0, 1, 2, 3, 4, 5, 6, 7].map(|o| o * d) {
+            let offsets: &[isize] = if self.neighbours_wanted() { &[-2, -1, 0, 1, 2, 3, 4, 5, 6, 7] } else { &[0] };
+            for o in offsets.iter().map(|o| o * d) {
                 let j = i + o;
                 if let Some(e) = (j >= 0).then(|| pl.get(j as usize)).flatten() {
                     w.insert(e.clone());
@@ -988,8 +1124,12 @@ impl App {
         // Look 6 ahead in the direction of travel and 1 behind: at 30 flips/s from a cold
         // 7200 rpm disk, 3 ahead missed 6 of 40 images.
         let d = self.dir as isize;
-        let list: Vec<Entry> = [0isize, d, 2 * d, 3 * d, -d, 4 * d, 5 * d, 6 * d]
+        // GPU mode: only the focused window preloads its neighbours (100 windows asked
+        // for up to 800 images against a cache of about 32 and decoded each one 6 times)
+        let offsets: &[isize] = if self.neighbours_wanted() { &[0, 1, 2, 3, -1, 4, 5, 6] } else { &[0] };
+        let list: Vec<Entry> = offsets
             .iter()
+            .map(|o| o * d)
             .filter_map(|o| {
                 let j = i + o;
                 if j >= 0 {
@@ -1008,14 +1148,22 @@ impl App {
     /// The master evicts the shared cache by the smallest distance over all windows.
     pub fn distance(&self, e: &Entry) -> i64 {
         let Some(pl) = &self.playlist else { return i64::MAX };
+        // GPU mode, a window without focus keeps only its own image in the cache
+        if !self.neighbours_wanted() && self.cur_entry().as_ref() != Some(e) {
+            return i64::MAX;
+        }
+        // a window that gave its full texture back does not keep its image in the cache
+        if self.stripped {
+            return i64::MAX;
+        }
         self.pos_map.get(e).map(|&p| (pl.flip(p) as i64 - pl.index as i64).abs()).unwrap_or(i64::MAX)
     }
 
     fn set_current(&mut self, e: Entry, d: Arc<Decoded>) {
         crate::trace(&format!("current {}", e.name()));
         self.frame_idx = 0;
-        self.next_frame_at = if d.frames.len() > 1 && self.cfg.double == 0 {
-            Some(Instant::now() + Duration::from_millis(self.frame_ms(d.frames[0].delay_ms)))
+        self.next_frame_at = if d.frame_count() > 1 {
+            Some(Instant::now() + Duration::from_millis(self.frame_ms(d.frame_delay(0))))
         } else {
             None
         };
@@ -1063,8 +1211,6 @@ impl App {
                     // While dragging, the exact image is rarely ready before the slider moves
                     // on (1 of 39 decodes was shown in a 672 ms drag). Show the nearest one.
                     self.set_current(e.clone(), d.clone());
-                } else if self.cfg.double != 0 && self.next_entry().as_ref() == Some(e) {
-                    self.invalidate();
                 }
             }
             Err(_) => {
@@ -1130,18 +1276,10 @@ impl App {
             return;
         }
         let idx = self.index() as isize;
-        let n = if !single && self.cfg.double != 0 {
-            if n > 0 {
-                n * self.shown as isize
-            } else {
-                n * 2
-            }
-        } else {
-            n
-        };
+        let _ = single;
         let t = idx + n;
         if t >= len {
-            if idx + self.shown as isize >= len || n.abs() == 1 && idx == len - 1 {
+            if idx + 1 >= len || n.abs() == 1 && idx == len - 1 {
                 self.at_end(true);
             } else {
                 self.go_to((len - 1) as usize);
@@ -1220,59 +1358,36 @@ impl App {
         }
     }
 
-    fn slideshow_tick(&mut self) {
-        if self.cfg.slideshow_random {
-            self.random();
-            return;
-        }
-        let len = self.len();
-        if self.index() + self.shown >= len {
-            if self.cfg.slideshow_loop {
-                self.go_to(0);
-            } else {
-                self.slideshow = None;
-                self.msg("Stop Slideshow");
-            }
-        } else {
-            self.next();
-        }
-    }
-
-    fn set_slideshow(&mut self, secs: u32) {
-        if secs == 0 {
-            self.slideshow = None;
-            self.msg("Stop Slideshow");
-        } else {
-            self.cfg.slideshow_secs = secs;
-            self.slideshow = Some((secs, Instant::now() + Duration::from_secs(secs as u64)));
-            self.msg(format!("Start Slideshow: {secs}sec"));
-        }
-    }
-
-    // ---------- view ----------
-
     fn ensure_base(&mut self) {
         if self.base.is_some() {
             return;
         }
         let Some((_, cur)) = self.current.clone() else { return };
-        let fi = self.frame_idx.min(cur.frames.len() - 1);
-        let mut img = cur.frames[fi].img.clone();
-        self.shown = 1;
-        if self.cfg.double != 0 && self.displaying_current() {
-            let sec = self.next_entry().and_then(|e| self.cache.borrow().get(&e).cloned());
-            if let Some(sec) = sec {
-                let b = &sec.frames[0].img;
-                let portrait = |i: &RgbaImage| i.height() >= i.width();
-                if portrait(&img) && portrait(b) {
-                    img = Arc::new(if self.cfg.double == 1 {
-                        decode::compose(&img, b)
-                    } else {
-                        decode::compose(b, &img)
-                    });
-                    self.shown = 2;
-                }
+        let fi = self.frame_idx.min(cur.frame_count() - 1);
+        // a Lottie: GPU mode replays its frame textures (each drawn once); the processor
+        // draws the frame now
+        let lottie_tex = match (&cur.lottie, self.gpu.is_some()) {
+            (Some(p), true) => p.frame_tex(fi),
+            _ => None,
+        };
+        let img = match (&cur.lottie, &lottie_tex) {
+            // the texture is the image; the first frame stands for it in RAM
+            (Some(_), Some(_)) => cur.frames[0].img.clone(),
+            (Some(p), None) => p.frame(fi),
+            (None, _) => cur.frames[fi].img.clone(),
+        };
+        self.base_tex = if cur.lottie.is_some() { lottie_tex } else { cur.frames[fi].gpu.clone() };
+        // GPU: the image as decoded; rotation, flips, Negative and Gamma are shader steps,
+        // so they make no new copy and no new upload (the key is the image itself)
+        if self.gpu.is_some() {
+            let key = self.base_tex.as_ref().map(|t| Arc::as_ptr(t) as u64).unwrap_or(Arc::as_ptr(&img) as u64);
+            if self.gpu_src != key {
+                self.gpu_src = key;
+                self.base_gen += 1;
             }
+            self.base = Some(img);
+            self.scaled = None;
+            return;
         }
         let v = &self.view;
         self.base = Some(decode::transform(&img, v.rotation, v.flip_h, v.flip_v, v.negative, v.gamma));
@@ -1280,9 +1395,122 @@ impl App {
         self.scaled = None;
     }
 
+    /// Neighbour images are preloaded and kept for this window: always on the processor
+    /// path; in GPU mode only for the focused window.
+    fn neighbours_wanted(&self) -> bool {
+        self.gpu.is_none() || self.window.as_ref().is_some_and(|w| w.has_focus())
+    }
+
+    /// GPU path: keep only the screen-sized copy (and the thumbnail): give back the full
+    /// texture and the window-sized frame buffers. Covered windows, and windows past the
+    /// shared budget, do this; the focused and most recently used windows keep theirs.
+    fn strip(&mut self) {
+        // no image yet: nothing to give back. (Marked anyway, a new window covered before
+        // it was first shown let its arriving image go from the cache and decoded it again
+        // when uncovered: 267 decodes for 200 in the 100-window test.) The budget check
+        // still strips it later if needed.
+        if self.gpu.is_none() || self.stripped || self.current.is_none() {
+            if let (Some(g), true) = (&mut self.gpu, self.current.is_none()) {
+                g.release(true);
+            }
+            return;
+        }
+        self.stripped = true;
+        self.gpu_buf = Vec::new();
+        if let Some(g) = &mut self.gpu {
+            g.release(true);
+        }
+        // the shown image without its texture: frames keep only their thumbnails
+        if let Some((e, d)) = self.current.clone() {
+            if d.frames.iter().any(|f| f.gpu.is_some()) {
+                let frames = d.frames.iter().map(|f| decode::Frame { img: f.img.clone(), delay_ms: f.delay_ms, gpu: None }).collect();
+                // the thumbnails are stored turned: nothing left to turn
+                let thin = Decoded { frames, format: d.format.clone(), file_size: d.file_size, modified: d.modified, exif: d.exif.clone(), orig_w: d.orig_w, orig_h: d.orig_h, orient: 1, lottie: d.lottie.clone() };
+                self.current = Some((e, Arc::new(thin)));
+            }
+        }
+        self.base = None;
+        self.base_tex = None;
+        self.last_frame.clear();
+        self.last_key = None;
+        crate::trace("gpu: window keeps its screen-sized copy only");
+    }
+
+    /// Used again (focused, uncovered): the full image comes back from the cache, or is
+    /// decoded again; the screen-sized copy shows meanwhile.
+    fn unstrip(&mut self) {
+        if !self.stripped {
+            return;
+        }
+        self.stripped = false;
+        if let Some(e) = self.cur_entry() {
+            let cached = self.cache.borrow().get(&e).cloned();
+            match cached {
+                Some(d) if d.frames.iter().any(|f| f.gpu.is_some()) => self.set_current(e, d),
+                _ => {
+                    self.cache.borrow_mut().remove(&e);
+                    self.request(e);
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Covered (nothing of the window on screen): stop drawing, keep only the screen-sized
+    /// copy, drop the surface; uncovered: draw again.
+    fn set_covered(&mut self, o: bool) {
+        if o == self.occluded {
+            return;
+        }
+        crate::trace(&format!("window covered: {o}"));
+        self.occluded = o;
+        if o {
+            self.strip();
+            if let Some(g) = &mut self.gpu {
+                g.park();
+            }
+        } else {
+            self.unstrip();
+            self.request_redraw();
+        }
+    }
+
+    /// The view transform for the GPU.
+    fn gpu_xf(&self) -> crate::gpu::Xform {
+        let v = &self.view;
+        let view = crate::gpu::Xform { rot: v.rotation % 4, flip_h: v.flip_h, flip_v: v.flip_v, negative: v.negative, gamma: v.gamma };
+        // the shared texture is the photo as stored: its EXIF turn first, then the view's
+        // (a thumbnail standing in is stored turned already)
+        match (&self.base_tex, &self.current) {
+            (Some(_), Some((_, d))) if d.orient > 1 => view.after(&crate::gpu::Xform::exif(d.orient)),
+            _ => view,
+        }
+    }
+
+    /// The width of the texture's full image: the stored photo's for a shared texture,
+    /// the turned one's for a thumbnail standing in.
+    fn gpu_full_w(&self, b: &RgbaImage) -> u32 {
+        match &self.current {
+            Some((_, d)) if self.base_tex.is_some() && d.orient >= 5 => d.orig_h,
+            Some((_, d)) => d.orig_w,
+            None => b.width(),
+        }
+    }
+
     fn compute_layout(&mut self, ww: f64, wh: f64) -> Option<Layout> {
         let b = self.base.as_ref()?;
-        let (bw, bh) = (b.width() as f64, b.height() as f64);
+        let (mut bw, mut bh) = (b.width() as f64, b.height() as f64);
+        // GPU: the base may be a thumbnail (of a texture, or standing in); lay out the
+        // full image
+        if self.base_tex.is_some() || self.gpu.is_some() {
+            if let Some((_, d)) = &self.current {
+                (bw, bh) = (d.orig_w as f64, d.orig_h as f64);
+            }
+        }
+        // GPU: the base is unrotated; lay out the turned image
+        if self.gpu.is_some() && self.view.rotation % 2 == 1 {
+            std::mem::swap(&mut bw, &mut bh);
+        }
         let z = match self.view.user_zoom {
             Some(z) => z,
             None => {
@@ -1302,7 +1530,7 @@ impl App {
         let sh = bh * z;
         if self.view.pan_reset && self.displaying_current() {
             self.view.pan_reset = false;
-            self.view.pan_x = if self.cfg.double == 2 { sw - ww } else { (sw - ww) / 2.0 };
+            self.view.pan_x = (sw - ww) / 2.0;
             self.view.pan_y = if self.cfg.view_mode == 2 || self.cfg.align_top { 0.0 } else { (sh - wh) / 2.0 };
         }
         self.view.pan_x = if sw > ww { self.view.pan_x.clamp(0.0, sw - ww) } else { 0.0 };
@@ -1375,25 +1603,6 @@ impl App {
         });
     }
 
-    fn set_double(&mut self, d: u8) {
-        self.cfg.double = if self.cfg.double == d { 0 } else { d };
-        self.view.pan_reset = true;
-        if self.cfg.double != 0 {
-            self.next_frame_at = None;
-            if let Some(e) = self.next_entry() {
-                self.request(e);
-            }
-        } else if let Some((e, d)) = self.current.clone() {
-            self.set_current(e, d);
-        }
-        self.invalidate();
-        self.msg(match self.cfg.double {
-            1 => "Smart Double Page (Left->Right)",
-            2 => "Smart Double Page (Left<-Right)",
-            _ => "Double page: Off",
-        });
-    }
-
     fn rotate(&mut self, q: u8) {
         self.view.rotation = (self.view.rotation + q) % 4;
         self.view.pan_reset = true;
@@ -1414,10 +1623,13 @@ impl App {
         if self.fullscreen {
             // A maximized window kept its maximized client area in full screen: the
             // bottom 36 px (taskbar height) showed the unpainted window frame.
-            self.fs_was_max = w.is_maximized();
+            // (macOS full screen keeps and restores the window's own frame)
+            self.fs_was_max = cfg!(not(target_os = "macos")) && is_maximized(&w);
             if self.fs_was_max {
                 w.set_maximized(false);
             }
+            // macOS: native full screen (its own Space; the system slides the title bar and
+            // menu bar down at the top edge and lays the window out below the notch)
             w.set_fullscreen(Some(Fullscreen::Borderless(None)));
         } else {
             w.set_fullscreen(None);
@@ -1427,13 +1639,39 @@ impl App {
         }
     }
 
+    /// Test hook: click the chrome control `id` as last drawn ("picker" opens Select Image).
+    pub fn test_click(&mut self, el: &ActiveEventLoop, id: &str) {
+        if id == "picker" {
+            self.open_picker();
+            return;
+        }
+        if let Some(h) = self.hits.iter().find(|h| h.id == id).cloned() {
+            self.on_chrome_click(el, h, false);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn test_press_green(&self) {
+        if let Some(w) = &self.window {
+            crate::mac::press_green(w);
+        }
+    }
+
+    pub fn test_fullscreen(&mut self, maximize: bool) {
+        if maximize {
+            self.toggle_maximize();
+        } else {
+            self.toggle_fullscreen();
+        }
+    }
+
     fn toggle_maximize(&mut self) {
         if self.fullscreen {
             self.toggle_fullscreen();
             return;
         }
         if let Some(w) = &self.window {
-            w.set_maximized(!w.is_maximized());
+            w.set_maximized(!is_maximized(&w));
         }
     }
 
@@ -1465,7 +1703,6 @@ impl App {
     fn close(&mut self) {
         self.playlist = None;
         self.current = None;
-        self.slideshow = None;
         self.next_frame_at = None;
         self.pos_map = Default::default();
         self.update_wanted();
@@ -1598,7 +1835,7 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = Command::new("open").arg("-R").arg(&p).spawn();
+            crate::mac::reveal(std::slice::from_ref(&p));
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         if let Some(d) = p.parent() {
@@ -1628,6 +1865,21 @@ impl App {
     fn copy_image(&mut self) {
         self.ensure_base();
         let Some(b) = self.base.clone() else { return };
+        // GPU: the full image is on the GPU; read it back
+        let b = match self.base_tex.as_ref().and_then(|t| crate::gpu::read_tex(t)) {
+            Some(full) => match &self.current {
+                Some((_, d)) if d.orient > 1 => Arc::new(decode::orient(&full, d.orient as u32)),
+                _ => Arc::new(full),
+            },
+            None => b,
+        };
+        // GPU: the base is untransformed; copy the image as shown
+        let b = if self.gpu.is_some() {
+            let v = &self.view;
+            decode::transform(&b, v.rotation, v.flip_h, v.flip_v, v.negative, v.gamma)
+        } else {
+            b
+        };
         let r = arboard::Clipboard::new().and_then(|mut cb| {
             cb.set_image(arboard::ImageData {
                 width: b.width() as usize,
@@ -1644,43 +1896,7 @@ impl App {
         self.msg(if r.is_ok() { "Copied to clipboard." } else { "Failed to copy to clipboard." });
     }
 
-    fn bookmarks_path() -> PathBuf {
-        Config::dir().join("bookmarks.txt")
-    }
-
-    fn add_bookmark(&mut self) {
-        let Some(e) = self.cur_entry() else { return };
-        let _ = std::fs::create_dir_all(Config::dir());
-        let r = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(Self::bookmarks_path())
-            .and_then(|mut f| writeln!(f, "{}", e.label()));
-        match r {
-            Ok(()) => self.msg(format!("Add to Bookmarks: {}", e.name())),
-            Err(err) => self.msg(format!("Failed to save the bookmarks: {err}")),
-        }
-    }
-
-    fn open_last_bookmark(&mut self) {
-        let Ok(s) = std::fs::read_to_string(Self::bookmarks_path()) else {
-            self.msg("Failed to open the bookmarks.");
-            return;
-        };
-        let Some(line) = s.lines().map(str::trim).filter(|l| !l.is_empty()).last() else {
-            self.msg("Failed to open the bookmarks.");
-            return;
-        };
-        let line = line.to_string();
-        self.open_bookmark_line(&line);
-    }
-
-    fn open_bookmark_line(&mut self, line: &str) {
-        self.open_label(line);
-        self.msg(format!("Open recently saved bookmark: {line}"));
-    }
-
-    /// Open an entry label: a file path, or "<archive>|<name inside>" (bookmarks, crash restore).
+    /// Open an entry label: a file path, or "<archive>|<name inside>" (the crash restore).
     pub fn open_label(&mut self, line: &str) {
         let line = line.to_string();
         match line.split_once('|') {
@@ -1713,15 +1929,6 @@ impl App {
             Some((p.x, p.y, s.width, s.height))
         })?;
         Some(crate::backup::WinState { x, y, w: gw, h: gh, max: self.was_max, fs: self.fullscreen, label })
-    }
-
-    fn edit_bookmarks(&mut self) {
-        let p = Self::bookmarks_path();
-        if !p.exists() {
-            let _ = std::fs::create_dir_all(Config::dir());
-            let _ = std::fs::write(&p, "");
-        }
-        open_text_file(&p);
     }
 
     fn reload_config(&mut self) {
@@ -1770,7 +1977,7 @@ impl App {
             if ce == e {
                 let mut img = vec![
                     row("Dimensions", format!("{} × {}", d.orig_w, d.orig_h), true),
-                    row("Format", if d.frames.len() > 1 { format!("{}, {} frames", d.format, d.frames.len()) } else { d.format.to_string() }, false),
+                    row("Format", if d.frame_count() > 1 { format!("{}, {} frames", d.format, d.frame_count()) } else { d.format.to_string() }, false),
                     row("File size", fmt_size(d.file_size), true),
                 ];
                 if let Some(t) = d.modified {
@@ -1798,7 +2005,7 @@ impl App {
         v.push(format!("Index: {} / {}", pl.index + 1, pl.entries.len()));
         if let Some((ce, d)) = &self.current {
             if ce == e {
-                let frames = if d.frames.len() > 1 { format!("  {} frames", d.frames.len()) } else { String::new() };
+                let frames = if d.frame_count() > 1 { format!("  {} frames", d.frame_count()) } else { String::new() };
                 v.push(format!("Image Size: {} x {}  {}{}", d.orig_w, d.orig_h, d.format, frames));
                 v.push(format!("File Size: {}", fmt_size(d.file_size)));
                 if let Some(t) = d.modified {
@@ -1818,10 +2025,382 @@ impl App {
         v
     }
 
+    /// The GPU setting, with the ARKIMAGE_GPU=0 test override (never saved).
+    /// Windows: never while the window glass shows (one window open). A DirectX swap chain
+    /// covers the glass: the blur behind the window reached neither an HWND swap chain
+    /// (Opaque only) nor a DirectComposition one (#000000 under a clear GPU frame, also
+    /// with the Windows 11 Acrylic backdrop). The window switches to the GPU once the
+    /// glass has faded out, when a second window opens.
+    fn gpu_wanted(&self) -> bool {
+        let glass = cfg!(windows) && (self.glass_on || self.glass_loaded) && std::env::var_os("ARKIMAGE_GPU_SELFTEST").is_none();
+        self.cfg.gpu && !glass && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0") && !self.too_big_for_gpu()
+    }
+
+    /// The image shown has a side past the GPU's texture limit (16,384 px on Apple
+    /// silicon): this window draws it with the processor at full size rather than shrink
+    /// it to fit, and goes back to the GPU at the next image that fits.
+    fn too_big_for_gpu(&self) -> bool {
+        let Some((_, d)) = &self.current else { return false };
+        let lim = crate::gpu::get().map(|g| g.max_tex()).unwrap_or(u32::MAX);
+        d.lottie.is_none() && (d.orig_w > lim || d.orig_h > lim)
+    }
+
+    /// The processor's window surface (softbuffer): at start without a GPU, or after the
+    /// GPU path failed or was turned off.
+    fn cpu_surface(&mut self) {
+        let Some(win) = self.window.clone() else { return };
+        self.gpu = None;
+        let ctx = softbuffer::Context::new(win.clone()).expect("softbuffer context");
+        let surface = softbuffer::Surface::new(&ctx, win.clone()).expect("softbuffer surface");
+        // the GPU's layer would stay under this one with its last frame (see mac.rs)
+        #[cfg(target_os = "macos")]
+        crate::trace(&format!("stale layers removed: {}", crate::mac::drop_stale_layers(&win)));
+        self._context = Some(ctx);
+        self.surface = Some(surface);
+        self.last_frame.clear();
+        self.last_key = None;
+        self.base = None;
+        self.scaled = None;
+        // the GPU copies are gone or unusable here: decoders keep RAM copies from now on,
+        // images that lived on the GPU are dropped from the cache, and the one shown is
+        // decoded again (its thumbnail stays on screen meanwhile)
+        crate::gpu::DECODE_TO_GPU.store(false, Ordering::Relaxed);
+        self.cache.borrow_mut().retain(|_, d| d.frames.iter().all(|f| f.gpu.is_none()));
+        self.base_tex = None;
+        if let Some(e) = self.cur_entry() {
+            self.request(e);
+        }
+    }
+
+    /// Test hook ARKIMAGE_GPU_SELFTEST: the GPU's full-quality shrink against the
+    /// processor's, per kernel and preset, on the current image; prints and exits.
+    fn gpu_selftest(&mut self) {
+        let Some(base) = self.base.clone() else { return };
+        // the base is a thumbnail when the image lives on the GPU: test on the full image
+        let base = match self.base_tex.as_ref().and_then(|t| crate::gpu::read_tex(t)) {
+            Some(full) => Arc::new(full),
+            None => base,
+        };
+        let (bw, bh) = base.dimensions();
+        let mut user = self.cfg.filter_presets.clone();
+        let mut presets = crate::filters::builtins();
+        presets.append(&mut user);
+        // every kernel, with and without sharpening
+        for k in 2..=6u8 {
+            presets.push(crate::filters::Preset { name: format!("kernel {k}"), kernel: k, amount: 0, radius: 100, threshold: 0 });
+            presets.push(crate::filters::Preset { name: format!("kernel {k} sharp"), kernel: k, amount: 150, radius: 150, threshold: 3 });
+        }
+        let interp = self.cfg.interp;
+        for z in [0.29f64, 0.5, 0.11] {
+            let (sw, sh) = (((bw as f64 * z).round() as u32).max(1), ((bh as f64 * z).round() as u32).max(1));
+            for (i, p) in presets.iter().enumerate() {
+                let t0 = Instant::now();
+                let cpu = self.scale_with_preset(&base, sw, sh);
+                let tc = t0.elapsed();
+                let q = crate::gpu::Hq {
+                    key: 0xC0FFEE ^ i as u64 ^ (sw as u64) << 32,
+                    w: sw,
+                    h: sh,
+                    kernel: p.resize_code(interp),
+                    amount: p.amount as f32 / 100.0,
+                    sigma: p.radius as f32 / 100.0,
+                    threshold: p.threshold,
+                    x: 0,
+                    y: 0,
+                    xf: Default::default(),
+                };
+                // the processor uses the selected preset; set it for this case
+                let _ = &cpu;
+                // the processor's own path for this preset
+                let cpu = {
+                    let mut img = render::resize(&base, sw, sh, p.resize_code(interp));
+                    render::sharpen(&mut img, p.amount as f32 / 100.0, p.radius as f32 / 100.0, p.threshold);
+                    img
+                };
+                let t1 = Instant::now();
+                let gpu = self.gpu.as_mut().map(|g| g.hq_readback(self.base_gen as u64, &base, &q)).unwrap_or_default();
+                let tg = t1.elapsed();
+                let mut hist = [0u64; 256];
+                for (k, (a, b)) in cpu.as_raw().iter().zip(gpu.iter()).enumerate() {
+                    if k % 4 != 3 {
+                        hist[(*a as i32 - *b as i32).unsigned_abs() as usize] += 1;
+                    }
+                }
+                let n: u64 = hist.iter().sum();
+                let max = hist.iter().rposition(|&c| c > 0).unwrap_or(0);
+                if max > 2 {
+                    let over: u64 = hist[3..].iter().sum();
+                    // the first few: position, channel, both values
+                    let mut ex = Vec::new();
+                    for (k, (a, b)) in cpu.as_raw().iter().zip(gpu.iter()).enumerate() {
+                        if k % 4 != 3 && a.abs_diff(*b) > 2 && ex.len() < 4 {
+                            let px = k / 4;
+                            ex.push(format!("({},{}) c{} cpu {} gpu {}", px % sw as usize, px / sw as usize, k % 4, a, b));
+                        }
+                    }
+                    eprintln!("selftest   over 2: {over} values; {}", ex.join("; "));
+                }
+                let le = |l: usize| 100.0 * hist[..=l].iter().sum::<u64>() as f64 / n.max(1) as f64;
+                eprintln!(
+                    "selftest z={z} {sw}x{sh} preset {i} {:?} kernel {}: <=0 {:.2}% <=1 {:.3}% <=2 {:.3}% max {max}  cpu {:.0} ms gpu {:.0} ms",
+                    p.name,
+                    p.resize_code(interp),
+                    le(0),
+                    le(1),
+                    le(2),
+                    tc.as_secs_f64() * 1000.0,
+                    tg.as_secs_f64() * 1000.0
+                );
+            }
+        }
+        // the GPU path's band decode against the processor path's decode of the same file
+        // (the processor path, not the image crate: their JPEG decoders differ by up to 5)
+        if let Some(e) = self.cur_entry() {
+            if let Ok(d) = decode::decode(&e, self.cfg.exif_rotate, false) {
+                {
+                    let img = d.frames[0].img.clone();
+                    let mut max = 0u8;
+                    let mut over1 = 0u64;
+                    for (k, (a, b)) in img.as_raw().iter().zip(base.as_raw().iter()).enumerate() {
+                        if k % 4 != 3 {
+                            let d = a.abs_diff(*b);
+                            max = max.max(d);
+                            over1 += (d > 1) as u64;
+                        }
+                    }
+                    eprintln!("selftest decoder: GPU texture vs processor decode {}x{}: max {max}, over 1: {over1} of {}", img.width(), img.height(), img.as_raw().len() / 4 * 3);
+                }
+            }
+        }
+        // the view transform: rotations, flips, Negative, Gamma, with Soften+Sharpen
+        let p = crate::filters::builtins()[2].clone();
+        let xfs = [
+            (1u8, false, false, false, false),
+            (2, false, false, false, false),
+            (3, false, false, false, false),
+            (0, true, false, false, false),
+            (0, false, true, false, false),
+            (1, true, false, false, false),
+            (0, false, false, true, false),
+            (0, false, false, false, true),
+            (3, false, true, true, true),
+        ];
+        for (n, &(rot, fh, fv, neg, gam)) in xfs.iter().enumerate() {
+            let xf = crate::gpu::Xform { rot, flip_h: fh, flip_v: fv, negative: neg, gamma: gam };
+            let shown = decode::transform(&base, rot, fh, fv, neg, gam);
+            let z = 0.29;
+            let (sw, sh) = (((shown.width() as f64 * z).round() as u32).max(1), ((shown.height() as f64 * z).round() as u32).max(1));
+            let mut cpu = render::resize(&shown, sw, sh, p.resize_code(interp));
+            render::sharpen(&mut cpu, p.amount as f32 / 100.0, p.radius as f32 / 100.0, p.threshold);
+            let q = crate::gpu::Hq { key: 0xBEEF ^ n as u64, w: sw, h: sh, kernel: p.resize_code(interp), amount: p.amount as f32 / 100.0, sigma: p.radius as f32 / 100.0, threshold: p.threshold, x: 0, y: 0, xf };
+            let raw = self.gpu.as_mut().map(|g| g.hq_readback(self.base_gen as u64, &base, &q)).unwrap_or_default();
+            let (uw, uh) = if rot % 2 == 1 { (sh, sw) } else { (sw, sh) };
+            let Some(un) = RgbaImage::from_raw(uw, uh, raw) else { eprintln!("selftest xf {xf:?}: readback failed"); continue };
+            // the GPU copy is unrotated: turn it as the layer shader does, to compare
+            let gpu = decode::transform(&Arc::new(un), rot, fh, fv, false, false);
+            let mut max = 0u8;
+            let mut over1 = 0u64;
+            for (k, (a, b)) in cpu.as_raw().iter().zip(gpu.as_raw().iter()).enumerate() {
+                if k % 4 != 3 {
+                    let d = a.abs_diff(*b);
+                    max = max.max(d);
+                    if d > 1 {
+                        over1 += 1;
+                    }
+                }
+            }
+            eprintln!("selftest xf {xf:?}: size {}x{} vs {}x{}, max {max}, over 1: {over1}", cpu.width(), cpu.height(), gpu.width(), gpu.height());
+        }
+        std::process::exit(0);
+    }
+
+    /// Draw the animation row alone into `rows` (the window's rows y0..y1, `w` wide, of a
+    /// window `h` tall): holes, then the row. True if it landed on exactly those rows.
+    fn draw_anim_band(&mut self, rows: &mut [u32], w: usize, y0: usize, y1: usize, h: usize) -> bool {
+        let Some(mut t) = self.text.borrow_mut().take() else { return false };
+        let hover_fx = self.hover_fx.clone();
+        let anim_fmt = self.anim_format();
+        let st = chrome::State {
+            sf: self.sf(),
+            title: "",
+            show_top: false,
+            show_bottom: true,
+            maximized: false,
+            lock_bottom: self.cfg.lock_bottom,
+            hover_fx: &hover_fx,
+            tip_fx: &[],
+            info_on: false,
+            index: self.index(),
+            len: self.len(),
+            anim: self.anim_frames().map(|n| (self.frame_idx.min(n - 1), n)),
+            anim_fmt: &anim_fmt,
+            anim_speed: self.anim_speed,
+            anim_fps: self.anim_fps(),
+            page_drag: None,
+            archive: false,
+            rtl: false,
+            flip_h: false,
+            flip_v: false,
+        };
+        rows.fill(render::HOLE);
+        let mut c = Canvas { buf: rows, w, h: y1 - y0 };
+        let mut hits = Vec::new();
+        let band = chrome::draw_anim_row(&mut c, &mut t, &st, &mut hits, h as f32, y0 as f32);
+        *self.text.borrow_mut() = Some(t);
+        band == Some((y0, y1))
+    }
+
+    /// The GPU path: the interface on the processor with holes, the image on the GPU.
+    fn render_gpu(&mut self, w: u32, h: u32) {
+        if std::env::var_os("ARKIMAGE_GPU_SELFTEST").is_some() && self.displaying_current() {
+            self.ensure_base();
+            self.gpu_selftest();
+        }
+        let n = (w * h) as usize;
+        let mut buf = std::mem::take(&mut self.gpu_buf);
+        let (wu, hu) = (w as usize, h as usize);
+        // an animation frame alone: redraw only the animation row (counter and track); the
+        // rest of the interface and the image placement stay as last drawn. Measured on a
+        // 3420x2148 window: the full interface took 6% CPU at 30 frames a second and the
+        // change scan another 4%.
+        let fast = !self.ui_dirty && buf.len() == n && self.gpu_img.is_some() && self.gpu_slide.is_none() && self.gpu_hq.is_none();
+        self.ui_dirty = false;
+        let mut rows = None;
+        if let (true, Some((y0, y1))) = (fast, self.anim_band) {
+            self.ensure_base();
+            // (0, 0): no animation row on screen (bar hidden); nothing in the interface
+            // follows the frame
+            if y0 == y1 || self.draw_anim_band(&mut buf[y0 * wu..y1 * wu], wu, y0, y1, hu) {
+                // the new frame is the layer a slide starts from, as draw() marks it
+                self.gpu_settle = self.cfg.slide_ms > 0;
+                rows = Some((y0, y1));
+                crate::trace("anim row only");
+            }
+        }
+        if rows.is_none() {
+            buf.resize(n, 0);
+            self.gpu_img = None;
+            self.gpu_hq = None;
+            self.gpu_slide = None;
+            self.gpu_settle = false;
+            self.gpu_motion = 0.0;
+            {
+                let mut c = Canvas { buf: &mut buf, w: wu, h: hu };
+                crate::trace("draw start");
+                crate::chrome::reset_anim_band();
+                self.draw(&mut c);
+            }
+            crate::trace("draw end");
+            // the animation row may be redrawn alone only if, drawn alone, it matches what
+            // the full draw left in its rows
+            let was = self.anim_band.is_some();
+            self.anim_band = None;
+            let band = crate::chrome::last_anim_band();
+            if band.is_none() && self.gpu_img.is_some() && self.gpu_slide.is_none() {
+                self.anim_band = Some((0, 0));
+            }
+            if let Some((y0, y1)) = band.filter(|&(a, b)| a < b && b <= hu) {
+                if self.gpu_img.is_some() && self.gpu_slide.is_none() {
+                    let mut tmp = vec![0u32; (y1 - y0) * wu];
+                    if self.draw_anim_band(&mut tmp, wu, y0, y1, hu) && tmp[..] == buf[y0 * wu..y1 * wu] {
+                        self.anim_band = Some((y0, y1));
+                    }
+                }
+            }
+            if was != self.anim_band.is_some() {
+                crate::trace(&format!("anim row alone: {}", self.anim_band.is_some()));
+            }
+        }
+        let sf = self.sf();
+        let glass = self.glass_prepare();
+        let bg_alpha = if glass { self.glass_bg_alpha() } else { 1.0 };
+        if let Some(g) = &mut self.gpu {
+            g.set_see_through(glass);
+        }
+        let base = self.base.clone();
+        let image = match (&self.gpu_img, &base) {
+            (Some((ox, oy, z, smooth)), Some(b)) => Some(crate::gpu::ImageDraw { full_w: self.gpu_full_w(b), tex: self.base_tex.clone(), xf: self.gpu_xf(), key: self.base_gen as u64, img: b, ox: *ox, oy: *oy, z: *z, smooth: *smooth }),
+            _ => None,
+        };
+        let frame = crate::gpu::Frame {
+            hq: self.gpu_hq,
+            ui: &buf,
+            w,
+            h,
+            image,
+            bg: self.cfg.bg_color,
+            bg_alpha,
+            checker: self.cfg.transparent_grid,
+            radii: [crate::chrome::GLASS_BLUR * sf, crate::ui::CARD_BLUR * sf / 3.0, 12.0 * sf],
+            slide_old: self.gpu_slide,
+            motion: if self.gpu_slide.is_some() { self.gpu_motion } else { 0.0 },
+            settle: self.gpu_settle,
+            rows,
+        };
+        crate::trace("scan end");
+        let used = self.base_tex.as_ref().map(|t| t.bytes).unwrap_or(0);
+        let focused = self.window.as_ref().is_some_and(|w| w.has_focus());
+        let budget = crate::config::cache_mb() << 20;
+        if let Some(g) = &mut self.gpu {
+            g.note_use(used, focused, budget);
+        }
+        // a panic here would abort the whole app (it runs inside AppKit's callbacks): catch
+        // it, and let this window carry on with the processor
+        let res = self.gpu.as_mut().map(|g| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.render(&frame))).unwrap_or_else(|_| {
+                crate::trace("gpu: frame panicked; processor drawing for this window");
+                Err(crate::gpu::Fail::Lost)
+            })
+        });
+        drop(frame);
+        self.gpu_buf = buf;
+        match res {
+            Some(Ok(())) => {
+                self.unpainted = None;
+                crate::trace("present");
+            }
+            Some(Err(crate::gpu::Fail::Skip)) | None => {}
+            // the same state the covered check reads: covered now, not at the next check
+            // half a second later (meanwhile the repaint failsafe asked again 4 times a
+            // second, and 100 covered windows drew 100 frames a second at idle)
+            Some(Err(crate::gpu::Fail::Occluded)) => self.set_covered(true),
+            Some(Err(crate::gpu::Fail::Lost)) => {
+                // the GPU is gone: this window carries on with the processor
+                crate::trace("gpu lost: processor drawing");
+                self.cpu_surface();
+                self.request_redraw();
+            }
+        }
+        self.update_title();
+    }
+
     fn render(&mut self) {
         let Some(win) = self.window.clone() else { return };
         let sz = win.inner_size();
         let (w, h) = (sz.width.max(1), sz.height.max(1));
+        // Settings > Image Processing > Use GPU acceleration: switch this window's path
+        if self.gpu_wanted() != self.gpu_cfg {
+            self.gpu_cfg = self.gpu_wanted();
+            if self.gpu_cfg {
+                if let Some(g) = crate::gpu::GpuWin::new(win.clone()) {
+                    self.gpu = Some(g);
+                    crate::gpu::DECODE_TO_GPU.store(true, Ordering::Relaxed);
+                    self.surface = None;
+                    self._context = None;
+                    self.base = None;
+                }
+            } else if self.gpu.is_some() {
+                self.cpu_surface();
+            }
+        }
+        if self.gpu.is_some() {
+            if self.occluded {
+                // nothing to show; the uncovering redraws
+                return;
+            }
+            self.render_gpu(w, h);
+            return;
+        }
         let Some(mut surface) = self.surface.take() else { return };
         if surface.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap()).is_ok() {
             if let Ok(mut buf) = surface.buffer_mut() {
@@ -1860,7 +2439,11 @@ impl App {
             }
             return;
         }
-        if self.glass_loaded {
+        let on_gpu = self.gpu.is_some();
+        if on_gpu {
+            // everything starts as a hole: the GPU draws background and image under it
+            c.fill(crate::render::HOLE);
+        } else if self.glass_loaded {
             crate::render::GLASS_BG.store(self.cfg.bg_color, std::sync::atomic::Ordering::Relaxed);
             c.fill(GLASS_MARK | 0xFF_FFFF);
         } else {
@@ -1890,13 +2473,67 @@ impl App {
                     let w = c.w as f64;
                     let d = s.dir as f64;
                     slide_at = Some((d * w * (1.0 - e), (-d * w * e).round() as i64));
+                    // GPU motion blur: the distance moved over one frame (the ease's speed,
+                    // 3 (1 - t)^2, times the frame time), smeared over half of it each way
+                    // of the frame's position, so a fast start blurs and the landing is sharp
+                    // a first frame has no previous one: count one 60 Hz frame (measured: an
+                    // old timestamp gave a 349 px smear on the first frame)
+                    let since = self.slide_drawn.elapsed().as_secs_f64();
+                    let frame_ms = if since > 0.05 { 16.7 } else { since.max(0.004) * 1000.0 };
+                    let per_frame = w * 3.0 * (1.0 - t).powi(2) * frame_ms / self.cfg.slide_ms as f64;
+                    self.gpu_motion = (per_frame * 0.5 * 0.5) as f32;
                 }
             }
         }
         if let (Some((_, dx_old)), Some(s)) = (slide_at, &self.slide) {
-            shift_rows(c, &s.old, dx_old);
+            if on_gpu {
+                self.gpu_slide = Some(dx_old as f64);
+            } else {
+                shift_rows(c, &s.old, dx_old);
+            }
         }
-        if let Some(l) = self.compute_layout(c.w as f64, c.h as f64) {
+        if let Some(l) = self.compute_layout(c.w as f64, c.h as f64).filter(|_| on_gpu) {
+            // the GPU draws the image; slides and pinch zoom move it there
+            let dx_new = slide_at.map(|s| s.0).unwrap_or(0.0);
+            let smooth = self.pinch_at.is_some() || self.preset().smooth();
+            self.gpu_img = Some((l.ox + dx_new, l.oy, l.z, smooth));
+            // settled: the full-quality shrink (and sharpening), as the processor does it
+            let preset = self.preset();
+            let up_sharp = preset.amount > 0 && preset.smooth() && l.z <= 4.0 && l.sw * l.sh <= 40e6;
+            // a playing animation draws its frames from their mipmaps: the full-quality
+            // shrink for every frame cost 38% CPU on a 30 fps Lottie
+            let playing = self.next_frame_at.is_some();
+            if slide_at.is_none() && self.pinch_at.is_none() && !playing && (l.z < 0.999 || (l.z > 1.001 && up_sharp)) {
+                let (sw, sh) = ((l.sw.round() as u32).max(1), (l.sh.round() as u32).max(1));
+                let fp = preset.fingerprint(self.cfg.interp);
+                let xf = self.gpu_xf();
+                let xk = xf.rot as u64 | (xf.flip_h as u64) << 2 | (xf.flip_v as u64) << 3 | (xf.negative as u64) << 4 | (xf.gamma as u64) << 5;
+                let key = (self.base_gen as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (sw as u64) << 40 ^ (sh as u64) << 20 ^ fp.rotate_left(7) ^ xk << 58;
+                self.gpu_hq = Some(crate::gpu::Hq {
+                    key,
+                    w: sw,
+                    h: sh,
+                    kernel: preset.resize_code(self.cfg.interp),
+                    amount: preset.amount as f32 / 100.0,
+                    sigma: preset.radius as f32 / 100.0,
+                    threshold: preset.threshold,
+                    x: l.ox.round() as i64,
+                    y: l.oy.round() as i64,
+                    xf,
+                });
+            }
+            if slide_at.is_some() {
+                self.slide_drawn = Instant::now();
+            }
+            let key = (self.base_gen as u64, l.ox.to_bits(), l.oy.to_bits(), l.z.to_bits(), c.w, c.h);
+            if self.cfg.slide_ms > 0 && ready && self.pinch_at.is_none() && slide_at.is_none() && self.last_key != Some(key) {
+                // the GPU keeps the settled layer; this only marks that one exists
+                self.gpu_settle = true;
+                self.last_frame.clear();
+                self.last_frame.push(0);
+                self.last_key = Some(key);
+            }
+        } else if let Some(l) = self.compute_layout(c.w as f64, c.h as f64) {
             let base = self.base.clone().unwrap();
             let preset = self.preset();
             if let Some((dx_new, _)) = slide_at {
@@ -2002,6 +2639,30 @@ impl App {
         self.fade_active = self.fade.0 != goal(target.0) || self.fade.1 != goal(target.1);
         // Further fade frames come from about_to_wait, paced at 60 per second.
         let (show_top, show_bottom) = (self.fade.0 > 0.0, self.fade.1 > 0.0);
+        // macOS: the green button, the Window menu and Esc enter and leave full screen
+        // without the app; follow the window's own flag
+        #[cfg(target_os = "macos")]
+        if let Some(w) = self.window.clone() {
+            let fs = crate::mac::is_fullscreen(&w);
+            if self.fs_native != Some(fs) {
+                self.fs_native = Some(fs);
+                self.fullscreen = fs;
+                self.fs_was_max = false;
+                self.lights_on = None;
+                crate::mac::fullscreen_titlebar(&w, fs);
+                let want = self.glass_want;
+                self.set_glass(want, false);
+            }
+        }
+        // macOS: the real traffic lights come and go with the top chrome
+        #[cfg(target_os = "macos")]
+        if let Some(w) = &self.window {
+            let on = self.fade.0 > 0.5 || self.fullscreen;
+            if self.lights_on != Some(on) {
+                self.lights_on = Some(on);
+                crate::mac::traffic_lights(w, on);
+            }
+        }
         if let Some((title, secs)) = &info {
             // under the top chrome when that is visible
             let y = if target.0 { chrome::top_zone(sf) + margin } else { margin };
@@ -2056,6 +2717,12 @@ impl App {
                 self.hover_fx.push((h, 0.0));
             }
         }
+        // Test hook: ARKIMAGE_TEST_HOVER=<control id> keeps that control hovered.
+        if let Some(id) = std::env::var("ARKIMAGE_TEST_HOVER").ok().map(|v| &*Box::leak(v.into_boxed_str())) {
+            if self.hover.is_none() {
+                self.hover = Some(id);
+            }
+        }
         let hov = self.hover;
         for (k, a) in &mut self.hover_fx {
             let to = if Some(*k) == hov { 1.0 } else { 0.0 };
@@ -2093,7 +2760,7 @@ impl App {
             title: &title,
             show_top,
             show_bottom,
-            maximized: self.window.as_ref().map(|w| w.is_maximized()).unwrap_or(false),
+            maximized: self.window.as_ref().map(|w| is_maximized(&w)).unwrap_or(false),
             lock_bottom: self.cfg.lock_bottom,
             hover_fx: &hover_fx,
             tip_fx: &tip_fx,
@@ -2158,8 +2825,6 @@ impl App {
                     w.set_minimized(true);
                 }
             }
-            "next1" => self.step(1, true),
-            "prev1" => self.step(-1, true),
             "scroll_up" => self.scroll(-1.0),
             "scroll_down" => self.scroll(1.0),
             "scroll_left" | "scroll_right" => {
@@ -2170,7 +2835,11 @@ impl App {
             }
             "context" => {
                 let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
+                // a menu at the cursor never takes a button's placement
+                self.popup_select = None;
+                self.at_pointer = true;
                 self.show_menu(el, "context", x, y);
+                self.at_pointer = false;
             }
             other => self.menu_action(el, other),
         }
@@ -2286,8 +2955,6 @@ impl App {
                 self.view.rotation = 0;
                 self.rotate(0);
             }
-            K::ArrowRight if sh => self.step(1, true),
-            K::ArrowLeft if sh => self.step(-1, true),
             K::ArrowRight | K::Space => self.next(),
             K::ArrowLeft | K::Backspace => self.prev(),
             K::PageDown if p && alt => self.random(),
@@ -2355,21 +3022,9 @@ impl App {
                 self.msg(if self.view.zoom_fixed { "Fix zoom in/out: On" } else { "Fix zoom in/out: Off" });
             }
 
-            K::Digit0 | K::Numpad0 if p => self.set_slideshow(0),
-            K::Digit1 if p => self.set_slideshow(1),
-            K::Digit2 if p => self.set_slideshow(2),
-            K::Digit3 if p => self.set_slideshow(3),
-            K::Digit4 if p => self.set_slideshow(4),
-            K::Digit5 if p => self.set_slideshow(5),
-            K::Digit6 if p => self.set_slideshow(6),
-            K::Digit7 if p => self.set_slideshow(7),
-            K::Digit8 if p => self.set_slideshow(8),
-            K::Digit9 if p => self.set_slideshow(9),
             K::Digit0 | K::Numpad0 => self.set_mode(0),
             K::Digit9 | K::Numpad9 => self.set_mode(1),
             K::Digit8 | K::Numpad8 => self.set_mode(2),
-            K::Digit7 | K::Numpad7 => self.set_double(1),
-            K::Digit6 | K::Numpad6 => self.set_double(2),
 
             K::Tab if sh => {
                 self.show_name = !self.show_name;
@@ -2400,9 +3055,6 @@ impl App {
                 }
                 self.msg(if self.on_top { "Always On Top: On" } else { "Always On Top: Off" });
             }
-            K::KeyB if sh => self.open_last_bookmark(),
-            K::KeyB => self.add_bookmark(),
-            K::F3 => self.edit_bookmarks(),
             // ` locks the top menu, ~ (Shift+`) locks the bottom control bar, as in Honeyview.
             K::Backquote if sh => {
                 self.cfg.lock_bottom = !self.cfg.lock_bottom;
@@ -2455,6 +3107,8 @@ impl App {
         let empty = self.playlist.is_none();
         let menu_open = false;
         let top = self.cfg.lock_top || empty || menu_open || (self.cursor_in && y < chrome::top_zone(sf));
+        // macOS full screen: the system's own title bar slides down at the top edge
+        let top = top && !(cfg!(target_os = "macos") && self.fullscreen);
         let anim = self.anim_frames().is_some();
         let bottom = self.cfg.lock_bottom || empty || self.slider_drag || self.anim_drag || (self.cursor_in && y > ch - chrome::bottom_zone(sf, anim));
         (top, bottom)
@@ -2477,7 +3131,7 @@ impl App {
 
     fn resize_edge(&self) -> Option<ResizeDirection> {
         let w = self.window.as_ref()?;
-        if self.fullscreen || w.is_maximized() {
+        if self.fullscreen || is_maximized(&w) {
             return None;
         }
         let sz = w.inner_size();
@@ -2581,12 +3235,11 @@ impl App {
                 self.request_redraw();
             }
             "tb_view" | "tb_edit" | "tb_copyto" | "bar_menu" => {
-                // Opens above the button, bottom edge 4 px above it. The main menu left-aligns
-                // with the button's left edge, the others right-align with its right edge.
+                // above the button: the main menu left-aligned with the button's left edge,
+                // the others right-aligned with its right edge (mac::popup_over)
                 let kind = if h.id == "bar_menu" { "context" } else { &h.id[3..] };
-                let (x, edge) = if h.id == "bar_menu" { (h.x0, MenuEdge::Left) } else { (h.x1, MenuEdge::Right) };
-                let y = h.y0 - 4.0 * self.sf();
-                self.show_menu_above(el, kind, x, y, edge, 0.0);
+                self.popup_select = Some(((h.x1 - h.x0) as f64, h.id == "bar_menu"));
+                self.show_menu(el, kind, h.x0, h.y0);
             }
             "bar_open" => self.open_dialog(),
             "bar_grid" => self.open_picker(),
@@ -2597,10 +3250,10 @@ impl App {
                 self.slider_drag = true;
                 self.slider_seek();
             }
-            // right-aligned above the pill, at least as wide as the pill
             "anim_speed" => {
-                let y = h.y0 - 4.0 * self.sf();
-                self.show_menu_above(el, "speed", h.x1, y, MenuEdge::Right, h.x1 - h.x0);
+                // above the pill, at least as wide, right-aligned
+                self.popup_select = Some(((h.x1 - h.x0) as f64, false));
+                self.show_menu(el, "speed", h.x0, h.y0)
             }
             "anim_slider" => {
                 self.anim_drag = true;
@@ -2628,8 +3281,6 @@ impl App {
                 C("mode0".into(), "Original Size (100%)".into(), "0", cfg.view_mode == 0),
                 C("mode1".into(), "Fit in Window".into(), "9", cfg.view_mode == 1),
                 C("mode2".into(), "Fit to Width".into(), "8", cfg.view_mode == 2),
-                C("dbl1".into(), "Smart Double Page (Left->Right)".into(), "7", cfg.double == 1),
-                C("dbl2".into(), "Smart Double Page (Left<-Right)".into(), "6", cfg.double == 2),
             ]
         };
         match kind {
@@ -2641,39 +3292,6 @@ impl App {
                     C(format!("spd:{q}"), format!("{}\u{d7}", chrome::fmt_speed(v)), "", (self.anim_speed - v).abs() < 0.01)
                 })
                 .collect(),
-            "slideshow" => {
-                let cur = self.slideshow.map(|s| s.0).unwrap_or(0);
-                let mut m = vec![C("ss:0".into(), "Stop Slideshow".into(), "Ctrl+0", cur == 0), S];
-                for s in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 60, 90] {
-                    let label = if s == 1 { "1 Second".to_string() } else { format!("{s} Seconds") };
-                    let key = if s < 10 { ["", "Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6", "Ctrl+7", "Ctrl+8", "Ctrl+9"][s as usize] } else { "" };
-                    m.push(C(format!("ss:{s}"), label, key, cur == s));
-                }
-                m.extend([S, C("ssloop".into(), "Repeat".into(), "", cfg.slideshow_loop), C("ssrand".into(), "Random".into(), "", cfg.slideshow_random)]);
-                m
-            }
-            "bookmark" => {
-                self.bm_cache = std::fs::read_to_string(Self::bookmarks_path())
-                    .unwrap_or_default()
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(String::from)
-                    .collect();
-                let mut m = vec![
-                    I("bmadd".into(), "Add to Bookmarks".into(), "B", has),
-                    I("bmdel".into(), "Delete All Bookmarks".into(), "", !self.bm_cache.is_empty()),
-                    I("bmedit".into(), "Edit Bookmarks".into(), "F3", true),
-                ];
-                if !self.bm_cache.is_empty() {
-                    m.push(S);
-                    let start = self.bm_cache.len().saturating_sub(30);
-                    for i in (start..self.bm_cache.len()).rev() {
-                        m.push(I(format!("bm:{i}"), self.bm_cache[i].replace('&', "&&"), "", true));
-                    }
-                }
-                m
-            }
             "edit" => vec![
                 I("clip".into(), "Copy to Clipboard".into(), "Ctrl+C", has),
                 I("editor".into(), "Open with Image Editor".into(), "Ctrl+E", has),
@@ -2768,40 +3386,6 @@ impl App {
         }
     }
 
-    /// A bar menu: bottom edge on (x, y) physical px, `edge` of the menu at x, at least
-    /// `min_w` physical px wide. Windows builds its own popup (muda opens only below);
-    /// macOS uses muda here and aligns in its own build.
-    fn show_menu_above(&mut self, el: &ActiveEventLoop, kind: &str, x: f32, y: f32, edge: MenuEdge, min_w: f32) {
-        #[cfg(windows)]
-        {
-            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if self.popup_closed.as_ref().is_some_and(|(t, o, _)| o == kind && t.elapsed() < Duration::from_millis(300)) {
-                return;
-            }
-            let items = self.menu_items(kind);
-            let Some(w) = self.window.clone() else { return };
-            let Ok(h) = w.window_handle() else { return };
-            let RawWindowHandle::Win32(h) = h.as_raw() else { return };
-            // menu text is 9 pt Segoe UI; a figure space is about 7 px at 100%, and the
-            // check column and margins take about 64 px
-            let sf = self.sf();
-            let min_chars = if min_w > 0.0 { ((min_w / sf - 64.0) / 7.0).ceil().max(0.0) as usize } else { 0 };
-            let e = if edge == MenuEdge::Left { crate::popup_win::Edge::Left } else { crate::popup_win::Edge::Right };
-            crate::trace(&format!("menu {kind} above x={x} y={y} edge={edge:?} min_w={min_w} chars={min_chars}"));
-            let chosen = crate::popup_win::show_above(h.hwnd.get(), items, x as i32, y as i32, e, min_chars);
-            self.popup_closed = Some((Instant::now(), kind.to_string(), false));
-            if let Some(id) = chosen {
-                self.menu_action(el, &id);
-            }
-            self.request_redraw();
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (edge, min_w);
-            self.show_menu(el, kind, x, y);
-        }
-    }
-
     fn show_menu(&mut self, el: &ActiveEventLoop, kind: &str, x: f32, y: f32) {
         let items = self.menu_items(kind);
         let Some(w) = self.window.clone() else { return };
@@ -2820,38 +3404,46 @@ impl App {
     /// closes rather than reopens.
     fn popup(&mut self, el: &ActiveEventLoop, w: &Arc<Window>, items: Vec<MenuEntry>, x: f32, y: f32, opener: &str) {
         if self.popup_closed.as_ref().is_some_and(|(t, o, _)| o == opener && t.elapsed() < Duration::from_millis(300)) {
+            // a dropped opener must not leave its placement for the next menu, or a later
+            // right-click opens above and beside the cursor as if over the button
+            self.popup_select = None;
+            self.below_w = None;
             return;
         }
         self.popup_show(el, w, items, x, y);
         self.popup_closed = Some((Instant::now(), opener.to_string(), false));
     }
 
-    /// A settings field's menu: top edge 2 px under the field, right edge on the field's
-    /// right edge (x, y: the field's bottom-right, physical px).
-    fn popup_field(&mut self, el: &ActiveEventLoop, w: &Arc<Window>, items: Vec<MenuEntry>, x: f32, y: f32, opener: &str) {
-        #[cfg(windows)]
-        {
-            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if self.popup_closed.as_ref().is_some_and(|(t, o, _)| o == opener && t.elapsed() < Duration::from_millis(300)) {
-                return;
-            }
-            let Ok(h) = w.window_handle() else { return };
-            let RawWindowHandle::Win32(h) = h.as_raw() else { return };
-            let gap = (2.0 * w.scale_factor() as f32).round();
-            let chosen = crate::popup_win::show_below(h.hwnd.get(), items, x as i32, (y + gap) as i32, crate::popup_win::Edge::Right);
-            self.popup_closed = Some((Instant::now(), opener.to_string(), false));
-            if let Some(id) = chosen {
-                self.menu_action(el, &id);
-            }
-            self.request_redraw();
-        }
-        #[cfg(not(windows))]
-        self.popup(el, w, items, x, y, opener);
-    }
-
     fn popup_show(&mut self, el: &ActiveEventLoop, w: &Arc<Window>, items: Vec<MenuEntry>, x: f32, y: f32) {
         use muda::ContextMenu;
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        // Windows: native dark Win32 menus (popup_win). Bar menus open above the button,
+        // 4 px over it; a settings dropdown opens 2 px under the field, right edges aligned.
+        #[cfg(windows)]
+        if let Ok(h) = w.window_handle() {
+            if let RawWindowHandle::Win32(h) = h.as_raw() {
+                use crate::popup_win::{show_above, show_below, Edge};
+                let hwnd = h.hwnd.get();
+                let sf = w.scale_factor() as f32;
+                let chosen = if let Some((pw, left)) = self.popup_select.take() {
+                    let pw = pw as f32;
+                    let (ax, edge) = if left { (x, Edge::Left) } else { (x + pw, Edge::Right) };
+                    // menu text is 9 pt Segoe UI: a figure space is about 7 px at 100%, and the
+                    // check column and margins take about 64 px; the main menu needs no minimum
+                    let min_chars = if left { 0 } else { ((pw / sf - 64.0) / 7.0).ceil().max(0.0) as usize };
+                    show_above(hwnd, items, ax as i32, (y - 4.0 * sf).round() as i32, edge, min_chars)
+                } else if let Some(bw) = self.below_w.take() {
+                    show_below(hwnd, items, (x + bw as f32) as i32, (y + (2.0 * sf).round()) as i32, Edge::Right)
+                } else {
+                    show_below(hwnd, items, x as i32, y as i32, Edge::Left)
+                };
+                if let Some(id) = chosen {
+                    self.menu_action(el, &id);
+                }
+                self.request_redraw();
+                return;
+            }
+        }
         let menu = muda::Menu::new();
         for b in build_menu(items) {
             let _ = menu.append(b.as_ref());
@@ -2865,7 +3457,20 @@ impl App {
                 },
                 #[cfg(target_os = "macos")]
                 RawWindowHandle::AppKit(h) => unsafe {
-                    menu.show_context_menu_for_nsview(h.ns_view.as_ptr() as _, Some(pos));
+                    match self.popup_select.take() {
+                        // a pop-up button: the chosen item opens over the control
+                        Some((pw, left)) => crate::mac::popup_over(menu.ns_menu(), h.ns_view.as_ptr() as _, x as f64 / w.scale_factor(), y as f64 / w.scale_factor(), pw / w.scale_factor(), left),
+                        None if self.below_w.is_some() => {
+                            let bw = self.below_w.take().unwrap_or(0.0);
+                            let sf = w.scale_factor();
+                            crate::mac::menu_below(menu.ns_menu(), h.ns_view.as_ptr() as _, x as f64 / sf, y as f64 / sf, bw / sf);
+                        }
+                        None if self.at_pointer => crate::mac::context_menu_at_pointer(menu.ns_menu(), h.ns_view.as_ptr() as _),
+                        None => {
+                            let _ = pos;
+                            crate::mac::menu_below(menu.ns_menu(), h.ns_view.as_ptr() as _, x as f64 / w.scale_factor(), y as f64 / w.scale_factor(), 0.0);
+                        }
+                    }
                 },
                 _ => {}
             }
@@ -2879,6 +3484,13 @@ impl App {
     /// For the ARKIMAGE_TEST_SETTINGS hook.
     pub fn test_open_settings(&mut self, el: &ActiveEventLoop) {
         self.open_settings(el, 0);
+    }
+
+    /// For the ARKIMAGE_TEST_CHOICE hook: open the first dropdown in Settings.
+    pub fn test_choice(&mut self, el: &ActiveEventLoop) {
+        if let Some(a) = self.settings.as_ref().and_then(|s| s.first_choice()) {
+            self.settings_act(el, a);
+        }
     }
 
     fn open_settings(&mut self, el: &ActiveEventLoop, tab: usize) {
@@ -3162,7 +3774,10 @@ impl App {
             Act::Swatch(c) => self.cfg.bg_color = c,
             Act::Clear(f) => f.set(&mut self.cfg, String::new()),
             Act::Choice(f) => {
-                let Some((x, y, w)) = self.settings.as_ref().and_then(|s| s.anchor(a).map(|(x, y)| (x, y, s.window.clone()))) else { return };
+                let Some((x, y, w)) = self.settings.as_ref().and_then(|s| s.anchor(a).map(|(x, y, bw)| (x, y, bw, s.window.clone()))).map(|(x, y, bw, w)| {
+                    self.below_w = Some(bw as f64);
+                    (x, y, w)
+                }) else { return };
                 let cur = f.get(&self.cfg);
                 let items = f
                     .options(&self.cfg)
@@ -3171,7 +3786,7 @@ impl App {
                     .map(|(i, o)| MenuEntry::Check(format!("cfgopt:{i}"), o.to_string(), "", i as u8 == cur))
                     .collect();
                 self.pending_choice = Some(f);
-                self.popup_field(el, &w, items, x, y, &format!("{a:?}"));
+                self.popup(el, &w, items, x, y, &format!("{a:?}"));
                 self.settings_redraw();
                 return;
             }
@@ -3199,7 +3814,10 @@ impl App {
             }
             Act::KeyAction(i) | Act::MouseAction(i) => {
                 let key = matches!(a, Act::KeyAction(_));
-                let Some((x, y, w)) = self.settings.as_ref().and_then(|s| s.anchor(a).map(|(x, y)| (x, y, s.window.clone()))) else { return };
+                let Some((x, y, w)) = self.settings.as_ref().and_then(|s| s.anchor(a).map(|(x, y, bw)| (x, y, bw, s.window.clone()))).map(|(x, y, bw, w)| {
+                    self.below_w = Some(bw as f64);
+                    (x, y, w)
+                }) else { return };
                 let cur = if key { &self.cfg.keys[i].action } else { &self.cfg.mouse[i].action };
                 let cur = crate::bindings::index(cur);
                 let items = crate::bindings::ACTIONS
@@ -3208,7 +3826,7 @@ impl App {
                     .map(|(k, (_, lbl))| MenuEntry::Check(format!("bindopt:{k}"), lbl.to_string(), "", k == cur))
                     .collect();
                 self.pending_bind = Some((key, i));
-                self.popup_field(el, &w, items, x, y, &format!("{a:?}"));
+                self.popup(el, &w, items, x, y, &format!("{a:?}"));
                 self.settings_redraw();
                 return;
             }
@@ -3303,6 +3921,12 @@ impl App {
                 self.settings_redraw();
                 return;
             }
+            Act::MakeDefault => {
+                #[cfg(target_os = "macos")]
+                crate::mac::spawn_make_default(self.proxy.clone());
+                self.settings_redraw();
+                return;
+            }
             Act::Install => {
                 if let Some(s) = &mut self.settings {
                     s.card = Some(crate::install::Card::Install(crate::install::is_installed()));
@@ -3344,13 +3968,9 @@ impl App {
         if c.sort != before.sort || c.sort_desc != before.sort_desc {
             self.resort();
         }
-        if c.view_mode != before.view_mode || c.stretch_small != before.stretch_small || c.double != before.double || c.align_top != before.align_top {
+        if c.view_mode != before.view_mode || c.stretch_small != before.stretch_small || c.align_top != before.align_top {
             self.view.user_zoom = None;
             self.view.pan_reset = true;
-            if c.double != 0 {
-                self.next_frame_at = None;
-                self.preload();
-            }
         }
         // live preview: redraw the viewer with the changed filter preset
         // (the scaled-image key holds the preset's fingerprint, so a redraw re-filters)
@@ -3359,15 +3979,6 @@ impl App {
         }
         if c.thumb_cache_mb != before.thumb_cache_mb {
             self.thumb_jobs.disk.store(c.thumb_cache_mb > 0, Ordering::Relaxed);
-        }
-        if c.cache_mb != before.cache_mb {
-
-        }
-        if let Some((secs, t)) = self.slideshow {
-            if c.slideshow_secs != before.slideshow_secs {
-                let _ = (secs, t);
-                self.slideshow = Some((c.slideshow_secs, Instant::now() + Duration::from_secs(c.slideshow_secs as u64)));
-            }
         }
         self.invalidate();
         self.settings_redraw();
@@ -3460,16 +4071,6 @@ impl App {
             self.cfg.save();
             return;
         }
-        if let Some(n) = id.strip_prefix("ss:") {
-            self.set_slideshow(n.parse().unwrap_or(0));
-            return;
-        }
-        if let Some(n) = id.strip_prefix("bm:") {
-            if let Some(line) = n.parse::<usize>().ok().and_then(|i| self.bm_cache.get(i).cloned()) {
-                self.open_bookmark_line(&line);
-            }
-            return;
-        }
         match id {
             "open" => self.open_dialog(),
             "open_folder" => self.open_folder_dialog(),
@@ -3537,8 +4138,6 @@ impl App {
             "mode0" => self.set_mode(0),
             "mode1" => self.set_mode(1),
             "mode2" => self.set_mode(2),
-            "dbl1" => self.set_double(1),
-            "dbl2" => self.set_double(2),
             "zin" => self.zoom_step(true, None),
             "zout" => self.zoom_step(false, None),
             "zfix" => self.view.zoom_fixed = !self.view.zoom_fixed,
@@ -3567,15 +4166,6 @@ impl App {
             }
             "editor" => self.open_editor(),
             "clip" => self.copy_image(),
-            "ssloop" => self.cfg.slideshow_loop = !self.cfg.slideshow_loop,
-            "ssrand" => self.cfg.slideshow_random = !self.cfg.slideshow_random,
-            "bmadd" => self.add_bookmark(),
-            "bmedit" => self.edit_bookmarks(),
-            "bmdel" => {
-                if crate::dialog::ask(self.window.as_deref(), "ArkImage", "Do you want to delete all the saved bookmarks?", crate::dialog::Kind::Warn) {
-                    let _ = std::fs::write(Self::bookmarks_path(), "");
-                }
-            }
             "config" => self.open_settings(el, 0),
             "exit" => self.exit(el),
             "closeall" => {
@@ -3697,7 +4287,7 @@ impl App {
         if self.fullscreen || w.is_minimized() == Some(true) {
             return;
         }
-        let max = w.is_maximized();
+        let max = is_maximized(&w);
         self.was_max = max;
         if !max {
             if let Ok(p) = w.outer_position() {
@@ -3732,8 +4322,8 @@ impl App {
 
     /// Frame count of the current image when it animates and plays; None otherwise.
     fn anim_frames(&self) -> Option<usize> {
-        let n = self.current.as_ref()?.1.frames.len();
-        (n > 1 && self.cfg.double == 0).then_some(n)
+        let n = self.current.as_ref()?.1.frame_count();
+        (n > 1).then_some(n)
     }
 
     /// Scrub: show the frame under the cursor and hold it while the button is down.
@@ -3773,7 +4363,7 @@ impl App {
     /// Frames per second shown in the speed pill: the current frame's rate at this speed.
     fn anim_fps(&self) -> u32 {
         let Some((_, d)) = &self.current else { return 0 };
-        let ms = self.frame_ms(d.frames[self.frame_idx.min(d.frames.len().saturating_sub(1))].delay_ms);
+        let ms = self.frame_ms(d.frame_delay(self.frame_idx));
         (1000.0 / ms as f32).round() as u32
     }
 
@@ -3782,7 +4372,7 @@ impl App {
         // re-time the frame on screen from now, so a slower speed takes effect at once
         if self.next_frame_at.is_some() {
             if let Some(d) = self.current.as_ref().map(|c| c.1.clone()) {
-                let ms = self.frame_ms(d.frames[self.frame_idx.min(d.frames.len() - 1)].delay_ms);
+                let ms = self.frame_ms(d.frame_delay(self.frame_idx));
                 self.next_frame_at = Some(Instant::now() + Duration::from_millis(ms));
             }
         }
@@ -3791,13 +4381,13 @@ impl App {
 
     fn advance_frame(&mut self, now: Instant) {
         let Some(d) = self.current.as_ref().map(|c| c.1.clone()) else { return };
-        let n = d.frames.len();
-        if n < 2 || self.cfg.double != 0 {
+        let n = d.frame_count();
+        if n < 2 {
             self.next_frame_at = None;
             return;
         }
         self.frame_idx = (self.frame_idx + 1) % n;
-        let delay = self.frame_ms(d.frames[self.frame_idx].delay_ms);
+        let delay = self.frame_ms(d.frame_delay(self.frame_idx));
         // Keep cadence; do not fall behind after a slow frame.
         let mut next = self.next_frame_at.unwrap_or(now) + Duration::from_millis(delay);
         if next < now {
@@ -3805,7 +4395,10 @@ impl App {
         }
         self.next_frame_at = Some(next);
         self.base = None;
-        self.request_redraw();
+        // only the frame changed: the animation row can be redrawn alone (ui_dirty stays)
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 }
 
@@ -3832,6 +4425,20 @@ impl App {
             // large icon (taskbar, Alt+Tab); with_window_icon sets only the small one
             use winit::platform::windows::WindowAttributesExtWindows;
             attrs = attrs.with_taskbar_icon(crate::icon::window_icon());
+        }
+        // macOS: a titled, resizable window with its title bar hidden and the content drawn
+        // beneath it, not a borderless one. It keeps native corners, shadow and resize edges,
+        // and winit can read the zoomed state directly: for a borderless window it adds a title
+        // bar for a moment, which moved the window 32 pt, sent Moved, and looped forever.
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs
+                .with_decorations(true)
+                .with_titlebar_transparent(true)
+                .with_title_hidden(true)
+                .with_fullsize_content_view(true)
+                .with_titlebar_buttons_hidden(true);
         }
         // Reopen where the window was closed: same monitor, size, position, maximized state.
         // A second window opens 32 px down and right of the newest one, not maximized.
@@ -3860,11 +4467,15 @@ impl App {
             win.set_maximized(true);
         }
         crate::trace("window created");
-        let ctx = softbuffer::Context::new(win.clone()).expect("softbuffer context");
-        let surface = softbuffer::Surface::new(&ctx, win.clone()).expect("softbuffer surface");
+        self.gpu_cfg = self.gpu_wanted();
+        if self.gpu_cfg {
+            self.gpu = crate::gpu::GpuWin::new(win.clone());
+            crate::gpu::DECODE_TO_GPU.store(self.gpu.is_some(), Ordering::Relaxed);
+        }
         self.window = Some(win);
-        self._context = Some(ctx);
-        self.surface = Some(surface);
+        if self.gpu.is_none() {
+            self.cpu_surface();
+        }
         if let Some(p) = self.pending_open.take() {
             self.open_path(&p);
         }
@@ -3883,14 +4494,12 @@ impl App {
             self.render();
             cloak(&w, false);
         }
-        // full screen: a crash restore uses the window's own state; a first window
-        // reopens in full screen if it was closed in it (a cascaded window never does)
-        let fs = match &exact {
-            Some(s) => s.fs,
-            None => cascade.is_none() && self.cfg.win_fs,
-        };
-        if fs {
-            self.toggle_fullscreen();
+        // full screen: a crash restore uses the window's own state; a normal start (not a
+        // cascaded second window) reopens in full screen if it was closed so
+        if exact.as_ref().map(|s| s.fs).unwrap_or(cascade.is_none() && self.cfg.win_fs) {
+            // asked while the window is still appearing, macOS enters full screen and
+            // leaves it again within 2 s; so ask a moment after it is shown
+            self.fs_restore_at = Some(Instant::now() + Duration::from_millis(400));
         }
         self.request_redraw();
     }
@@ -3951,15 +4560,51 @@ impl App {
             self.settings_event(el, ev);
             return;
         }
+        // zooming, panning, clicking or typing in a window that kept only its screen-sized
+        // copy brings the full image back (a scroll or pinch reaches a window without
+        // focusing it on the Mac)
+        if self.stripped
+            && matches!(
+                ev,
+                WindowEvent::MouseWheel { .. } | WindowEvent::PinchGesture { .. } | WindowEvent::MouseInput { .. } | WindowEvent::KeyboardInput { .. }
+            )
+        {
+            self.unstrip();
+        }
         match ev {
             WindowEvent::CloseRequested => self.exit(el),
             WindowEvent::Moved(_) => self.track_geometry(),
+            // macOS: the notch band is a window of its own at menu-bar level; it must not
+            // stay over other apps
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.track_geometry();
                 self.scaled = None;
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => self.render(),
+            // covered or minimized: stop drawing and give the GPU memory back; uncovered:
+            // draw again (the image is uploaded anew)
+            // macOS: the event says "visible" for a window under one of ours (see
+            // is_occluded), and taking it as is flipped such windows between covered and
+            // uncovered, each flip a redraw and a new decode; the event asks again instead
+            #[cfg(target_os = "macos")]
+            WindowEvent::Occluded(o) => {
+                let c = o || self.window.as_ref().is_some_and(|w| crate::mac::is_occluded(w));
+                self.set_covered(c);
+            }
+            #[cfg(windows)]
+            WindowEvent::Occluded(o) => {
+                let c = o || self.window.as_ref().is_some_and(covered_now);
+                self.set_covered(c);
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            WindowEvent::Occluded(o) => self.set_covered(o),
+            WindowEvent::Focused(true) => {
+                self.unstrip();
+                // the focused window preloads its neighbours (GPU mode)
+                self.update_wanted();
+                self.preload();
+            }
             WindowEvent::DroppedFile(p) => self.open_path(&p),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             // A synthetic press is a key already held when the window gained focus; it was
@@ -4166,7 +4811,7 @@ impl App {
                         // resume playback from the frame let go on
                         self.anim_drag = false;
                         if let Some(d) = self.current.as_ref().map(|c| c.1.clone()) {
-                            let ms = self.frame_ms(d.frames[self.frame_idx.min(d.frames.len() - 1)].delay_ms);
+                            let ms = self.frame_ms(d.frame_delay(self.frame_idx));
                             self.next_frame_at = Some(Instant::now() + Duration::from_millis(ms));
                         }
                         self.request_redraw();
@@ -4290,19 +4935,89 @@ impl App {
         true
     }
 
-    /// Timers for this window (animation, slideshow, toast, fade); returns the next deadline.
+    /// Timers for this window (animation, toast, fade); returns the next deadline.
     pub fn about_to_wait(&mut self) -> Option<Instant> {
-        const REPAINT_RETRY: Duration = Duration::from_millis(250);
         let now = Instant::now();
+        // ask whether the window is covered, twice a second (winit reports only "visible"
+        // on macOS and only a minimize on Windows: stacked windows were never covered)
+        #[cfg(any(windows, target_os = "macos"))]
+        if self.gpu.is_some() && now >= self.occ_checked {
+            self.occ_checked = shared_tick(now, Duration::from_millis(500));
+            if let Some(w) = self.window.clone() {
+                let minimized = w.is_minimized() == Some(true);
+                self.set_covered(minimized || covered_now(&w));
+            }
+            // a window covered before its image arrived was not stripped then (see strip);
+            // still covered half a second on, it gives the full image back now
+            if self.occluded && !self.stripped && self.current.is_some() {
+                self.strip();
+            }
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        let occ_at = self.gpu.is_some().then_some(self.occ_checked);
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let occ_at: Option<Instant> = None;
+        // test hook: ARKIMAGE_TEST_PINCH_MS=<n> pinches from n ms after start: a zoom step
+        // every 8 ms for 1.5 s (in, then out), as trackpad events arrive
+        let mut pinch_hook_at = None;
+        if let Some(ms) = std::env::var("ARKIMAGE_TEST_PINCH_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+            let t0 = *T0.get_or_init(Instant::now);
+            let start = t0 + Duration::from_millis(ms);
+            let end = start + Duration::from_millis(1500);
+            if now >= start && now < end {
+                let mut last = LAST.lock().unwrap();
+                if last.is_none_or(|l| now.duration_since(l) >= Duration::from_millis(8)) {
+                    *last = Some(now);
+                    if let Some(l) = self.layout {
+                        let k = if now < start + Duration::from_millis(750) { 1.01 } else { 1.0 / 1.01 };
+                        self.pinch_at = Some(now);
+                        crate::trace("test: pinch step");
+                        let c = Some((l.ww / 2.0, l.wh / 2.0));
+                        self.zoom_to(l.z * k, c);
+                        self.request_redraw();
+                    }
+                }
+                pinch_hook_at = Some(now + Duration::from_millis(8));
+            } else if now < start {
+                pinch_hook_at = Some(start);
+            }
+        }
+        // test hook: ARKIMAGE_TEST_NEXT_MS=<n> steps to the next image n ms after start
+        let mut hook_at = None;
+        if let Some(ms) = std::env::var("ARKIMAGE_TEST_NEXT_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            if T0.get_or_init(Instant::now).elapsed().as_millis() as u64 >= ms && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // ARKIMAGE_TEST_XF="rot,fh,fv,neg,gamma" sets the view transform instead
+                if let Ok(x) = std::env::var("ARKIMAGE_TEST_XF") {
+                    let v: Vec<u8> = x.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                    if v.len() == 5 {
+                        self.view.rotation = v[0] % 4;
+                        self.view.flip_h = v[1] != 0;
+                        self.view.flip_v = v[2] != 0;
+                        self.view.negative = v[3] != 0;
+                        self.view.gamma = v[4] != 0;
+                        self.view.user_zoom = None;
+                        self.view.pan_reset = true;
+                        crate::trace("test: transform set");
+                        self.invalidate();
+                    }
+                    return hook_at;
+                }
+                crate::trace("test: next image");
+                self.step(1, false);
+            } else if !DONE.load(std::sync::atomic::Ordering::Relaxed) {
+                hook_at = Some(*T0.get().unwrap() + Duration::from_millis(ms));
+            }
+        }
+        if self.gpu.as_mut().is_some_and(|g| g.poll_budget()) {
+            self.strip();
+        }
         if let Some(t) = self.next_frame_at {
             if now >= t {
                 self.advance_frame(now);
-            }
-        }
-        if let Some((secs, t)) = self.slideshow {
-            if now >= t {
-                self.slideshow = Some((secs, now + Duration::from_secs(secs as u64)));
-                self.slideshow_tick();
             }
         }
         if let Some((_, t)) = &self.toast {
@@ -4314,7 +5029,7 @@ impl App {
         // a file deleted outside the app is noticed within GONE_EVERY
         let gone_at = self.playlist.is_some().then(|| self.gone_at);
         if gone_at.is_some_and(|t| now >= t) {
-            self.gone_at = now + GONE_EVERY;
+            self.gone_at = shared_tick(now, GONE_EVERY);
             self.check_gone();
         }
         let gone_at = self.playlist.is_some().then(|| self.gone_at);
@@ -4326,7 +5041,12 @@ impl App {
         }
         let pinch_end = self.pinch_at.map(|t| t + PINCH_SETTLE);
         // Chrome fade: one frame every 16 ms until it settles (unpaced it drew ~380 fps).
-        let fade_at = self.fade_active.then(|| self.fade_last + Duration::from_millis(16));
+        // A covered window draws nothing, so nothing it waits for here would settle: it
+        // asked again on every loop pass (44,811 times in 3 s with 100 windows), and the
+        // glass check below every 16 ms per window (the idle CPU of covered windows).
+        // Uncovering redraws it.
+        let live = !self.occluded;
+        let fade_at = (live && self.fade_active).then(|| self.fade_last + Duration::from_millis(16));
         if let Some(t) = fade_at {
             if now >= t {
                 self.request_redraw();
@@ -4340,7 +5060,7 @@ impl App {
             || self.modal_at.is_some_and(|t| t.elapsed() < Duration::from_millis(260))
             || self.glass_fading()
             || (!self.glass_on && self.glass_loaded);
-        let ui_at = fading.then(|| self.fade_last + Duration::from_millis(16));
+        let ui_at = (live && fading).then(|| self.fade_last + Duration::from_millis(16));
         if ui_at.is_some_and(|t| now >= t) {
             self.fade_last = now;
             self.request_redraw();
@@ -4350,18 +5070,26 @@ impl App {
         if slide_at.is_some_and(|t| now >= t) {
             self.request_redraw();
         }
-        // repaint failsafe: a stored image not yet presented is redrawn every REPAINT_RETRY
-        let hidden = self.window.as_ref().is_none_or(|w| w.is_visible() == Some(false) || w.is_minimized() == Some(true));
-        if hidden {
+        if self.fs_restore_at.is_some_and(|t| now >= t) {
+            self.fs_restore_at = None;
+            if !self.fullscreen {
+                self.toggle_fullscreen();
+            }
+        }
+        // failsafe: an image stored for display with no paint since; ask for the paint again
+        // a hidden or minimized window paints when shown, so it needs no retry
+        if self.occluded || self.window.as_ref().is_some_and(|w| w.is_visible() == Some(false) || w.is_minimized() == Some(true)) {
             self.unpainted = None;
         }
-        if self.unpainted.is_some_and(|t| now >= t + REPAINT_RETRY) {
-            crate::trace("repaint retry");
+        let retry_at = self.unpainted.map(|t| t + REPAINT_RETRY);
+        if retry_at.is_some_and(|t| now >= t) {
+            if std::env::var_os("ARKIMAGE_REDRAW_LOG").is_some() {
+                eprintln!("repaint retry: no paint {} ms after the image was stored", self.unpainted.map(|t| t.elapsed().as_millis()).unwrap_or(0));
+            }
             self.unpainted = Some(now);
             self.request_redraw();
         }
-        let repaint_at = self.unpainted.map(|t| t + REPAINT_RETRY);
-        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at, repaint_at]
+        [self.next_frame_at, self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at, retry_at, self.fs_restore_at, hook_at, pinch_hook_at, occ_at]
             .into_iter()
             .flatten()
             .min()

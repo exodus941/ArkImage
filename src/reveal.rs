@@ -53,9 +53,7 @@ fn select_now(folder: &Path, files: &[PathBuf]) -> bool {
 
 #[cfg(target_os = "macos")]
 pub fn select_in_folder(_folder: &Path, files: &[PathBuf]) -> bool {
-    let list: Vec<String> = files.iter().map(|f| format!("POSIX file \"{}\"", f.display().to_string().replace('"', "\\\""))).collect();
-    let script = format!("tell application \"Finder\"\nreveal {{{}}}\nactivate\nend tell", list.join(", "));
-    std::process::Command::new("osascript").arg("-e").arg(script).spawn().is_ok()
+    crate::mac::reveal(files)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

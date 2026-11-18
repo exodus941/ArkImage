@@ -26,7 +26,7 @@ pub const STABLE_AFTER: Duration = Duration::from_secs(60);
 
 fn name() -> io::Result<Name<'static>> {
     let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default();
-    format!("arkimage-{user}-backup.sock").to_ns_name::<GenericNamespaced>()
+    format!("arkimage-{user}{}-backup.sock", Config::instance_tag()).to_ns_name::<GenericNamespaced>()
 }
 
 // ---------- session file ----------
@@ -126,12 +126,15 @@ pub fn run_backup(mut crashes: u32) -> Option<Takeover> {
     });
     let mut pid: Option<u32> = None;
     let mut hung_since: Option<Instant> = None;
+    // macOS: the master's heartbeat ("alive", sent once its main thread answers)
+    let mut alive: Option<Instant> = None;
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // gone without bye
             Ok(Some(l)) => match l.as_str() {
                 "bye" => return None,
                 "stable" => crashes = 0,
+                "alive" => alive = Some(Instant::now()),
                 _ => {
                     if let Some(n) = l.strip_prefix("pid ") {
                         pid = n.parse().ok();
@@ -142,8 +145,14 @@ pub fn run_backup(mut crashes: u32) -> Option<Takeover> {
         }
         // A master whose windows all stop answering messages for HANG_AFTER is hung:
         // save a dump for diagnosis, end it, and take over as for a crash.
+        #[cfg(not(target_os = "macos"))]
+        let _ = alive;
+        #[cfg(target_os = "macos")]
+        let not_responding = |_p: u32| hang::not_responding(alive);
+        #[cfg(not(target_os = "macos"))]
+        let not_responding = hang::not_responding;
         if let Some(p) = pid {
-            if hang::not_responding(p) {
+            if not_responding(p) {
                 let since = *hung_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= HANG_AFTER {
                     crate::trace(&format!("master {p} not responding for {:?}", since.elapsed()));
@@ -261,7 +270,72 @@ mod hang {
     }
 }
 
-#[cfg(not(windows))]
+/// Hang detection and recovery (macOS). There is no "does this window answer" query
+/// across processes, so the master proves it: a thread asks the main thread to touch a
+/// timestamp once a second (through the main dispatch queue, which also runs during menus
+/// and file dialogs, so those never count as a hang) and sends "alive" to the backup while
+/// the main thread keeps answering. No "alive" for 3 s counts as not responding; HANG_AFTER
+/// of that ends the master. A master that never sent "alive" is never judged.
+#[cfg(target_os = "macos")]
+mod hang {
+    use std::time::{Duration, Instant};
+
+    pub fn not_responding(alive: Option<Instant>) -> bool {
+        alive.is_some_and(|t| t.elapsed() > Duration::from_secs(3))
+    }
+
+    /// Write hang-<unix time>.txt next to the config with `sample` (a 1 s stack sample of
+    /// every thread; keeps the newest 3), then end the process.
+    pub fn dump_and_kill(pid: u32) {
+        let dir = crate::config::Config::dir();
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let path = dir.join(format!("hang-{secs}.txt"));
+        let ok = std::process::Command::new("/usr/bin/sample").arg(pid.to_string()).arg("1").arg("-file").arg(&path).output().is_ok_and(|o| o.status.success());
+        crate::trace(&format!("hang sample {} written: {ok}", path.display()));
+        let mut dumps: Vec<_> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("hang-") && n.ends_with(".txt")))
+            .collect();
+        dumps.sort();
+        while dumps.len() > 3 {
+            let _ = std::fs::remove_file(dumps.remove(0));
+        }
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe { kill(pid as i32, 9) };
+    }
+
+    /// The master's side: a thread that sends "alive" while the main thread answers.
+    pub fn heartbeat(send: impl Fn(&str) + Send + 'static) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let t0 = *T0.get_or_init(Instant::now);
+        extern "C" {
+            static _dispatch_main_q: u8;
+            fn dispatch_async_f(queue: *const u8, ctx: *mut std::ffi::c_void, f: extern "C" fn(*mut std::ffi::c_void));
+        }
+        extern "C" fn touch(_: *mut std::ffi::c_void) {
+            if let Some(t0) = T0.get() {
+                SEEN.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
+            }
+        }
+        std::thread::spawn(move || loop {
+            unsafe { dispatch_async_f(&raw const _dispatch_main_q, std::ptr::null_mut(), touch) };
+            std::thread::sleep(Duration::from_secs(1));
+            let now = t0.elapsed().as_millis() as u64;
+            if now.saturating_sub(SEEN.load(Ordering::Relaxed)) < 2000 {
+                send("alive");
+            }
+        });
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 mod hang {
     pub fn not_responding(_pid: u32) -> bool {
         false
@@ -285,7 +359,15 @@ impl Guard {
     /// Start listening and spawn the first backup. `crashes` is the count carried over
     /// from a takeover (0 on a normal start).
     pub fn start(crashes: u32) -> Option<Self> {
-        let listener = ListenerOptions::new().name(name().ok()?).create_sync().ok()?;
+        // macOS: the socket is a file in /tmp, left behind when a master is killed or crashes;
+        // take it over (only the one master gets here, so no live listener owns it)
+        let listener = match ListenerOptions::new().name(name().ok()?).try_overwrite(cfg!(unix)).create_sync() {
+            Ok(l) => l,
+            Err(e) => {
+                crate::trace(&format!("backup listener: {e}"));
+                return None;
+            }
+        };
         let conn: Arc<Mutex<Option<Stream>>> = Arc::new(Mutex::new(None));
         let c2 = conn.clone();
         std::thread::spawn(move || {
@@ -295,12 +377,28 @@ impl Guard {
                 *c2.lock().unwrap() = Some(s); // newest backup replaces any older one
             }
         });
+        // macOS: prove the main thread answers, for the backup's hang check
+        #[cfg(target_os = "macos")]
+        {
+            let c3 = conn.clone();
+            hang::heartbeat(move |m| {
+                if let Some(c) = c3.lock().unwrap().as_mut() {
+                    let _ = c.write_all(format!("{m}\n").as_bytes());
+                    let _ = c.flush();
+                }
+            });
+        }
         let mut g = Self { conn, child: None, crashes, started: Instant::now(), stable_sent: false, last_spawn: Instant::now() };
         g.spawn();
         Some(g)
     }
 
     fn spawn(&mut self) {
+        // the GPU self-test exits on its own when done; a backup counted each exit as a
+        // crash and, after 3, showed "crashed 3 times in a row"
+        if std::env::var_os("ARKIMAGE_GPU_SELFTEST").is_some() {
+            return;
+        }
         let Ok(exe) = std::env::current_exe() else { return };
         self.child = Command::new(exe).args(["--backup", &self.crashes.to_string()]).spawn().ok();
         self.last_spawn = Instant::now();

@@ -205,9 +205,8 @@ pub fn install() -> Result<PathBuf, String> {
     move_portable_files();
     Ok(dst)
 }
-
 /// Files a portable copy keeps beside its exe; an install moves them to AppData.
-const PORTABLE_FILES: [&str; 4] = ["ArkImage.ini", "session.txt", "bookmarks.txt", "crash.log"];
+const PORTABLE_FILES: [&str; 3] = ["ArkImage.ini", "session.txt", "crash.log"];
 
 /// After an install from a portable copy: move its settings to AppData so nothing stays
 /// beside the original exe. AppData's ini then wins for every copy (config::pick_dir).

@@ -66,7 +66,7 @@ pub fn width(t: &mut Text, face: Face, s: &str, px: f32) -> f32 {
 /// Cards are dark frosted glass with no shadow (the user's call: shadows banded over
 /// the window glass). What is under a card shows blurred over 64 px, under the card's
 /// fill at CARD_TINT.
-const CARD_BLUR: f32 = 64.0;
+pub const CARD_BLUR: f32 = 64.0;
 const CARD_TINT: f32 = 0.6;
 
 /// One box-blur pass of radius `r` along rows (`step` 1) or columns (`step` = width)
@@ -142,6 +142,9 @@ fn frost(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, blur: f32, tint
             let orig = c.buf[i];
             let out = if orig >> 24 == 1 {
                 mix(orig, 0, ka)
+            } else if crate::render::is_hole(orig) {
+                // over the GPU image layer: the GPU blurs the layer, the tint goes over it
+                mix(crate::render::hole_with_class(orig, crate::render::BLUR_CARD), tint, ka)
             } else {
                 let j = ((py - sy0) * sw + px - sx0) * 3;
                 let q = |k: usize| v[j + k].round().clamp(0.0, 255.0) as u32;
@@ -293,8 +296,12 @@ pub fn modal_card(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, body: &[St
     let rects = modal_card_solid(c, t, sf, title, body, buttons, hover);
     if let Some(below) = below {
         let k = (alpha.clamp(0.0, 1.0) * 255.0) as u32;
+        // only the pixels the card drew: mixing the whole screen cost about 40 ms a
+        // frame at 3456x2234
         for (p, b) in c.buf.iter_mut().zip(below) {
-            *p = crate::render::mix(b, *p, k);
+            if *p != b {
+                *p = crate::render::mix(b, *p, k);
+            }
         }
     }
     rects
@@ -310,8 +317,12 @@ pub fn faded(c: &mut Canvas, alpha: f32, f: impl FnOnce(&mut Canvas)) {
     f(c);
     if let Some(below) = below {
         let k = (alpha.clamp(0.0, 1.0) * 255.0) as u32;
+        // only the pixels the card drew: mixing the whole screen cost about 40 ms a
+        // frame at 3456x2234
         for (p, b) in c.buf.iter_mut().zip(below) {
-            *p = crate::render::mix(b, *p, k);
+            if *p != b {
+                *p = crate::render::mix(b, *p, k);
+            }
         }
     }
 }

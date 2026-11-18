@@ -37,9 +37,8 @@ pub enum BoolF {
     WheelZoom,
     ClickSide,
     SortDesc,
-    SsLoop,
-    SsRandom,
     AutoUpdate,
+    Gpu,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -48,16 +47,13 @@ pub enum ChoiceF {
     ViewMode,
     Filter,
     Sort,
-    Double,
     /// Resize kernel of the selected filter preset.
     Kernel,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum NumF {
-    CacheMb,
     ThumbCacheMb,
-    SlideSecs,
     /// Sharpen amount, radius and threshold of the selected filter preset.
     Amount,
     Radius,
@@ -99,9 +95,8 @@ impl BoolF {
             BoolF::WheelZoom => c.wheel_zoom,
             BoolF::ClickSide => c.click_side_turn,
             BoolF::SortDesc => c.sort_desc,
-            BoolF::SsLoop => c.slideshow_loop,
-            BoolF::SsRandom => c.slideshow_random,
             BoolF::AutoUpdate => c.auto_update,
+            BoolF::Gpu => c.gpu,
         }
     }
     pub fn toggle(self, c: &mut Config) {
@@ -118,9 +113,8 @@ impl BoolF {
             BoolF::WheelZoom => c.wheel_zoom = v,
             BoolF::ClickSide => c.click_side_turn = v,
             BoolF::SortDesc => c.sort_desc = v,
-            BoolF::SsLoop => c.slideshow_loop = v,
-            BoolF::SsRandom => c.slideshow_random = v,
             BoolF::AutoUpdate => c.auto_update = v,
+            BoolF::Gpu => c.gpu = v,
         }
     }
 }
@@ -137,7 +131,6 @@ impl ChoiceF {
                 .map(|(i, p)| if crate::filters::is_builtin(i as u8) { format!("{} (built-in)", p.name) } else { p.name })
                 .collect(),
             ChoiceF::Sort => s(&["Name", "Date modified", "Size", "Type"]),
-            ChoiceF::Double => s(&["Off", "Smart Double Page (Left->Right)", "Smart Double Page (Left<-Right)"]),
             // index 0 ("Interpolation setting") is not offered: the list starts at 1
             ChoiceF::Kernel => s(&crate::filters::KERNELS[1..]),
         }
@@ -148,7 +141,6 @@ impl ChoiceF {
             ChoiceF::ViewMode => c.view_mode,
             ChoiceF::Filter => c.filter,
             ChoiceF::Sort => c.sort,
-            ChoiceF::Double => c.double,
             ChoiceF::Kernel => crate::filters::get(&c.filter_presets, c.filter).kernel.saturating_sub(1),
         }
     }
@@ -162,7 +154,6 @@ impl ChoiceF {
             ChoiceF::ViewMode => c.view_mode = v,
             ChoiceF::Filter => c.filter = v,
             ChoiceF::Sort => c.sort = v,
-            ChoiceF::Double => c.double = v,
             ChoiceF::Kernel => {
                 if let Some(p) = user_preset(c) {
                     p.kernel = (v + 1).min(crate::filters::KERNELS.len() as u8 - 1);
@@ -178,9 +169,7 @@ impl NumF {
         use crate::filters as f;
         let p = f::get(&c.filter_presets, c.filter);
         match self {
-            NumF::CacheMb => (c.cache_mb as i64, 128, 128, 16384, "MB"),
             NumF::ThumbCacheMb => (c.thumb_cache_mb as i64, 256, 0, 16384, "MB"),
-            NumF::SlideSecs => (c.slideshow_secs as i64, 1, 1, 3600, "s"),
             NumF::Amount => (p.amount as i64, 10, 0, f::AMOUNT_MAX as i64, ""),
             NumF::Radius => (p.radius as i64, 10, f::RADIUS_MIN as i64, f::RADIUS_MAX as i64, "px"),
             NumF::Threshold => (p.threshold as i64, 1, 0, f::THRESHOLD_MAX as i64, ""),
@@ -228,9 +217,7 @@ impl NumF {
         let (_, _, lo, hi, _) = self.spec(c);
         let nv = v.clamp(lo, hi);
         match self {
-            NumF::CacheMb => c.cache_mb = nv as u64,
             NumF::ThumbCacheMb => c.thumb_cache_mb = nv as u64,
-            NumF::SlideSecs => c.slideshow_secs = nv as u32,
             NumF::Amount => user_preset(c).into_iter().for_each(|p| p.amount = nv as u16),
             NumF::Radius => user_preset(c).into_iter().for_each(|p| p.radius = nv as u16),
             NumF::Threshold => user_preset(c).into_iter().for_each(|p| p.threshold = nv as u8),
@@ -303,6 +290,8 @@ pub enum Act {
     Reset,
     /// Install or reinstall ArkImage for this user.
     Install,
+    /// macOS: make ArkImage the default app for the supported image types.
+    MakeDefault,
     /// Check GitHub for a newer version now.
     CheckUpdate,
     /// Open the GitHub page in the browser.
@@ -323,7 +312,10 @@ fn page(i: usize) -> Vec<Ctl> {
             Gap,
             Choice("Action when on last/first image:", ChoiceF::EndAction),
             Gap,
+            #[cfg(windows)]
             Button("ArkImage for this Windows user", Act::Install),
+            #[cfg(target_os = "macos")]
+            Button("Open supported images with ArkImage by default", Act::MakeDefault),
             Check("Check for updates at startup", BoolF::AutoUpdate),
             Button("Reset all settings to their defaults", Act::Reset),
             Version,
@@ -338,10 +330,11 @@ fn page(i: usize) -> Vec<Ctl> {
             Swatches("Background Color:"),
         ],
         2 => vec![
+            Check("Use GPU acceleration when available", BoolF::Gpu),
+            Gap,
             Check("Auto rotate images based on EXIF info", BoolF::ExifRotate),
             Check("Grid background for transparent images", BoolF::Grid),
             Gap,
-            Num("Cache memory size:", NumF::CacheMb),
             Num("Thumbnail cache on disk (0 = off):", NumF::ThumbCacheMb),
         ],
         FILTERS_TAB => vec![
@@ -361,11 +354,7 @@ fn page(i: usize) -> Vec<Ctl> {
         4 => vec![
             Choice("Sort by:", ChoiceF::Sort),
             Check("Descending", BoolF::SortDesc),
-            Choice("Double page:", ChoiceF::Double),
             Gap,
-            Num("Slideshow interval:", NumF::SlideSecs),
-            Check("Repeat slideshow", BoolF::SsLoop),
-            Check("Random slideshow order", BoolF::SsRandom),
         ],
         5 => {
             let mut v = vec![KeyHeader];
@@ -475,9 +464,14 @@ impl Dialog {
         self.hits.iter().rev().find(|h| x >= h.x0 && x < h.x1 && y >= h.y0 && y < h.y1).map(|h| h.act)
     }
 
-    /// Where a choice box sits, for placing its popup menu (physical px, bottom-right).
-    pub fn anchor(&self, act: Act) -> Option<(f32, f32)> {
-        self.hits.iter().find(|h| h.act == act).map(|h| (h.x1, h.y1))
+    /// Where a choice box sits, for placing its popup menu (physical px: left, bottom, width).
+    pub fn anchor(&self, act: Act) -> Option<(f32, f32, f32)> {
+        self.hits.iter().find(|h| h.act == act).map(|h| (h.x0, h.y1, h.x1 - h.x0))
+    }
+
+    /// For the ARKIMAGE_TEST_CHOICE hook: the first choice box.
+    pub fn first_choice(&self) -> Option<Act> {
+        self.hits.iter().find(|h| matches!(h.act, Act::Choice(_))).map(|h| h.act)
     }
 
     pub fn render(&mut self, cfg: &Config, text: Option<&mut Text>) {
