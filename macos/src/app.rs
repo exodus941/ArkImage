@@ -3,7 +3,6 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    io::Write as _,
     num::NonZeroU32,
     path::{Path, PathBuf},
     process::Command,
@@ -278,6 +277,17 @@ const FADE_SECS: f32 = 0.25;
 /// How often a window checks that its file was not deleted outside the app.
 const GONE_EVERY: Duration = Duration::from_millis(2500);
 
+/// The next tick of a clock shared by every window, `every` apart. Periodic checks wait for
+/// it, so all windows wake together: each on its own timer, 100 windows woke the loop about
+/// 200 times a second at idle, and each wake ran every window's timers.
+fn shared_tick(now: Instant, every: Duration) -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let e = *EPOCH.get_or_init(Instant::now);
+    let p = every.as_nanos().max(1);
+    let n = now.saturating_duration_since(e).as_nanos() / p + 1;
+    e + Duration::from_nanos((n * p) as u64)
+}
+
 /// Zoom In/Out stops, as Honeyview 5.53 measured (drawn width of a test square):
 /// 5%, then 10-300% by 10, 320-500% by 20, 550-2000% by 50.
 static ZOOM_STEPS: std::sync::LazyLock<Vec<f64>> = std::sync::LazyLock::new(|| {
@@ -295,9 +305,7 @@ const HELP: &[(&str, &str)] = &[
     ("Ctrl+PgDn  Ctrl+PgUp", "10 images forward / back"),
     ("Ctrl+Alt+PgDn  Ctrl+Alt+PgUp", "Random image"),
     ("]  [", "Next / previous folder or archive"),
-    ("Shift+Right  Shift+Left", "1 page in double view"),
     ("0  9  8", "Original size / fit window / fit width"),
-    ("7  6", "Double page left-to-right / right-to-left"),
     ("Z", "Stretch small images"),
     ("+  -  *", "Zoom in / out / 100%"),
     ("Ctrl++  Ctrl+-", "Zoom 1%"),
@@ -313,8 +321,6 @@ const HELP: &[(&str, &str)] = &[
     ("Del", "Delete"),
     ("Ins  Shift+Ins  Ctrl+Ins", "Copy to photo folder 1 / 2, move to 1"),
     ("Ctrl+C  Ctrl+E", "Copy image / open in editor"),
-    ("Ctrl+1..9  Ctrl+0", "Slideshow seconds / stop"),
-    ("B  Shift+B  F3", "Bookmark / open last / edit bookmarks"),
     ("Alt+Enter  F11  Middle click", "Full screen"),
     ("Ctrl+A", "Always on top"),
     ("F5  Shift+F5", "Settings / reload settings file"),
@@ -378,6 +384,10 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(proxy: EventLoopProxy<UserEvent>, cfg: &Config) -> Self {
+        // the first image decodes before any window has a GPU surface: upload from the
+        // start when the setting is on (a GPU that then fails turns this off again)
+        let gpu_on = cfg.gpu && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0");
+        crate::gpu::DECODE_TO_GPU.store(gpu_on, Ordering::Relaxed);
         let wanted = Arc::new(Mutex::new(HashMap::new()));
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 3);
         let exif_flag = Arc::new(AtomicBool::new(cfg.exif_rotate));
@@ -432,6 +442,40 @@ pub struct App {
     window: Option<Arc<Window>>,
     _context: Option<softbuffer::Context<Arc<Window>>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// The GPU image layer; None draws everything on the processor (no GPU, the setting
+    /// off, or the GPU lost).
+    gpu: Option<crate::gpu::GpuWin>,
+    /// The interface frame the GPU path draws into (kept between frames).
+    gpu_buf: Vec<u32>,
+    /// Something other than an animation frame asked for a redraw: the whole interface is
+    /// drawn again. False: only the frame advanced, and the animation row is redrawn alone
+    /// when `anim_band` allows it.
+    ui_dirty: bool,
+    /// The animation row's rows (y0..y1), checked after the last full draw to come out the
+    /// same when drawn on its own (no card, toast or fade over it); (0, 0) when no row is
+    /// on screen; None otherwise.
+    anim_band: Option<(usize, usize)>,
+    /// The GPU setting this window last acted on (a change switches the path).
+    gpu_cfg: bool,
+    /// macOS reports the window covered (or minimized): nothing of it is on screen.
+    occluded: bool,
+    /// GPU path: this window gave its full texture back (covered, or past the budget) and
+    /// shows its screen-sized copy, or the thumbnail; it decodes again when used.
+    stripped: bool,
+    /// When the covered check last ran (macOS polls it).
+    occ_checked: Instant,
+    /// This frame's image placement for the GPU: (ox, oy, z, smooth), slide shift of the
+    /// old layer, and whether the frame is a settled one.
+    gpu_img: Option<(f64, f64, f64, bool)>,
+    gpu_hq: Option<crate::gpu::Hq>,
+    gpu_slide: Option<f64>,
+    /// The decoded image the GPU base is (its address), so a transform does not re-upload.
+    gpu_src: u64,
+    /// The decoder's shared texture of the base (the base itself is then a thumbnail).
+    base_tex: Option<Arc<crate::gpu::Tex>>,
+    gpu_settle: bool,
+    /// This frame's slide motion blur (half-length of the smear, px).
+    gpu_motion: f32,
     pub cfg: Config,
     pending_open: Option<PathBuf>,
     playlist: Option<Playlist>,
@@ -457,7 +501,6 @@ pub struct App {
     view: View,
     base: Option<Arc<RgbaImage>>,
     base_gen: u64,
-    shown: usize,
     scaled: Option<(ScaledKey, RgbaImage)>,
     scaled_hq: bool,
     layout: Option<Layout>,
@@ -470,7 +513,6 @@ pub struct App {
     help_at: Instant,
     /// When the "Drop an image" card appeared, for its fade-in.
     empty_at: Option<Instant>,
-    slideshow: Option<(u32, Instant)>,
     mods: ModifiersState,
     cursor: (f64, f64),
     drag: Option<((f64, f64), (f64, f64), bool)>,
@@ -549,7 +591,6 @@ pub struct App {
     was_max: bool,
     /// Maximized when full screen was entered; restored on leaving it.
     fs_was_max: bool,
-    bm_cache: Vec<String>,
     settings: Option<settings::Dialog>,
     /// The choice box whose popup menu is open in the settings dialog.
     pending_choice: Option<settings::ChoiceF>,
@@ -602,7 +643,8 @@ fn spawn_workers(
                 }
                 continue;
             }
-            let res = decode::decode(&e, exif_rotate.load(Ordering::Relaxed)).map(Arc::new);
+            let to_gpu = crate::gpu::DECODE_TO_GPU.load(Ordering::Relaxed);
+            let res = decode::decode(&e, exif_rotate.load(Ordering::Relaxed), to_gpu).map(Arc::new);
             if proxy.send_event(UserEvent::Loaded(e, res)).is_err() {
                 break;
             }
@@ -669,6 +711,21 @@ impl App {
             window: None,
             _context: None,
             surface: None,
+            gpu: None,
+            gpu_buf: Vec::new(),
+            ui_dirty: true,
+            anim_band: None,
+            gpu_cfg: true,
+            occluded: false,
+            stripped: false,
+            occ_checked: Instant::now(),
+            gpu_img: None,
+            gpu_hq: None,
+            gpu_slide: None,
+            gpu_src: 0,
+            base_tex: None,
+            gpu_settle: false,
+            gpu_motion: 0.0,
             cfg,
             pending_open: arg,
             playlist: None,
@@ -690,7 +747,6 @@ impl App {
             view: View::default(),
             base: None,
             base_gen: 0,
-            shown: 1,
             scaled: None,
             scaled_hq: true,
             layout: None,
@@ -701,7 +757,6 @@ impl App {
             show_help: false,
             help_at: Instant::now() - Duration::from_secs(1),
             empty_at: None,
-            slideshow: None,
             mods: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             drag: None,
@@ -749,7 +804,6 @@ impl App {
             geom: None,
             was_max: false,
             fs_was_max: false,
-            bm_cache: Vec::new(),
             settings: None,
             pending_choice: None,
             popup_closed: None,
@@ -779,7 +833,8 @@ impl App {
         }
     }
 
-    pub fn request_redraw(&self) {
+    pub fn request_redraw(&mut self) {
+        self.ui_dirty = true;
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -798,10 +853,6 @@ impl App {
 
     fn cur_entry(&self) -> Option<Entry> {
         self.playlist.as_ref().and_then(|p| p.get(p.index).cloned())
-    }
-
-    fn next_entry(&self) -> Option<Entry> {
-        self.playlist.as_ref().and_then(|p| p.get(p.index + 1).cloned())
     }
 
     fn displaying_current(&self) -> bool {
@@ -859,6 +910,12 @@ impl App {
     }
 
     /// How solid the background is now: 0 frosted glass, 1 the solid colour.
+    /// The background's opacity over the window glass, as `glass_finish` draws it.
+    fn glass_bg_alpha(&self) -> f32 {
+        let o = GLASS_OPACITY as f32 / 255.0;
+        o + (1.0 - o) * self.glass_solid()
+    }
+
     fn glass_solid(&self) -> f32 {
         let to = if self.glass_on { 0.0 } else { 1.0 };
         let k = (self.glass_at.elapsed().as_secs_f32() / GLASS_FADE.as_secs_f32()).min(1.0);
@@ -1011,7 +1068,8 @@ impl App {
         if let Some(pl) = &self.playlist {
             let i = pl.index as isize;
             let d = self.dir as isize;
-            for o in [-2isize, -1, 0, 1, 2, 3, 4, 5, 6, 7].map(|o| o * d) {
+            let offsets: &[isize] = if self.neighbours_wanted() { &[-2, -1, 0, 1, 2, 3, 4, 5, 6, 7] } else { &[0] };
+            for o in offsets.iter().map(|o| o * d) {
                 let j = i + o;
                 if let Some(e) = (j >= 0).then(|| pl.get(j as usize)).flatten() {
                     w.insert(e.clone());
@@ -1050,8 +1108,12 @@ impl App {
         // Look 6 ahead in the direction of travel and 1 behind: at 30 flips/s from a cold
         // 7200 rpm disk, 3 ahead missed 6 of 40 images.
         let d = self.dir as isize;
-        let list: Vec<Entry> = [0isize, d, 2 * d, 3 * d, -d, 4 * d, 5 * d, 6 * d]
+        // GPU mode: only the focused window preloads its neighbours (100 windows asked
+        // for up to 800 images against a cache of about 32 and decoded each one 6 times)
+        let offsets: &[isize] = if self.neighbours_wanted() { &[0, 1, 2, 3, -1, 4, 5, 6] } else { &[0] };
+        let list: Vec<Entry> = offsets
             .iter()
+            .map(|o| o * d)
             .filter_map(|o| {
                 let j = i + o;
                 if j >= 0 {
@@ -1070,14 +1132,22 @@ impl App {
     /// The master evicts the shared cache by the smallest distance over all windows.
     pub fn distance(&self, e: &Entry) -> i64 {
         let Some(pl) = &self.playlist else { return i64::MAX };
+        // GPU mode, a window without focus keeps only its own image in the cache
+        if !self.neighbours_wanted() && self.cur_entry().as_ref() != Some(e) {
+            return i64::MAX;
+        }
+        // a window that gave its full texture back does not keep its image in the cache
+        if self.stripped {
+            return i64::MAX;
+        }
         self.pos_map.get(e).map(|&p| (pl.flip(p) as i64 - pl.index as i64).abs()).unwrap_or(i64::MAX)
     }
 
     fn set_current(&mut self, e: Entry, d: Arc<Decoded>) {
         crate::trace(&format!("current {}", e.name()));
         self.frame_idx = 0;
-        self.next_frame_at = if d.frames.len() > 1 && self.cfg.double == 0 {
-            Some(Instant::now() + Duration::from_millis(self.frame_ms(d.frames[0].delay_ms)))
+        self.next_frame_at = if d.frame_count() > 1 {
+            Some(Instant::now() + Duration::from_millis(self.frame_ms(d.frame_delay(0))))
         } else {
             None
         };
@@ -1125,8 +1195,6 @@ impl App {
                     // While dragging, the exact image is rarely ready before the slider moves
                     // on (1 of 39 decodes was shown in a 672 ms drag). Show the nearest one.
                     self.set_current(e.clone(), d.clone());
-                } else if self.cfg.double != 0 && self.next_entry().as_ref() == Some(e) {
-                    self.invalidate();
                 }
             }
             Err(_) => {
@@ -1192,18 +1260,10 @@ impl App {
             return;
         }
         let idx = self.index() as isize;
-        let n = if !single && self.cfg.double != 0 {
-            if n > 0 {
-                n * self.shown as isize
-            } else {
-                n * 2
-            }
-        } else {
-            n
-        };
+        let _ = single;
         let t = idx + n;
         if t >= len {
-            if idx + self.shown as isize >= len || n.abs() == 1 && idx == len - 1 {
+            if idx + 1 >= len || n.abs() == 1 && idx == len - 1 {
                 self.at_end(true);
             } else {
                 self.go_to((len - 1) as usize);
@@ -1282,59 +1342,36 @@ impl App {
         }
     }
 
-    fn slideshow_tick(&mut self) {
-        if self.cfg.slideshow_random {
-            self.random();
-            return;
-        }
-        let len = self.len();
-        if self.index() + self.shown >= len {
-            if self.cfg.slideshow_loop {
-                self.go_to(0);
-            } else {
-                self.slideshow = None;
-                self.msg("Stop Slideshow");
-            }
-        } else {
-            self.next();
-        }
-    }
-
-    fn set_slideshow(&mut self, secs: u32) {
-        if secs == 0 {
-            self.slideshow = None;
-            self.msg("Stop Slideshow");
-        } else {
-            self.cfg.slideshow_secs = secs;
-            self.slideshow = Some((secs, Instant::now() + Duration::from_secs(secs as u64)));
-            self.msg(format!("Start Slideshow: {secs}sec"));
-        }
-    }
-
-    // ---------- view ----------
-
     fn ensure_base(&mut self) {
         if self.base.is_some() {
             return;
         }
         let Some((_, cur)) = self.current.clone() else { return };
-        let fi = self.frame_idx.min(cur.frames.len() - 1);
-        let mut img = cur.frames[fi].img.clone();
-        self.shown = 1;
-        if self.cfg.double != 0 && self.displaying_current() {
-            let sec = self.next_entry().and_then(|e| self.cache.borrow().get(&e).cloned());
-            if let Some(sec) = sec {
-                let b = &sec.frames[0].img;
-                let portrait = |i: &RgbaImage| i.height() >= i.width();
-                if portrait(&img) && portrait(b) {
-                    img = Arc::new(if self.cfg.double == 1 {
-                        decode::compose(&img, b)
-                    } else {
-                        decode::compose(b, &img)
-                    });
-                    self.shown = 2;
-                }
+        let fi = self.frame_idx.min(cur.frame_count() - 1);
+        // a Lottie: GPU mode replays its frame textures (each drawn once); the processor
+        // draws the frame now
+        let lottie_tex = match (&cur.lottie, self.gpu.is_some()) {
+            (Some(p), true) => p.frame_tex(fi),
+            _ => None,
+        };
+        let img = match (&cur.lottie, &lottie_tex) {
+            // the texture is the image; the first frame stands for it in RAM
+            (Some(_), Some(_)) => cur.frames[0].img.clone(),
+            (Some(p), None) => p.frame(fi),
+            (None, _) => cur.frames[fi].img.clone(),
+        };
+        self.base_tex = if cur.lottie.is_some() { lottie_tex } else { cur.frames[fi].gpu.clone() };
+        // GPU: the image as decoded; rotation, flips, Negative and Gamma are shader steps,
+        // so they make no new copy and no new upload (the key is the image itself)
+        if self.gpu.is_some() {
+            let key = self.base_tex.as_ref().map(|t| Arc::as_ptr(t) as u64).unwrap_or(Arc::as_ptr(&img) as u64);
+            if self.gpu_src != key {
+                self.gpu_src = key;
+                self.base_gen += 1;
             }
+            self.base = Some(img);
+            self.scaled = None;
+            return;
         }
         let v = &self.view;
         self.base = Some(decode::transform(&img, v.rotation, v.flip_h, v.flip_v, v.negative, v.gamma));
@@ -1342,9 +1379,122 @@ impl App {
         self.scaled = None;
     }
 
+    /// Neighbour images are preloaded and kept for this window: always on the processor
+    /// path; in GPU mode only for the focused window.
+    fn neighbours_wanted(&self) -> bool {
+        self.gpu.is_none() || self.window.as_ref().is_some_and(|w| w.has_focus())
+    }
+
+    /// GPU path: keep only the screen-sized copy (and the thumbnail): give back the full
+    /// texture and the window-sized frame buffers. Covered windows, and windows past the
+    /// shared budget, do this; the focused and most recently used windows keep theirs.
+    fn strip(&mut self) {
+        // no image yet: nothing to give back. (Marked anyway, a new window covered before
+        // it was first shown let its arriving image go from the cache and decoded it again
+        // when uncovered: 267 decodes for 200 in the 100-window test.) The budget check
+        // still strips it later if needed.
+        if self.gpu.is_none() || self.stripped || self.current.is_none() {
+            if let (Some(g), true) = (&mut self.gpu, self.current.is_none()) {
+                g.release(true);
+            }
+            return;
+        }
+        self.stripped = true;
+        self.gpu_buf = Vec::new();
+        if let Some(g) = &mut self.gpu {
+            g.release(true);
+        }
+        // the shown image without its texture: frames keep only their thumbnails
+        if let Some((e, d)) = self.current.clone() {
+            if d.frames.iter().any(|f| f.gpu.is_some()) {
+                let frames = d.frames.iter().map(|f| decode::Frame { img: f.img.clone(), delay_ms: f.delay_ms, gpu: None }).collect();
+                // the thumbnails are stored turned: nothing left to turn
+                let thin = Decoded { frames, format: d.format.clone(), file_size: d.file_size, modified: d.modified, exif: d.exif.clone(), orig_w: d.orig_w, orig_h: d.orig_h, orient: 1, lottie: d.lottie.clone() };
+                self.current = Some((e, Arc::new(thin)));
+            }
+        }
+        self.base = None;
+        self.base_tex = None;
+        self.last_frame.clear();
+        self.last_key = None;
+        crate::trace("gpu: window keeps its screen-sized copy only");
+    }
+
+    /// Used again (focused, uncovered): the full image comes back from the cache, or is
+    /// decoded again; the screen-sized copy shows meanwhile.
+    fn unstrip(&mut self) {
+        if !self.stripped {
+            return;
+        }
+        self.stripped = false;
+        if let Some(e) = self.cur_entry() {
+            let cached = self.cache.borrow().get(&e).cloned();
+            match cached {
+                Some(d) if d.frames.iter().any(|f| f.gpu.is_some()) => self.set_current(e, d),
+                _ => {
+                    self.cache.borrow_mut().remove(&e);
+                    self.request(e);
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Covered (nothing of the window on screen): stop drawing, keep only the screen-sized
+    /// copy, drop the surface; uncovered: draw again.
+    fn set_covered(&mut self, o: bool) {
+        if o == self.occluded {
+            return;
+        }
+        crate::trace(&format!("window covered: {o}"));
+        self.occluded = o;
+        if o {
+            self.strip();
+            if let Some(g) = &mut self.gpu {
+                g.park();
+            }
+        } else {
+            self.unstrip();
+            self.request_redraw();
+        }
+    }
+
+    /// The view transform for the GPU.
+    fn gpu_xf(&self) -> crate::gpu::Xform {
+        let v = &self.view;
+        let view = crate::gpu::Xform { rot: v.rotation % 4, flip_h: v.flip_h, flip_v: v.flip_v, negative: v.negative, gamma: v.gamma };
+        // the shared texture is the photo as stored: its EXIF turn first, then the view's
+        // (a thumbnail standing in is stored turned already)
+        match (&self.base_tex, &self.current) {
+            (Some(_), Some((_, d))) if d.orient > 1 => view.after(&crate::gpu::Xform::exif(d.orient)),
+            _ => view,
+        }
+    }
+
+    /// The width of the texture's full image: the stored photo's for a shared texture,
+    /// the turned one's for a thumbnail standing in.
+    fn gpu_full_w(&self, b: &RgbaImage) -> u32 {
+        match &self.current {
+            Some((_, d)) if self.base_tex.is_some() && d.orient >= 5 => d.orig_h,
+            Some((_, d)) => d.orig_w,
+            None => b.width(),
+        }
+    }
+
     fn compute_layout(&mut self, ww: f64, wh: f64) -> Option<Layout> {
         let b = self.base.as_ref()?;
-        let (bw, bh) = (b.width() as f64, b.height() as f64);
+        let (mut bw, mut bh) = (b.width() as f64, b.height() as f64);
+        // GPU: the base may be a thumbnail (of a texture, or standing in); lay out the
+        // full image
+        if self.base_tex.is_some() || self.gpu.is_some() {
+            if let Some((_, d)) = &self.current {
+                (bw, bh) = (d.orig_w as f64, d.orig_h as f64);
+            }
+        }
+        // GPU: the base is unrotated; lay out the turned image
+        if self.gpu.is_some() && self.view.rotation % 2 == 1 {
+            std::mem::swap(&mut bw, &mut bh);
+        }
         let z = match self.view.user_zoom {
             Some(z) => z,
             None => {
@@ -1364,7 +1514,7 @@ impl App {
         let sh = bh * z;
         if self.view.pan_reset && self.displaying_current() {
             self.view.pan_reset = false;
-            self.view.pan_x = if self.cfg.double == 2 { sw - ww } else { (sw - ww) / 2.0 };
+            self.view.pan_x = (sw - ww) / 2.0;
             self.view.pan_y = if self.cfg.view_mode == 2 || self.cfg.align_top { 0.0 } else { (sh - wh) / 2.0 };
         }
         self.view.pan_x = if sw > ww { self.view.pan_x.clamp(0.0, sw - ww) } else { 0.0 };
@@ -1434,25 +1584,6 @@ impl App {
             0 => "View: Original Size (100%)",
             1 => "View: Fit in Window",
             _ => "View: Fit to Width",
-        });
-    }
-
-    fn set_double(&mut self, d: u8) {
-        self.cfg.double = if self.cfg.double == d { 0 } else { d };
-        self.view.pan_reset = true;
-        if self.cfg.double != 0 {
-            self.next_frame_at = None;
-            if let Some(e) = self.next_entry() {
-                self.request(e);
-            }
-        } else if let Some((e, d)) = self.current.clone() {
-            self.set_current(e, d);
-        }
-        self.invalidate();
-        self.msg(match self.cfg.double {
-            1 => "Smart Double Page (Left->Right)",
-            2 => "Smart Double Page (Left<-Right)",
-            _ => "Double page: Off",
         });
     }
 
@@ -1556,7 +1687,6 @@ impl App {
     fn close(&mut self) {
         self.playlist = None;
         self.current = None;
-        self.slideshow = None;
         self.next_frame_at = None;
         self.pos_map = Default::default();
         self.update_wanted();
@@ -1719,6 +1849,21 @@ impl App {
     fn copy_image(&mut self) {
         self.ensure_base();
         let Some(b) = self.base.clone() else { return };
+        // GPU: the full image is on the GPU; read it back
+        let b = match self.base_tex.as_ref().and_then(|t| crate::gpu::read_tex(t)) {
+            Some(full) => match &self.current {
+                Some((_, d)) if d.orient > 1 => Arc::new(decode::orient(&full, d.orient as u32)),
+                _ => Arc::new(full),
+            },
+            None => b,
+        };
+        // GPU: the base is untransformed; copy the image as shown
+        let b = if self.gpu.is_some() {
+            let v = &self.view;
+            decode::transform(&b, v.rotation, v.flip_h, v.flip_v, v.negative, v.gamma)
+        } else {
+            b
+        };
         let r = arboard::Clipboard::new().and_then(|mut cb| {
             cb.set_image(arboard::ImageData {
                 width: b.width() as usize,
@@ -1735,43 +1880,7 @@ impl App {
         self.msg(if r.is_ok() { "Copied to clipboard." } else { "Failed to copy to clipboard." });
     }
 
-    fn bookmarks_path() -> PathBuf {
-        Config::dir().join("bookmarks.txt")
-    }
-
-    fn add_bookmark(&mut self) {
-        let Some(e) = self.cur_entry() else { return };
-        let _ = std::fs::create_dir_all(Config::dir());
-        let r = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(Self::bookmarks_path())
-            .and_then(|mut f| writeln!(f, "{}", e.label()));
-        match r {
-            Ok(()) => self.msg(format!("Add to Bookmarks: {}", e.name())),
-            Err(err) => self.msg(format!("Failed to save the bookmarks: {err}")),
-        }
-    }
-
-    fn open_last_bookmark(&mut self) {
-        let Ok(s) = std::fs::read_to_string(Self::bookmarks_path()) else {
-            self.msg("Failed to open the bookmarks.");
-            return;
-        };
-        let Some(line) = s.lines().map(str::trim).filter(|l| !l.is_empty()).last() else {
-            self.msg("Failed to open the bookmarks.");
-            return;
-        };
-        let line = line.to_string();
-        self.open_bookmark_line(&line);
-    }
-
-    fn open_bookmark_line(&mut self, line: &str) {
-        self.open_label(line);
-        self.msg(format!("Open recently saved bookmark: {line}"));
-    }
-
-    /// Open an entry label: a file path, or "<archive>|<name inside>" (bookmarks, crash restore).
+    /// Open an entry label: a file path, or "<archive>|<name inside>" (the crash restore).
     pub fn open_label(&mut self, line: &str) {
         let line = line.to_string();
         match line.split_once('|') {
@@ -1804,15 +1913,6 @@ impl App {
             Some((p.x, p.y, s.width, s.height))
         })?;
         Some(crate::backup::WinState { x, y, w: gw, h: gh, max: self.was_max, fs: self.fullscreen, label })
-    }
-
-    fn edit_bookmarks(&mut self) {
-        let p = Self::bookmarks_path();
-        if !p.exists() {
-            let _ = std::fs::create_dir_all(Config::dir());
-            let _ = std::fs::write(&p, "");
-        }
-        open_text_file(&p);
     }
 
     fn reload_config(&mut self) {
@@ -1861,7 +1961,7 @@ impl App {
             if ce == e {
                 let mut img = vec![
                     row("Dimensions", format!("{} × {}", d.orig_w, d.orig_h), true),
-                    row("Format", if d.frames.len() > 1 { format!("{}, {} frames", d.format, d.frames.len()) } else { d.format.to_string() }, false),
+                    row("Format", if d.frame_count() > 1 { format!("{}, {} frames", d.format, d.frame_count()) } else { d.format.to_string() }, false),
                     row("File size", fmt_size(d.file_size), true),
                 ];
                 if let Some(t) = d.modified {
@@ -1889,7 +1989,7 @@ impl App {
         v.push(format!("Index: {} / {}", pl.index + 1, pl.entries.len()));
         if let Some((ce, d)) = &self.current {
             if ce == e {
-                let frames = if d.frames.len() > 1 { format!("  {} frames", d.frames.len()) } else { String::new() };
+                let frames = if d.frame_count() > 1 { format!("  {} frames", d.frame_count()) } else { String::new() };
                 v.push(format!("Image Size: {} x {}  {}{}", d.orig_w, d.orig_h, d.format, frames));
                 v.push(format!("File Size: {}", fmt_size(d.file_size)));
                 if let Some(t) = d.modified {
@@ -1909,10 +2009,376 @@ impl App {
         v
     }
 
+    /// The GPU setting, with the ARKIMAGE_GPU=0 test override (never saved).
+    fn gpu_wanted(&self) -> bool {
+        self.cfg.gpu && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0") && !self.too_big_for_gpu()
+    }
+
+    /// The image shown has a side past the GPU's texture limit (16,384 px on Apple
+    /// silicon): this window draws it with the processor at full size rather than shrink
+    /// it to fit, and goes back to the GPU at the next image that fits.
+    fn too_big_for_gpu(&self) -> bool {
+        let Some((_, d)) = &self.current else { return false };
+        let lim = crate::gpu::get().map(|g| g.max_tex()).unwrap_or(u32::MAX);
+        d.lottie.is_none() && (d.orig_w > lim || d.orig_h > lim)
+    }
+
+    /// The processor's window surface (softbuffer): at start without a GPU, or after the
+    /// GPU path failed or was turned off.
+    fn cpu_surface(&mut self) {
+        let Some(win) = self.window.clone() else { return };
+        self.gpu = None;
+        let ctx = softbuffer::Context::new(win.clone()).expect("softbuffer context");
+        let surface = softbuffer::Surface::new(&ctx, win.clone()).expect("softbuffer surface");
+        // the GPU's layer would stay under this one with its last frame (see mac.rs)
+        #[cfg(target_os = "macos")]
+        crate::trace(&format!("stale layers removed: {}", crate::mac::drop_stale_layers(&win)));
+        self._context = Some(ctx);
+        self.surface = Some(surface);
+        self.last_frame.clear();
+        self.last_key = None;
+        self.base = None;
+        self.scaled = None;
+        // the GPU copies are gone or unusable here: decoders keep RAM copies from now on,
+        // images that lived on the GPU are dropped from the cache, and the one shown is
+        // decoded again (its thumbnail stays on screen meanwhile)
+        crate::gpu::DECODE_TO_GPU.store(false, Ordering::Relaxed);
+        self.cache.borrow_mut().retain(|_, d| d.frames.iter().all(|f| f.gpu.is_none()));
+        self.base_tex = None;
+        if let Some(e) = self.cur_entry() {
+            self.request(e);
+        }
+    }
+
+    /// Test hook ARKIMAGE_GPU_SELFTEST: the GPU's full-quality shrink against the
+    /// processor's, per kernel and preset, on the current image; prints and exits.
+    fn gpu_selftest(&mut self) {
+        let Some(base) = self.base.clone() else { return };
+        // the base is a thumbnail when the image lives on the GPU: test on the full image
+        let base = match self.base_tex.as_ref().and_then(|t| crate::gpu::read_tex(t)) {
+            Some(full) => Arc::new(full),
+            None => base,
+        };
+        let (bw, bh) = base.dimensions();
+        let mut user = self.cfg.filter_presets.clone();
+        let mut presets = crate::filters::builtins();
+        presets.append(&mut user);
+        // every kernel, with and without sharpening
+        for k in 2..=6u8 {
+            presets.push(crate::filters::Preset { name: format!("kernel {k}"), kernel: k, amount: 0, radius: 100, threshold: 0 });
+            presets.push(crate::filters::Preset { name: format!("kernel {k} sharp"), kernel: k, amount: 150, radius: 150, threshold: 3 });
+        }
+        let interp = self.cfg.interp;
+        for z in [0.29f64, 0.5, 0.11] {
+            let (sw, sh) = (((bw as f64 * z).round() as u32).max(1), ((bh as f64 * z).round() as u32).max(1));
+            for (i, p) in presets.iter().enumerate() {
+                let t0 = Instant::now();
+                let cpu = self.scale_with_preset(&base, sw, sh);
+                let tc = t0.elapsed();
+                let q = crate::gpu::Hq {
+                    key: 0xC0FFEE ^ i as u64 ^ (sw as u64) << 32,
+                    w: sw,
+                    h: sh,
+                    kernel: p.resize_code(interp),
+                    amount: p.amount as f32 / 100.0,
+                    sigma: p.radius as f32 / 100.0,
+                    threshold: p.threshold,
+                    x: 0,
+                    y: 0,
+                    xf: Default::default(),
+                };
+                // the processor uses the selected preset; set it for this case
+                let _ = &cpu;
+                // the processor's own path for this preset
+                let cpu = {
+                    let mut img = render::resize(&base, sw, sh, p.resize_code(interp));
+                    render::sharpen(&mut img, p.amount as f32 / 100.0, p.radius as f32 / 100.0, p.threshold);
+                    img
+                };
+                let t1 = Instant::now();
+                let gpu = self.gpu.as_mut().map(|g| g.hq_readback(self.base_gen as u64, &base, &q)).unwrap_or_default();
+                let tg = t1.elapsed();
+                let mut hist = [0u64; 256];
+                for (k, (a, b)) in cpu.as_raw().iter().zip(gpu.iter()).enumerate() {
+                    if k % 4 != 3 {
+                        hist[(*a as i32 - *b as i32).unsigned_abs() as usize] += 1;
+                    }
+                }
+                let n: u64 = hist.iter().sum();
+                let max = hist.iter().rposition(|&c| c > 0).unwrap_or(0);
+                if max > 2 {
+                    let over: u64 = hist[3..].iter().sum();
+                    // the first few: position, channel, both values
+                    let mut ex = Vec::new();
+                    for (k, (a, b)) in cpu.as_raw().iter().zip(gpu.iter()).enumerate() {
+                        if k % 4 != 3 && a.abs_diff(*b) > 2 && ex.len() < 4 {
+                            let px = k / 4;
+                            ex.push(format!("({},{}) c{} cpu {} gpu {}", px % sw as usize, px / sw as usize, k % 4, a, b));
+                        }
+                    }
+                    eprintln!("selftest   over 2: {over} values; {}", ex.join("; "));
+                }
+                let le = |l: usize| 100.0 * hist[..=l].iter().sum::<u64>() as f64 / n.max(1) as f64;
+                eprintln!(
+                    "selftest z={z} {sw}x{sh} preset {i} {:?} kernel {}: <=0 {:.2}% <=1 {:.3}% <=2 {:.3}% max {max}  cpu {:.0} ms gpu {:.0} ms",
+                    p.name,
+                    p.resize_code(interp),
+                    le(0),
+                    le(1),
+                    le(2),
+                    tc.as_secs_f64() * 1000.0,
+                    tg.as_secs_f64() * 1000.0
+                );
+            }
+        }
+        // the GPU path's band decode against the processor path's decode of the same file
+        // (the processor path, not the image crate: their JPEG decoders differ by up to 5)
+        if let Some(e) = self.cur_entry() {
+            if let Ok(d) = decode::decode(&e, self.cfg.exif_rotate, false) {
+                {
+                    let img = d.frames[0].img.clone();
+                    let mut max = 0u8;
+                    let mut over1 = 0u64;
+                    for (k, (a, b)) in img.as_raw().iter().zip(base.as_raw().iter()).enumerate() {
+                        if k % 4 != 3 {
+                            let d = a.abs_diff(*b);
+                            max = max.max(d);
+                            over1 += (d > 1) as u64;
+                        }
+                    }
+                    eprintln!("selftest decoder: GPU texture vs processor decode {}x{}: max {max}, over 1: {over1} of {}", img.width(), img.height(), img.as_raw().len() / 4 * 3);
+                }
+            }
+        }
+        // the view transform: rotations, flips, Negative, Gamma, with Soften+Sharpen
+        let p = crate::filters::builtins()[2].clone();
+        let xfs = [
+            (1u8, false, false, false, false),
+            (2, false, false, false, false),
+            (3, false, false, false, false),
+            (0, true, false, false, false),
+            (0, false, true, false, false),
+            (1, true, false, false, false),
+            (0, false, false, true, false),
+            (0, false, false, false, true),
+            (3, false, true, true, true),
+        ];
+        for (n, &(rot, fh, fv, neg, gam)) in xfs.iter().enumerate() {
+            let xf = crate::gpu::Xform { rot, flip_h: fh, flip_v: fv, negative: neg, gamma: gam };
+            let shown = decode::transform(&base, rot, fh, fv, neg, gam);
+            let z = 0.29;
+            let (sw, sh) = (((shown.width() as f64 * z).round() as u32).max(1), ((shown.height() as f64 * z).round() as u32).max(1));
+            let mut cpu = render::resize(&shown, sw, sh, p.resize_code(interp));
+            render::sharpen(&mut cpu, p.amount as f32 / 100.0, p.radius as f32 / 100.0, p.threshold);
+            let q = crate::gpu::Hq { key: 0xBEEF ^ n as u64, w: sw, h: sh, kernel: p.resize_code(interp), amount: p.amount as f32 / 100.0, sigma: p.radius as f32 / 100.0, threshold: p.threshold, x: 0, y: 0, xf };
+            let raw = self.gpu.as_mut().map(|g| g.hq_readback(self.base_gen as u64, &base, &q)).unwrap_or_default();
+            let (uw, uh) = if rot % 2 == 1 { (sh, sw) } else { (sw, sh) };
+            let Some(un) = RgbaImage::from_raw(uw, uh, raw) else { eprintln!("selftest xf {xf:?}: readback failed"); continue };
+            // the GPU copy is unrotated: turn it as the layer shader does, to compare
+            let gpu = decode::transform(&Arc::new(un), rot, fh, fv, false, false);
+            let mut max = 0u8;
+            let mut over1 = 0u64;
+            for (k, (a, b)) in cpu.as_raw().iter().zip(gpu.as_raw().iter()).enumerate() {
+                if k % 4 != 3 {
+                    let d = a.abs_diff(*b);
+                    max = max.max(d);
+                    if d > 1 {
+                        over1 += 1;
+                    }
+                }
+            }
+            eprintln!("selftest xf {xf:?}: size {}x{} vs {}x{}, max {max}, over 1: {over1}", cpu.width(), cpu.height(), gpu.width(), gpu.height());
+        }
+        std::process::exit(0);
+    }
+
+    /// Draw the animation row alone into `rows` (the window's rows y0..y1, `w` wide, of a
+    /// window `h` tall): holes, then the row. True if it landed on exactly those rows.
+    fn draw_anim_band(&mut self, rows: &mut [u32], w: usize, y0: usize, y1: usize, h: usize) -> bool {
+        let Some(mut t) = self.text.borrow_mut().take() else { return false };
+        let hover_fx = self.hover_fx.clone();
+        let anim_fmt = self.anim_format();
+        let st = chrome::State {
+            sf: self.sf(),
+            title: "",
+            show_top: false,
+            show_bottom: true,
+            maximized: false,
+            lock_bottom: self.cfg.lock_bottom,
+            hover_fx: &hover_fx,
+            tip_fx: &[],
+            info_on: false,
+            index: self.index(),
+            len: self.len(),
+            anim: self.anim_frames().map(|n| (self.frame_idx.min(n - 1), n)),
+            anim_fmt: &anim_fmt,
+            anim_speed: self.anim_speed,
+            anim_fps: self.anim_fps(),
+            page_drag: None,
+            archive: false,
+            rtl: false,
+            flip_h: false,
+            flip_v: false,
+        };
+        rows.fill(render::HOLE);
+        let mut c = Canvas { buf: rows, w, h: y1 - y0 };
+        let mut hits = Vec::new();
+        let band = chrome::draw_anim_row(&mut c, &mut t, &st, &mut hits, h as f32, y0 as f32);
+        *self.text.borrow_mut() = Some(t);
+        band == Some((y0, y1))
+    }
+
+    /// The GPU path: the interface on the processor with holes, the image on the GPU.
+    fn render_gpu(&mut self, w: u32, h: u32) {
+        if std::env::var_os("ARKIMAGE_GPU_SELFTEST").is_some() && self.displaying_current() {
+            self.ensure_base();
+            self.gpu_selftest();
+        }
+        let n = (w * h) as usize;
+        let mut buf = std::mem::take(&mut self.gpu_buf);
+        let (wu, hu) = (w as usize, h as usize);
+        // an animation frame alone: redraw only the animation row (counter and track); the
+        // rest of the interface and the image placement stay as last drawn. Measured on a
+        // 3420x2148 window: the full interface took 6% CPU at 30 frames a second and the
+        // change scan another 4%.
+        let fast = !self.ui_dirty && buf.len() == n && self.gpu_img.is_some() && self.gpu_slide.is_none() && self.gpu_hq.is_none();
+        self.ui_dirty = false;
+        let mut rows = None;
+        if let (true, Some((y0, y1))) = (fast, self.anim_band) {
+            self.ensure_base();
+            // (0, 0): no animation row on screen (bar hidden); nothing in the interface
+            // follows the frame
+            if y0 == y1 || self.draw_anim_band(&mut buf[y0 * wu..y1 * wu], wu, y0, y1, hu) {
+                // the new frame is the layer a slide starts from, as draw() marks it
+                self.gpu_settle = self.cfg.slide_ms > 0;
+                rows = Some((y0, y1));
+                crate::trace("anim row only");
+            }
+        }
+        if rows.is_none() {
+            buf.resize(n, 0);
+            self.gpu_img = None;
+            self.gpu_hq = None;
+            self.gpu_slide = None;
+            self.gpu_settle = false;
+            self.gpu_motion = 0.0;
+            {
+                let mut c = Canvas { buf: &mut buf, w: wu, h: hu };
+                crate::trace("draw start");
+                crate::chrome::reset_anim_band();
+                self.draw(&mut c);
+            }
+            crate::trace("draw end");
+            // the animation row may be redrawn alone only if, drawn alone, it matches what
+            // the full draw left in its rows
+            let was = self.anim_band.is_some();
+            self.anim_band = None;
+            let band = crate::chrome::last_anim_band();
+            if band.is_none() && self.gpu_img.is_some() && self.gpu_slide.is_none() {
+                self.anim_band = Some((0, 0));
+            }
+            if let Some((y0, y1)) = band.filter(|&(a, b)| a < b && b <= hu) {
+                if self.gpu_img.is_some() && self.gpu_slide.is_none() {
+                    let mut tmp = vec![0u32; (y1 - y0) * wu];
+                    if self.draw_anim_band(&mut tmp, wu, y0, y1, hu) && tmp[..] == buf[y0 * wu..y1 * wu] {
+                        self.anim_band = Some((y0, y1));
+                    }
+                }
+            }
+            if was != self.anim_band.is_some() {
+                crate::trace(&format!("anim row alone: {}", self.anim_band.is_some()));
+            }
+        }
+        let sf = self.sf();
+        let glass = self.glass_prepare();
+        let bg_alpha = if glass { self.glass_bg_alpha() } else { 1.0 };
+        if let Some(g) = &mut self.gpu {
+            g.set_see_through(glass);
+        }
+        let base = self.base.clone();
+        let image = match (&self.gpu_img, &base) {
+            (Some((ox, oy, z, smooth)), Some(b)) => Some(crate::gpu::ImageDraw { full_w: self.gpu_full_w(b), tex: self.base_tex.clone(), xf: self.gpu_xf(), key: self.base_gen as u64, img: b, ox: *ox, oy: *oy, z: *z, smooth: *smooth }),
+            _ => None,
+        };
+        let frame = crate::gpu::Frame {
+            hq: self.gpu_hq,
+            ui: &buf,
+            w,
+            h,
+            image,
+            bg: self.cfg.bg_color,
+            bg_alpha,
+            checker: self.cfg.transparent_grid,
+            radii: [crate::chrome::GLASS_BLUR * sf, crate::ui::CARD_BLUR * sf / 3.0, 12.0 * sf],
+            slide_old: self.gpu_slide,
+            motion: if self.gpu_slide.is_some() { self.gpu_motion } else { 0.0 },
+            settle: self.gpu_settle,
+            rows,
+        };
+        crate::trace("scan end");
+        let used = self.base_tex.as_ref().map(|t| t.bytes).unwrap_or(0);
+        let focused = self.window.as_ref().is_some_and(|w| w.has_focus());
+        let budget = crate::config::cache_mb() << 20;
+        if let Some(g) = &mut self.gpu {
+            g.note_use(used, focused, budget);
+        }
+        // a panic here would abort the whole app (it runs inside AppKit's callbacks): catch
+        // it, and let this window carry on with the processor
+        let res = self.gpu.as_mut().map(|g| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.render(&frame))).unwrap_or_else(|_| {
+                crate::trace("gpu: frame panicked; processor drawing for this window");
+                Err(crate::gpu::Fail::Lost)
+            })
+        });
+        drop(frame);
+        self.gpu_buf = buf;
+        match res {
+            Some(Ok(())) => {
+                self.unpainted = None;
+                crate::trace("present");
+            }
+            Some(Err(crate::gpu::Fail::Skip)) | None => {}
+            // the same state the covered check reads: covered now, not at the next check
+            // half a second later (meanwhile the repaint failsafe asked again 4 times a
+            // second, and 100 covered windows drew 100 frames a second at idle)
+            Some(Err(crate::gpu::Fail::Occluded)) => self.set_covered(true),
+            Some(Err(crate::gpu::Fail::Lost)) => {
+                // the GPU is gone: this window carries on with the processor
+                crate::trace("gpu lost: processor drawing");
+                self.cpu_surface();
+                self.request_redraw();
+            }
+        }
+        self.update_title();
+    }
+
     fn render(&mut self) {
         let Some(win) = self.window.clone() else { return };
         let sz = win.inner_size();
         let (w, h) = (sz.width.max(1), sz.height.max(1));
+        // Settings > Image Processing > Use GPU acceleration: switch this window's path
+        if self.gpu_wanted() != self.gpu_cfg {
+            self.gpu_cfg = self.gpu_wanted();
+            if self.gpu_cfg {
+                if let Some(g) = crate::gpu::GpuWin::new(win.clone()) {
+                    self.gpu = Some(g);
+                    crate::gpu::DECODE_TO_GPU.store(true, Ordering::Relaxed);
+                    self.surface = None;
+                    self._context = None;
+                    self.base = None;
+                }
+            } else if self.gpu.is_some() {
+                self.cpu_surface();
+            }
+        }
+        if self.gpu.is_some() {
+            if self.occluded {
+                // nothing to show; the uncovering redraws
+                return;
+            }
+            self.render_gpu(w, h);
+            return;
+        }
         let Some(mut surface) = self.surface.take() else { return };
         if surface.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap()).is_ok() {
             if let Ok(mut buf) = surface.buffer_mut() {
@@ -1951,7 +2417,11 @@ impl App {
             }
             return;
         }
-        if self.glass_loaded {
+        let on_gpu = self.gpu.is_some();
+        if on_gpu {
+            // everything starts as a hole: the GPU draws background and image under it
+            c.fill(crate::render::HOLE);
+        } else if self.glass_loaded {
             crate::render::GLASS_BG.store(self.cfg.bg_color, std::sync::atomic::Ordering::Relaxed);
             c.fill(GLASS_MARK | 0xFF_FFFF);
         } else {
@@ -1981,13 +2451,67 @@ impl App {
                     let w = c.w as f64;
                     let d = s.dir as f64;
                     slide_at = Some((d * w * (1.0 - e), (-d * w * e).round() as i64));
+                    // GPU motion blur: the distance moved over one frame (the ease's speed,
+                    // 3 (1 - t)^2, times the frame time), smeared over half of it each way
+                    // of the frame's position, so a fast start blurs and the landing is sharp
+                    // a first frame has no previous one: count one 60 Hz frame (measured: an
+                    // old timestamp gave a 349 px smear on the first frame)
+                    let since = self.slide_drawn.elapsed().as_secs_f64();
+                    let frame_ms = if since > 0.05 { 16.7 } else { since.max(0.004) * 1000.0 };
+                    let per_frame = w * 3.0 * (1.0 - t).powi(2) * frame_ms / self.cfg.slide_ms as f64;
+                    self.gpu_motion = (per_frame * 0.5 * 0.5) as f32;
                 }
             }
         }
         if let (Some((_, dx_old)), Some(s)) = (slide_at, &self.slide) {
-            shift_rows(c, &s.old, dx_old);
+            if on_gpu {
+                self.gpu_slide = Some(dx_old as f64);
+            } else {
+                shift_rows(c, &s.old, dx_old);
+            }
         }
-        if let Some(l) = self.compute_layout(c.w as f64, c.h as f64) {
+        if let Some(l) = self.compute_layout(c.w as f64, c.h as f64).filter(|_| on_gpu) {
+            // the GPU draws the image; slides and pinch zoom move it there
+            let dx_new = slide_at.map(|s| s.0).unwrap_or(0.0);
+            let smooth = self.pinch_at.is_some() || self.preset().smooth();
+            self.gpu_img = Some((l.ox + dx_new, l.oy, l.z, smooth));
+            // settled: the full-quality shrink (and sharpening), as the processor does it
+            let preset = self.preset();
+            let up_sharp = preset.amount > 0 && preset.smooth() && l.z <= 4.0 && l.sw * l.sh <= 40e6;
+            // a playing animation draws its frames from their mipmaps: the full-quality
+            // shrink for every frame cost 38% CPU on a 30 fps Lottie
+            let playing = self.next_frame_at.is_some();
+            if slide_at.is_none() && self.pinch_at.is_none() && !playing && (l.z < 0.999 || (l.z > 1.001 && up_sharp)) {
+                let (sw, sh) = ((l.sw.round() as u32).max(1), (l.sh.round() as u32).max(1));
+                let fp = preset.fingerprint(self.cfg.interp);
+                let xf = self.gpu_xf();
+                let xk = xf.rot as u64 | (xf.flip_h as u64) << 2 | (xf.flip_v as u64) << 3 | (xf.negative as u64) << 4 | (xf.gamma as u64) << 5;
+                let key = (self.base_gen as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (sw as u64) << 40 ^ (sh as u64) << 20 ^ fp.rotate_left(7) ^ xk << 58;
+                self.gpu_hq = Some(crate::gpu::Hq {
+                    key,
+                    w: sw,
+                    h: sh,
+                    kernel: preset.resize_code(self.cfg.interp),
+                    amount: preset.amount as f32 / 100.0,
+                    sigma: preset.radius as f32 / 100.0,
+                    threshold: preset.threshold,
+                    x: l.ox.round() as i64,
+                    y: l.oy.round() as i64,
+                    xf,
+                });
+            }
+            if slide_at.is_some() {
+                self.slide_drawn = Instant::now();
+            }
+            let key = (self.base_gen as u64, l.ox.to_bits(), l.oy.to_bits(), l.z.to_bits(), c.w, c.h);
+            if self.cfg.slide_ms > 0 && ready && self.pinch_at.is_none() && slide_at.is_none() && self.last_key != Some(key) {
+                // the GPU keeps the settled layer; this only marks that one exists
+                self.gpu_settle = true;
+                self.last_frame.clear();
+                self.last_frame.push(0);
+                self.last_key = Some(key);
+            }
+        } else if let Some(l) = self.compute_layout(c.w as f64, c.h as f64) {
             let base = self.base.clone().unwrap();
             let preset = self.preset();
             if let Some((dx_new, _)) = slide_at {
@@ -2279,8 +2803,6 @@ impl App {
                     w.set_minimized(true);
                 }
             }
-            "next1" => self.step(1, true),
-            "prev1" => self.step(-1, true),
             "scroll_up" => self.scroll(-1.0),
             "scroll_down" => self.scroll(1.0),
             "scroll_left" | "scroll_right" => {
@@ -2411,8 +2933,6 @@ impl App {
                 self.view.rotation = 0;
                 self.rotate(0);
             }
-            K::ArrowRight if sh => self.step(1, true),
-            K::ArrowLeft if sh => self.step(-1, true),
             K::ArrowRight | K::Space => self.next(),
             K::ArrowLeft | K::Backspace => self.prev(),
             K::PageDown if p && alt => self.random(),
@@ -2480,21 +3000,9 @@ impl App {
                 self.msg(if self.view.zoom_fixed { "Fix zoom in/out: On" } else { "Fix zoom in/out: Off" });
             }
 
-            K::Digit0 | K::Numpad0 if p => self.set_slideshow(0),
-            K::Digit1 if p => self.set_slideshow(1),
-            K::Digit2 if p => self.set_slideshow(2),
-            K::Digit3 if p => self.set_slideshow(3),
-            K::Digit4 if p => self.set_slideshow(4),
-            K::Digit5 if p => self.set_slideshow(5),
-            K::Digit6 if p => self.set_slideshow(6),
-            K::Digit7 if p => self.set_slideshow(7),
-            K::Digit8 if p => self.set_slideshow(8),
-            K::Digit9 if p => self.set_slideshow(9),
             K::Digit0 | K::Numpad0 => self.set_mode(0),
             K::Digit9 | K::Numpad9 => self.set_mode(1),
             K::Digit8 | K::Numpad8 => self.set_mode(2),
-            K::Digit7 | K::Numpad7 => self.set_double(1),
-            K::Digit6 | K::Numpad6 => self.set_double(2),
 
             K::Tab if sh => {
                 self.show_name = !self.show_name;
@@ -2525,9 +3033,6 @@ impl App {
                 }
                 self.msg(if self.on_top { "Always On Top: On" } else { "Always On Top: Off" });
             }
-            K::KeyB if sh => self.open_last_bookmark(),
-            K::KeyB => self.add_bookmark(),
-            K::F3 => self.edit_bookmarks(),
             // ` locks the top menu, ~ (Shift+`) locks the bottom control bar, as in Honeyview.
             K::Backquote if sh => {
                 self.cfg.lock_bottom = !self.cfg.lock_bottom;
@@ -2757,8 +3262,6 @@ impl App {
                 C("mode0".into(), "Original Size (100%)".into(), "0", cfg.view_mode == 0),
                 C("mode1".into(), "Fit in Window".into(), "9", cfg.view_mode == 1),
                 C("mode2".into(), "Fit to Width".into(), "8", cfg.view_mode == 2),
-                C("dbl1".into(), "Smart Double Page (Left->Right)".into(), "7", cfg.double == 1),
-                C("dbl2".into(), "Smart Double Page (Left<-Right)".into(), "6", cfg.double == 2),
             ]
         };
         match kind {
@@ -2770,39 +3273,6 @@ impl App {
                     C(format!("spd:{q}"), format!("{}\u{d7}", chrome::fmt_speed(v)), "", (self.anim_speed - v).abs() < 0.01)
                 })
                 .collect(),
-            "slideshow" => {
-                let cur = self.slideshow.map(|s| s.0).unwrap_or(0);
-                let mut m = vec![C("ss:0".into(), "Stop Slideshow".into(), "Ctrl+0", cur == 0), S];
-                for s in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 60, 90] {
-                    let label = if s == 1 { "1 Second".to_string() } else { format!("{s} Seconds") };
-                    let key = if s < 10 { ["", "Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6", "Ctrl+7", "Ctrl+8", "Ctrl+9"][s as usize] } else { "" };
-                    m.push(C(format!("ss:{s}"), label, key, cur == s));
-                }
-                m.extend([S, C("ssloop".into(), "Repeat".into(), "", cfg.slideshow_loop), C("ssrand".into(), "Random".into(), "", cfg.slideshow_random)]);
-                m
-            }
-            "bookmark" => {
-                self.bm_cache = std::fs::read_to_string(Self::bookmarks_path())
-                    .unwrap_or_default()
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(String::from)
-                    .collect();
-                let mut m = vec![
-                    I("bmadd".into(), "Add to Bookmarks".into(), "B", has),
-                    I("bmdel".into(), "Delete All Bookmarks".into(), "", !self.bm_cache.is_empty()),
-                    I("bmedit".into(), "Edit Bookmarks".into(), "F3", true),
-                ];
-                if !self.bm_cache.is_empty() {
-                    m.push(S);
-                    let start = self.bm_cache.len().saturating_sub(30);
-                    for i in (start..self.bm_cache.len()).rev() {
-                        m.push(I(format!("bm:{i}"), self.bm_cache[i].replace('&', "&&"), "", true));
-                    }
-                }
-                m
-            }
             "edit" => vec![
                 I("clip".into(), "Copy to Clipboard".into(), "Ctrl+C", has),
                 I("editor".into(), "Open with Image Editor".into(), "Ctrl+E", has),
@@ -3452,13 +3922,9 @@ impl App {
         if c.sort != before.sort || c.sort_desc != before.sort_desc {
             self.resort();
         }
-        if c.view_mode != before.view_mode || c.stretch_small != before.stretch_small || c.double != before.double || c.align_top != before.align_top {
+        if c.view_mode != before.view_mode || c.stretch_small != before.stretch_small || c.align_top != before.align_top {
             self.view.user_zoom = None;
             self.view.pan_reset = true;
-            if c.double != 0 {
-                self.next_frame_at = None;
-                self.preload();
-            }
         }
         // live preview: redraw the viewer with the changed filter preset
         // (the scaled-image key holds the preset's fingerprint, so a redraw re-filters)
@@ -3467,15 +3933,6 @@ impl App {
         }
         if c.thumb_cache_mb != before.thumb_cache_mb {
             self.thumb_jobs.disk.store(c.thumb_cache_mb > 0, Ordering::Relaxed);
-        }
-        if c.cache_mb != before.cache_mb {
-
-        }
-        if let Some((secs, t)) = self.slideshow {
-            if c.slideshow_secs != before.slideshow_secs {
-                let _ = (secs, t);
-                self.slideshow = Some((c.slideshow_secs, Instant::now() + Duration::from_secs(c.slideshow_secs as u64)));
-            }
         }
         self.invalidate();
         self.settings_redraw();
@@ -3568,16 +4025,6 @@ impl App {
             self.cfg.save();
             return;
         }
-        if let Some(n) = id.strip_prefix("ss:") {
-            self.set_slideshow(n.parse().unwrap_or(0));
-            return;
-        }
-        if let Some(n) = id.strip_prefix("bm:") {
-            if let Some(line) = n.parse::<usize>().ok().and_then(|i| self.bm_cache.get(i).cloned()) {
-                self.open_bookmark_line(&line);
-            }
-            return;
-        }
         match id {
             "open" => self.open_dialog(),
             "open_folder" => self.open_folder_dialog(),
@@ -3645,8 +4092,6 @@ impl App {
             "mode0" => self.set_mode(0),
             "mode1" => self.set_mode(1),
             "mode2" => self.set_mode(2),
-            "dbl1" => self.set_double(1),
-            "dbl2" => self.set_double(2),
             "zin" => self.zoom_step(true, None),
             "zout" => self.zoom_step(false, None),
             "zfix" => self.view.zoom_fixed = !self.view.zoom_fixed,
@@ -3675,15 +4120,6 @@ impl App {
             }
             "editor" => self.open_editor(),
             "clip" => self.copy_image(),
-            "ssloop" => self.cfg.slideshow_loop = !self.cfg.slideshow_loop,
-            "ssrand" => self.cfg.slideshow_random = !self.cfg.slideshow_random,
-            "bmadd" => self.add_bookmark(),
-            "bmedit" => self.edit_bookmarks(),
-            "bmdel" => {
-                if crate::dialog::ask(self.window.as_deref(), "ArkImage", "Do you want to delete all the saved bookmarks?", crate::dialog::Kind::Warn) {
-                    let _ = std::fs::write(Self::bookmarks_path(), "");
-                }
-            }
             "config" => self.open_settings(el, 0),
             "exit" => self.exit(el),
             "closeall" => {
@@ -3840,8 +4276,8 @@ impl App {
 
     /// Frame count of the current image when it animates and plays; None otherwise.
     fn anim_frames(&self) -> Option<usize> {
-        let n = self.current.as_ref()?.1.frames.len();
-        (n > 1 && self.cfg.double == 0).then_some(n)
+        let n = self.current.as_ref()?.1.frame_count();
+        (n > 1).then_some(n)
     }
 
     /// Scrub: show the frame under the cursor and hold it while the button is down.
@@ -3881,7 +4317,7 @@ impl App {
     /// Frames per second shown in the speed pill: the current frame's rate at this speed.
     fn anim_fps(&self) -> u32 {
         let Some((_, d)) = &self.current else { return 0 };
-        let ms = self.frame_ms(d.frames[self.frame_idx.min(d.frames.len().saturating_sub(1))].delay_ms);
+        let ms = self.frame_ms(d.frame_delay(self.frame_idx));
         (1000.0 / ms as f32).round() as u32
     }
 
@@ -3890,7 +4326,7 @@ impl App {
         // re-time the frame on screen from now, so a slower speed takes effect at once
         if self.next_frame_at.is_some() {
             if let Some(d) = self.current.as_ref().map(|c| c.1.clone()) {
-                let ms = self.frame_ms(d.frames[self.frame_idx.min(d.frames.len() - 1)].delay_ms);
+                let ms = self.frame_ms(d.frame_delay(self.frame_idx));
                 self.next_frame_at = Some(Instant::now() + Duration::from_millis(ms));
             }
         }
@@ -3899,13 +4335,13 @@ impl App {
 
     fn advance_frame(&mut self, now: Instant) {
         let Some(d) = self.current.as_ref().map(|c| c.1.clone()) else { return };
-        let n = d.frames.len();
-        if n < 2 || self.cfg.double != 0 {
+        let n = d.frame_count();
+        if n < 2 {
             self.next_frame_at = None;
             return;
         }
         self.frame_idx = (self.frame_idx + 1) % n;
-        let delay = self.frame_ms(d.frames[self.frame_idx].delay_ms);
+        let delay = self.frame_ms(d.frame_delay(self.frame_idx));
         // Keep cadence; do not fall behind after a slow frame.
         let mut next = self.next_frame_at.unwrap_or(now) + Duration::from_millis(delay);
         if next < now {
@@ -3913,7 +4349,10 @@ impl App {
         }
         self.next_frame_at = Some(next);
         self.base = None;
-        self.request_redraw();
+        // only the frame changed: the animation row can be redrawn alone (ui_dirty stays)
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 }
 
@@ -3982,11 +4421,15 @@ impl App {
             win.set_maximized(true);
         }
         crate::trace("window created");
-        let ctx = softbuffer::Context::new(win.clone()).expect("softbuffer context");
-        let surface = softbuffer::Surface::new(&ctx, win.clone()).expect("softbuffer surface");
+        self.gpu_cfg = self.gpu_wanted();
+        if self.gpu_cfg {
+            self.gpu = crate::gpu::GpuWin::new(win.clone());
+            crate::gpu::DECODE_TO_GPU.store(self.gpu.is_some(), Ordering::Relaxed);
+        }
         self.window = Some(win);
-        self._context = Some(ctx);
-        self.surface = Some(surface);
+        if self.gpu.is_none() {
+            self.cpu_surface();
+        }
         if let Some(p) = self.pending_open.take() {
             self.open_path(&p);
         }
@@ -4071,6 +4514,17 @@ impl App {
             self.settings_event(el, ev);
             return;
         }
+        // zooming, panning, clicking or typing in a window that kept only its screen-sized
+        // copy brings the full image back (a scroll or pinch reaches a window without
+        // focusing it on the Mac)
+        if self.stripped
+            && matches!(
+                ev,
+                WindowEvent::MouseWheel { .. } | WindowEvent::PinchGesture { .. } | WindowEvent::MouseInput { .. } | WindowEvent::KeyboardInput { .. }
+            )
+        {
+            self.unstrip();
+        }
         match ev {
             WindowEvent::CloseRequested => self.exit(el),
             WindowEvent::Moved(_) => self.track_geometry(),
@@ -4082,6 +4536,24 @@ impl App {
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => self.render(),
+            // covered or minimized: stop drawing and give the GPU memory back; uncovered:
+            // draw again (the image is uploaded anew)
+            // macOS: the event says "visible" for a window under one of ours (see
+            // is_occluded), and taking it as is flipped such windows between covered and
+            // uncovered, each flip a redraw and a new decode; the event asks again instead
+            #[cfg(target_os = "macos")]
+            WindowEvent::Occluded(o) => {
+                let c = o || self.window.as_ref().is_some_and(|w| crate::mac::is_occluded(w));
+                self.set_covered(c);
+            }
+            #[cfg(not(target_os = "macos"))]
+            WindowEvent::Occluded(o) => self.set_covered(o),
+            WindowEvent::Focused(true) => {
+                self.unstrip();
+                // the focused window preloads its neighbours (GPU mode)
+                self.update_wanted();
+                self.preload();
+            }
             WindowEvent::DroppedFile(p) => self.open_path(&p),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             // A synthetic press is a key already held when the window gained focus; it was
@@ -4288,7 +4760,7 @@ impl App {
                         // resume playback from the frame let go on
                         self.anim_drag = false;
                         if let Some(d) = self.current.as_ref().map(|c| c.1.clone()) {
-                            let ms = self.frame_ms(d.frames[self.frame_idx.min(d.frames.len() - 1)].delay_ms);
+                            let ms = self.frame_ms(d.frame_delay(self.frame_idx));
                             self.next_frame_at = Some(Instant::now() + Duration::from_millis(ms));
                         }
                         self.request_redraw();
@@ -4412,18 +4884,88 @@ impl App {
         true
     }
 
-    /// Timers for this window (animation, slideshow, toast, fade); returns the next deadline.
+    /// Timers for this window (animation, toast, fade); returns the next deadline.
     pub fn about_to_wait(&mut self) -> Option<Instant> {
         let now = Instant::now();
+        // macOS: ask whether the window is covered, twice a second (winit only passed on
+        // "visible": stacked windows were never reported covered)
+        #[cfg(target_os = "macos")]
+        if self.gpu.is_some() && now >= self.occ_checked {
+            self.occ_checked = shared_tick(now, Duration::from_millis(500));
+            if let Some(w) = self.window.clone() {
+                self.set_covered(crate::mac::is_occluded(&w));
+            }
+            // a window covered before its image arrived was not stripped then (see strip);
+            // still covered half a second on, it gives the full image back now
+            if self.occluded && !self.stripped && self.current.is_some() {
+                self.strip();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        let occ_at = self.gpu.is_some().then_some(self.occ_checked);
+        #[cfg(not(target_os = "macos"))]
+        let occ_at: Option<Instant> = None;
+        // test hook: ARKIMAGE_TEST_PINCH_MS=<n> pinches from n ms after start: a zoom step
+        // every 8 ms for 1.5 s (in, then out), as trackpad events arrive
+        let mut pinch_hook_at = None;
+        if let Some(ms) = std::env::var("ARKIMAGE_TEST_PINCH_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+            let t0 = *T0.get_or_init(Instant::now);
+            let start = t0 + Duration::from_millis(ms);
+            let end = start + Duration::from_millis(1500);
+            if now >= start && now < end {
+                let mut last = LAST.lock().unwrap();
+                if last.is_none_or(|l| now.duration_since(l) >= Duration::from_millis(8)) {
+                    *last = Some(now);
+                    if let Some(l) = self.layout {
+                        let k = if now < start + Duration::from_millis(750) { 1.01 } else { 1.0 / 1.01 };
+                        self.pinch_at = Some(now);
+                        crate::trace("test: pinch step");
+                        let c = Some((l.ww / 2.0, l.wh / 2.0));
+                        self.zoom_to(l.z * k, c);
+                        self.request_redraw();
+                    }
+                }
+                pinch_hook_at = Some(now + Duration::from_millis(8));
+            } else if now < start {
+                pinch_hook_at = Some(start);
+            }
+        }
+        // test hook: ARKIMAGE_TEST_NEXT_MS=<n> steps to the next image n ms after start
+        let mut hook_at = None;
+        if let Some(ms) = std::env::var("ARKIMAGE_TEST_NEXT_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            if T0.get_or_init(Instant::now).elapsed().as_millis() as u64 >= ms && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // ARKIMAGE_TEST_XF="rot,fh,fv,neg,gamma" sets the view transform instead
+                if let Ok(x) = std::env::var("ARKIMAGE_TEST_XF") {
+                    let v: Vec<u8> = x.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                    if v.len() == 5 {
+                        self.view.rotation = v[0] % 4;
+                        self.view.flip_h = v[1] != 0;
+                        self.view.flip_v = v[2] != 0;
+                        self.view.negative = v[3] != 0;
+                        self.view.gamma = v[4] != 0;
+                        self.view.user_zoom = None;
+                        self.view.pan_reset = true;
+                        crate::trace("test: transform set");
+                        self.invalidate();
+                    }
+                    return hook_at;
+                }
+                crate::trace("test: next image");
+                self.step(1, false);
+            } else if !DONE.load(std::sync::atomic::Ordering::Relaxed) {
+                hook_at = Some(*T0.get().unwrap() + Duration::from_millis(ms));
+            }
+        }
+        if self.gpu.as_mut().is_some_and(|g| g.poll_budget()) {
+            self.strip();
+        }
         if let Some(t) = self.next_frame_at {
             if now >= t {
                 self.advance_frame(now);
-            }
-        }
-        if let Some((secs, t)) = self.slideshow {
-            if now >= t {
-                self.slideshow = Some((secs, now + Duration::from_secs(secs as u64)));
-                self.slideshow_tick();
             }
         }
         if let Some((_, t)) = &self.toast {
@@ -4435,7 +4977,7 @@ impl App {
         // a file deleted outside the app is noticed within GONE_EVERY
         let gone_at = self.playlist.is_some().then(|| self.gone_at);
         if gone_at.is_some_and(|t| now >= t) {
-            self.gone_at = now + GONE_EVERY;
+            self.gone_at = shared_tick(now, GONE_EVERY);
             self.check_gone();
         }
         let gone_at = self.playlist.is_some().then(|| self.gone_at);
@@ -4447,7 +4989,12 @@ impl App {
         }
         let pinch_end = self.pinch_at.map(|t| t + PINCH_SETTLE);
         // Chrome fade: one frame every 16 ms until it settles (unpaced it drew ~380 fps).
-        let fade_at = self.fade_active.then(|| self.fade_last + Duration::from_millis(16));
+        // A covered window draws nothing, so nothing it waits for here would settle: it
+        // asked again on every loop pass (44,811 times in 3 s with 100 windows), and the
+        // glass check below every 16 ms per window (the idle CPU of covered windows).
+        // Uncovering redraws it.
+        let live = !self.occluded;
+        let fade_at = (live && self.fade_active).then(|| self.fade_last + Duration::from_millis(16));
         if let Some(t) = fade_at {
             if now >= t {
                 self.request_redraw();
@@ -4461,7 +5008,7 @@ impl App {
             || self.modal_at.is_some_and(|t| t.elapsed() < Duration::from_millis(260))
             || self.glass_fading()
             || (!self.glass_on && self.glass_loaded);
-        let ui_at = fading.then(|| self.fade_last + Duration::from_millis(16));
+        let ui_at = (live && fading).then(|| self.fade_last + Duration::from_millis(16));
         if ui_at.is_some_and(|t| now >= t) {
             self.fade_last = now;
             self.request_redraw();
@@ -4479,7 +5026,7 @@ impl App {
         }
         // failsafe: an image stored for display with no paint since; ask for the paint again
         // a hidden or minimized window paints when shown, so it needs no retry
-        if self.window.as_ref().is_some_and(|w| w.is_visible() == Some(false) || w.is_minimized() == Some(true)) {
+        if self.occluded || self.window.as_ref().is_some_and(|w| w.is_visible() == Some(false) || w.is_minimized() == Some(true)) {
             self.unpainted = None;
         }
         let retry_at = self.unpainted.map(|t| t + REPAINT_RETRY);
@@ -4490,7 +5037,7 @@ impl App {
             self.unpainted = Some(now);
             self.request_redraw();
         }
-        [self.next_frame_at, self.slideshow.map(|s| s.1), self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at, retry_at, self.fs_restore_at]
+        [self.next_frame_at, self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at, retry_at, self.fs_restore_at, hook_at, pinch_hook_at, occ_at]
             .into_iter()
             .flatten()
             .min()

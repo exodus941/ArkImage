@@ -153,9 +153,9 @@ impl Master {
         }
     }
 
-    /// Keep the shared cache under cache_mb, dropping the images farthest from every window.
+    /// Keep the shared cache under config::cache_mb(), dropping the images farthest from every window.
     fn evict(&mut self) {
-        let budget = self.cfg.cache_mb * 1024 * 1024;
+        let budget = crate::config::cache_mb() * 1024 * 1024;
         let mut cache = self.sh.cache.borrow_mut();
         let mut total: u64 = cache.values().map(|d| d.bytes()).sum();
         if total <= budget {
@@ -316,7 +316,7 @@ impl ApplicationHandler<UserEvent> for Master {
             }
             UserEvent::Font(t) => {
                 *self.sh.text.borrow_mut() = t;
-                for w in &self.windows {
+                for w in &mut self.windows {
                     w.request_redraw();
                 }
             }

@@ -26,9 +26,75 @@ pub fn glass_real(p: u32) -> u32 {
     rgb(s(bg >> 16), s(bg >> 8), s(bg))
 }
 
+/// GPU image layer: a "hole" pixel shows the GPU-drawn image layer under whatever the
+/// interface drew over it. Top byte: 0b0000_cc10, `cc` the blur class the GPU applies to
+/// the layer there (0 none, 1 bar and title strip, 2 cards, 3 picker backdrop). Low 24
+/// bits: the interface colour drawn over it, premultiplied, as RGB 5-6-5 in bits 8-23,
+/// and its coverage 0-255 in bits 0-7. Coverage 255 is stored as a plain opaque pixel.
+pub const HOLE: u32 = 0x0200_0000;
+pub const BLUR_BAR: u32 = 1;
+pub const BLUR_CARD: u32 = 2;
+pub const BLUR_PICKER: u32 = 3;
+
+#[inline]
+pub fn is_hole(p: u32) -> bool {
+    p >> 24 & 3 == 2
+}
+
+#[inline]
+pub fn hole_class(p: u32) -> u32 {
+    p >> 26 & 3
+}
+
+/// A hole with this blur class, keeping what is drawn over it.
+#[inline]
+pub fn hole_with_class(p: u32, class: u32) -> u32 {
+    (p & 0x00FF_FFFF) | HOLE | class << 26
+}
+
+/// Premultiplied (r, g, b, a) of a plain or hole pixel, 0-255 floats.
+#[inline]
+fn pm(p: u32) -> [f32; 4] {
+    if is_hole(p) {
+        let c = p >> 8 & 0xFFFF;
+        let r = ((c >> 11) & 31) as f32 * 255.0 / 31.0;
+        let g = ((c >> 5) & 63) as f32 * 255.0 / 63.0;
+        let b = (c & 31) as f32 * 255.0 / 31.0;
+        [r, g, b, (p & 0xFF) as f32]
+    } else {
+        [(p >> 16 & 0xFF) as f32, (p >> 8 & 0xFF) as f32, (p & 0xFF) as f32, 255.0]
+    }
+}
+
+#[inline]
+fn from_pm(v: [f32; 4], class: u32) -> u32 {
+    let a = v[3].round().clamp(0.0, 255.0) as u32;
+    let q = |x: f32| x.round().clamp(0.0, 255.0) as u32;
+    if a >= 255 {
+        return rgb(q(v[0]), q(v[1]), q(v[2]));
+    }
+    let r5 = (v[0].max(0.0) * 31.0 / 255.0).round().min(31.0) as u32;
+    let g6 = (v[1].max(0.0) * 63.0 / 255.0).round().min(63.0) as u32;
+    let b5 = (v[2].max(0.0) * 31.0 / 255.0).round().min(31.0) as u32;
+    HOLE | class << 26 | (r5 << 11 | g6 << 5 | b5) << 8 | a
+}
+
+/// `mix` where either side is a hole: premultiplied blend, the class of the hole kept.
+#[cold]
+fn mix_hole(dst: u32, src: u32, a: u32) -> u32 {
+    let (d, s) = (pm(dst), pm(src));
+    let k = a as f32 / 255.0;
+    let v = [0, 1, 2, 3].map(|i| s[i] * k + d[i] * (1.0 - k));
+    let class = if is_hole(src) { hole_class(src) } else { hole_class(dst) };
+    from_pm(v, if is_hole(src) || is_hole(dst) { class } else { 0 })
+}
+
 /// Blend `src` over `dst` with alpha `a` (0-255).
 #[inline]
 pub fn mix(dst: u32, src: u32, a: u32) -> u32 {
+    if (dst | src) & 0x0200_0000 != 0 && (is_hole(dst) || is_hole(src)) {
+        return mix_hole(dst, src, a);
+    }
     let (dm, sm) = (dst >> 24 == 1, src >> 24 == 1);
     if dm && (sm || src & 0xFF_FFFF == 0) {
         // glass under glass or under black (a shadow): stays glass, the fraction mixed
@@ -78,12 +144,27 @@ impl Canvas<'_> {
 
     /// Blur a rectangle in place: three box passes each way (close to a Gaussian, sigma ~ r).
     /// The rectangle is box-downsampled by BLUR_F first; at 4x a 3440x142 strip costs 1/16 per pass.
-    pub fn blur(&mut self, x: i32, y: i32, w: i32, h: i32, r: usize) {
+    /// `class`: the GPU blur class for hole pixels (see HOLE); the GPU blurs the image layer
+    /// there, and only the interface's own pixels are blurred here.
+    pub fn blur(&mut self, x: i32, y: i32, w: i32, h: i32, r: usize, class: u32) {
         let x0 = x.max(0) as usize;
         let y0 = y.max(0) as usize;
         let x1 = ((x + w).max(0) as usize).min(self.w);
         let y1 = ((y + h).max(0) as usize).min(self.h);
         if x1 <= x0 + 2 || y1 <= y0 + 2 || r == 0 {
+            return;
+        }
+        let mut plain = false;
+        for py in y0..y1 {
+            for p in &mut self.buf[py * self.w + x0..py * self.w + x1] {
+                if is_hole(*p) {
+                    *p = hole_with_class(*p, class);
+                } else {
+                    plain = true;
+                }
+            }
+        }
+        if !plain {
             return;
         }
         // box downsample by BLUR_F into planar channels
@@ -143,7 +224,7 @@ impl Canvas<'_> {
                 // window glass stays glass: the blur is a rectangle, and its corners
                 // outside a rounded shape drew opaque squares over the glass
                 let i = py * self.w + px;
-                if self.buf[i] >> 24 != 1 {
+                if self.buf[i] >> 24 != 1 && !is_hole(self.buf[i]) {
                     self.buf[i] = rgb(s(&ch[0]), s(&ch[1]), s(&ch[2]));
                 }
             }

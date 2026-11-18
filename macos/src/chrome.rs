@@ -10,6 +10,22 @@ use crate::text::Text;
 #[path = "chrome_bar.rs"]
 mod bar;
 use bar::draw_bottom;
+pub use bar::draw_anim_row;
+
+thread_local! {
+    /// The animation row's band (rows y0..y1) from the last full draw, if one was drawn.
+    static ANIM_BAND: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Forget the band (a draw that may not reach the chrome starts with this).
+pub fn reset_anim_band() {
+    ANIM_BAND.with(|b| b.set(None));
+}
+
+/// The animation row's band from the last full draw.
+pub fn last_anim_band() -> Option<(usize, usize)> {
+    ANIM_BAND.with(|b| b.get())
+}
 pub use bar::{fmt_speed, page_label};
 /// Bottom-bar icon size, design px (menus align to the icon's edges).
 
@@ -28,7 +44,7 @@ pub const SLIDER_INSET: f32 = 16.0;
 /// Slider and scrub track height, design px.
 pub const TRACK_H: f32 = 12.0;
 /// Frosted glass: blur radius (design px) and tint opacities (0-255).
-const GLASS_BLUR: f32 = 32.0;
+pub const GLASS_BLUR: f32 = 32.0;
 const GLASS_TITLE_A: u32 = 205;
 const GLASS_BAR_A: u32 = 150;
 
@@ -144,6 +160,7 @@ pub fn slider_rect(w: f32, h: f32, sf: f32) -> (f32, f32, f32, f32) {
 
 pub fn draw(c: &mut Canvas, t: Option<&mut Text>, s: &State, hits: &mut Vec<Hit>) {
     let mut t = t;
+    ANIM_BAND.with(|b| b.set(None));
     if s.show_top {
         draw_top(c, t.as_deref_mut(), s, hits);
     }
@@ -164,7 +181,7 @@ fn draw_top(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, hits: &mut Vec<
     let th = (TITLE_H * sf).round();
 
     // Frosted glass: blur what is under the top chrome, then tint it.
-    c.blur(0, 0, w as i32, th as i32 + 1, (GLASS_BLUR * sf).round() as usize);
+    c.blur(0, 0, w as i32, th as i32 + 1, (GLASS_BLUR * sf).round() as usize, crate::render::BLUR_BAR);
     let isz = 16.0 * sf;
     // --- title bar ---
     #[cfg(target_os = "macos")]

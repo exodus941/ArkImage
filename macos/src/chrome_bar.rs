@@ -93,7 +93,7 @@ pub(super) fn draw_bottom(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, h
     let r = (BAR_RADIUS * sf).min(bh / 2.0);
 
     // frosted glass: blur and a dark tint, no outline
-    c.blur(bx as i32, by as i32, bw as i32, bh as i32, (GLASS_BLUR * sf).round() as usize);
+    c.blur(bx as i32, by as i32, bw as i32, bh as i32, (GLASS_BLUR * sf).round() as usize, crate::render::BLUR_BAR);
     c.fill_rrect(bx, by, bw, bh, r, 0x101010, GLASS_BAR_A as f32 / 255.0);
     hits.push(Hit { x0: bx, y0: by, x1: bx + bw, y1: by + bh, id: "bar" });
 
@@ -116,65 +116,10 @@ pub(super) fn draw_bottom(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, h
     c.fill_rrect(fx, vy, fw, vh, vh / 2.0, 0xFFFFFF, a);
     hits.push(Hit { x0: sx - 8.0 * sf, y0: sy - 8.0 * sf, x1: sx + sw + 8.0 * sf, y1: sy + sh + 8.0 * sf, id: "bar_slider" });
 
-    // Added 2026-11-16 by Claude on the Mac, for Windows and macOS (see docs/windows-handoff.md).
-    // animation scrub row: format pill, frame counter | track | speed dropdown
-    if let (Some((f, n)), Some(t)) = (s.anim, t.as_deref_mut()) {
-        let ph = (PILL_H * sf).round();
-        let pad = PILL_PAD * sf;
-        let px = 12.0 * sf;
-        let isz = 16.0 * sf;
-        // frame counter: current frame zero-padded to the digits of the count, "001/300"
-        let digits = n.to_string().len();
-        let counter = format!("{:0digits$}/{n}", f + 1);
-        let speed = format!("{}\u{d7} {}FPS", fmt_speed(s.anim_speed), s.anim_fps);
-        // the format and the counter are set in Geist Mono; the speed in Geist Medium
-        let prev = t.face(crate::text::Face::Mono);
-        let fmt_w = t.width(s.anim_fmt, px);
-        let cnt_w = t.width(&counter, px);
-        t.face(crate::text::Face::Medium);
-        let spd_w = t.width(&speed, px);
-        // pill widths: text + padding; the dropdown adds a 4 px gap and a 16 px chevron
-        let lw = (fmt_w + 2.0 * pad).round();
-        let cw = (cnt_w + 2.0 * pad).round();
-        let dw = (spd_w + 4.0 * sf + isz + 2.0 * pad).round();
-        let space = (PILL_SPACE * sf).round();
-        let (tx, ty, tw, th) = anim_track(c.w as f32, c.h as f32, sf, lw + space + cw, dw);
-        let py = ty + ((th - ph) / 2.0).round();
-        let mid = py + ph / 2.0;
-        // frosted glass, as the bar: blur, then a dark tint; the dropdown lightens on hover
-        let pill = |c: &mut Canvas, x: f32, w: f32, hover: f32| {
-            c.blur(x as i32, py as i32, w as i32, ph as i32, (GLASS_BLUR * sf).round() as usize);
-            c.fill_rrect(x, py, w, ph, ph / 2.0, 0x101010, GLASS_BAR_A as f32 / 255.0);
-            if hover > 0.0 {
-                c.fill_rrect(x, py, w, ph, ph / 2.0, 0xFFFFFF, 0.12 * hover);
-            }
-        };
-        // format pill and frame counter from the bar's left edge
-        let lx = bx;
-        pill(c, lx, lw, 0.0);
-        t.face(crate::text::Face::Mono);
-        text_mid(c, t, lx + pad, mid, s.anim_fmt, px, ICON);
-        let cx = lx + lw + space;
-        pill(c, cx, cw, 0.0);
-        text_mid(c, t, cx + pad, mid, &counter, px, ICON);
-        // speed dropdown, ending on the bar's right edge
-        let dx = bx + bw - dw;
-        let ha = s.hover_amt("anim_speed");
-        pill(c, dx, dw, ha);
-        let col = mix(ICON, 0xFFFFFF, (ha * 255.0) as u32);
-        t.face(crate::text::Face::Medium);
-        text_mid(c, t, dx + pad, mid, &speed, px, col);
-        icons::draw(c, Icon::ChevronDown, dx + dw - pad - isz / 2.0, mid, isz, col);
-        hits.push(Hit { x0: dx, y0: py, x1: dx + dw, y1: py + ph, id: "anim_speed" });
-        t.face(prev);
-        // the track: 4 px tall, centred in the row; the grab area is the row + 8 px
-        let vh = (4.0 * sf).round();
-        let vy = ty + ((th - vh) / 2.0).round();
-        c.fill_rrect(tx, vy, tw, vh, vh / 2.0, 0xFFFFFF, 0.14);
-        let frac = (f + 1) as f32 / n.max(1) as f32;
-        let a = 0.40 + 0.16 * s.hover_amt("anim_slider");
-        c.fill_rrect(tx, vy, (frac * tw).max(vh), vh, vh / 2.0, 0xFFFFFF, a);
-        hits.push(Hit { x0: tx - 8.0 * sf, y0: ty - 8.0 * sf, x1: tx + tw + 8.0 * sf, y1: ty + th + 8.0 * sf, id: "anim_slider" });
+    // animation scrub row (drawn on its own too: see draw_anim_row)
+    if let Some(t) = t.as_deref_mut() {
+        let band = draw_anim_row(c, t, s, hits, c.h as f32, 0.0);
+        super::ANIM_BAND.with(|b| b.set(band));
     }
 
     // icon row, centred; Tabler icons, 20 px
@@ -265,4 +210,74 @@ fn thousands(v: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+/// The animation scrub row: format pill, frame counter | track | speed dropdown. Laid out
+/// for a window `full_h` tall; drawn `y_off` px higher, so a canvas holding only the row's
+/// band (y_off = its first row) gets the same pixels as the full frame. Returns the band,
+/// rows y0..y1 of the full frame. Every animation frame redraws only this band.
+pub fn draw_anim_row(c: &mut Canvas, t: &mut Text, s: &State, hits: &mut Vec<Hit>, full_h: f32, y_off: f32) -> Option<(usize, usize)> {
+    let sf = s.sf;
+    let (bx, _, bw, _) = bar_rect(c.w as f32, full_h, sf);
+    let Some((f, n)) = s.anim else { return None };
+    let ph = (PILL_H * sf).round();
+    let pad = PILL_PAD * sf;
+    let px = 12.0 * sf;
+    let isz = 16.0 * sf;
+    // frame counter: current frame zero-padded to the digits of the count, "001/300"
+    let digits = n.to_string().len();
+    let counter = format!("{:0digits$}/{n}", f + 1);
+    let speed = format!("{}\u{d7} {}FPS", fmt_speed(s.anim_speed), s.anim_fps);
+    // the format and the counter are set in Geist Mono; the speed in Geist Medium
+    let prev = t.face(crate::text::Face::Mono);
+    let fmt_w = t.width(s.anim_fmt, px);
+    let cnt_w = t.width(&counter, px);
+    t.face(crate::text::Face::Medium);
+    let spd_w = t.width(&speed, px);
+    // pill widths: text + padding; the dropdown adds a 4 px gap and a 16 px chevron
+    let lw = (fmt_w + 2.0 * pad).round();
+    let cw = (cnt_w + 2.0 * pad).round();
+    let dw = (spd_w + 4.0 * sf + isz + 2.0 * pad).round();
+    let space = (PILL_SPACE * sf).round();
+    let (tx, ty, tw, th) = anim_track(c.w as f32, full_h, sf, lw + space + cw, dw);
+    // drawing is y_off higher than the layout (a band of rows on its own canvas)
+    let ty = ty - y_off;
+    let py = ty + ((th - ph) / 2.0).round();
+    let mid = py + ph / 2.0;
+    // frosted glass, as the bar: blur, then a dark tint; the dropdown lightens on hover
+    let pill = |c: &mut Canvas, x: f32, w: f32, hover: f32| {
+        c.blur(x as i32, py as i32, w as i32, ph as i32, (GLASS_BLUR * sf).round() as usize, crate::render::BLUR_BAR);
+        c.fill_rrect(x, py, w, ph, ph / 2.0, 0x101010, GLASS_BAR_A as f32 / 255.0);
+        if hover > 0.0 {
+            c.fill_rrect(x, py, w, ph, ph / 2.0, 0xFFFFFF, 0.12 * hover);
+        }
+    };
+    // format pill and frame counter from the bar's left edge
+    let lx = bx;
+    pill(c, lx, lw, 0.0);
+    t.face(crate::text::Face::Mono);
+    text_mid(c, t, lx + pad, mid, s.anim_fmt, px, ICON);
+    let cx = lx + lw + space;
+    pill(c, cx, cw, 0.0);
+    text_mid(c, t, cx + pad, mid, &counter, px, ICON);
+    // speed dropdown, ending on the bar's right edge
+    let dx = bx + bw - dw;
+    let ha = s.hover_amt("anim_speed");
+    pill(c, dx, dw, ha);
+    let col = mix(ICON, 0xFFFFFF, (ha * 255.0) as u32);
+    t.face(crate::text::Face::Medium);
+    text_mid(c, t, dx + pad, mid, &speed, px, col);
+    icons::draw(c, Icon::ChevronDown, dx + dw - pad - isz / 2.0, mid, isz, col);
+    hits.push(Hit { x0: dx, y0: py + y_off, x1: dx + dw, y1: py + ph + y_off, id: "anim_speed" });
+    t.face(prev);
+    // the track: 4 px tall, centred in the row; the grab area is the row + 8 px
+    let vh = (4.0 * sf).round();
+    let vy = ty + ((th - vh) / 2.0).round();
+    c.fill_rrect(tx, vy, tw, vh, vh / 2.0, 0xFFFFFF, 0.14);
+    let frac = (f + 1) as f32 / n.max(1) as f32;
+    let a = 0.40 + 0.16 * s.hover_amt("anim_slider");
+    c.fill_rrect(tx, vy, (frac * tw).max(vh), vh, vh / 2.0, 0xFFFFFF, a);
+    hits.push(Hit { x0: tx - 8.0 * sf, y0: ty + y_off - 8.0 * sf, x1: tx + tw + 8.0 * sf, y1: ty + y_off + th + 8.0 * sf, id: "anim_slider" });
+    let y0 = (ty + y_off).max(0.0) as usize;
+    Some((y0, (ty + y_off + th).ceil() as usize))
 }

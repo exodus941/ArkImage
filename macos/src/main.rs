@@ -1,6 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+/// macOS: decoded images are freed after upload to the GPU, but the system allocator keeps
+/// large freed blocks cached (350 MB stayed after one 6016 px photo); mimalloc returns them.
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod app;
+mod gpu;
 mod archive;
 mod backup;
 mod bindings;
@@ -141,7 +148,29 @@ fn main() {
         trace("forwarded to master");
         return;
     }
+    // Unix: the lock holder is the master and listens; every other launch hands over, and
+    // waits for a master that is still starting (up to 15 s, then runs on its own).
+    #[cfg(unix)]
+    let listener = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(lock) = ipc::claim_master() {
+                // held until the process ends
+                std::mem::forget(lock);
+                break ipc::listen();
+            }
+            if ipc::forward(&arg) {
+                trace("forwarded to master");
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
     // Become the master. If another launch claimed the socket first, hand over to it.
+    #[cfg(not(unix))]
     let listener = loop {
         if let Some(l) = ipc::listen() {
             break Some(l);

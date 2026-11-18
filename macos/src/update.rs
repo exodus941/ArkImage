@@ -1,7 +1,10 @@
 //! Auto-update from GitHub Releases (Windows).
 //!
-//! 1. Read the latest release of `REPO`; if its tag (vX.Y.Z) is newer than this build,
-//!    download its `arkimage.exe` next to the running exe as `arkimage.exe.new`.
+//! 1. Read the recent releases of `REPO` and take the newest one that carries this
+//!    platform's file (`arkimage.exe`, or `ArkImage-macOS.zip` on the Mac); if its tag
+//!    (vX.Y.Z) is newer than this build, download that file next to the running exe as
+//!    `arkimage.exe.new`. (Reading only the release marked Latest, one platform's updater
+//!    reported a new version and failed while the other platform's files were up alone.)
 //! 2. Check its size, and its SHA-256 when GitHub lists one.
 //! 3. Swap: Windows lets a running exe be renamed, so the running exe becomes
 //!    `<name>.old` and the download takes its name. The next launch is the new
@@ -39,7 +42,30 @@ pub enum Outcome {
 }
 
 fn api_url() -> String {
-    std::env::var("ARKIMAGE_UPDATE_URL").unwrap_or_else(|_| format!("https://api.github.com/repos/{REPO}/releases/latest"))
+    std::env::var("ARKIMAGE_UPDATE_URL").unwrap_or_else(|_| format!("https://api.github.com/repos/{REPO}/releases?per_page=20"))
+}
+
+/// This platform's release file.
+fn platform_asset() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return mac::ASSET;
+    #[cfg(not(target_os = "macos"))]
+    ASSET
+}
+
+/// From a release list (or one release), the newest published release that carries
+/// `asset`; None when none does.
+fn pick_release(v: &serde_json::Value, asset: &str) -> Option<serde_json::Value> {
+    let list: Vec<&serde_json::Value> = match v.as_array() {
+        Some(a) => a.iter().collect(),
+        None => vec![v],
+    };
+    list.into_iter()
+        .filter(|r| !r["draft"].as_bool().unwrap_or(false) && !r["prerelease"].as_bool().unwrap_or(false))
+        .filter(|r| r["assets"].as_array().is_some_and(|a| a.iter().any(|x| x["name"].as_str() == Some(asset))))
+        .filter_map(|r| Some((parse_version(r["tag_name"].as_str()?)?, r)))
+        .max_by_key(|(v, _)| *v)
+        .map(|(_, r)| r.clone())
 }
 
 /// "v1.2.3" or "1.2.3" -> (1, 2, 3).
@@ -109,9 +135,14 @@ fn run(on_found: &dyn Fn(&str)) -> Result<Outcome, String> {
     let current = env!("CARGO_PKG_VERSION");
     let a = agent();
     let body = a.get(&api_url()).set("Accept", "application/vnd.github+json").call().map_err(|e| { crate::trace(&format!("update: {e}")); "Can't reach GitHub.".to_string() })?.into_string().map_err(|e| e.to_string())?;
-    let rel: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("Unexpected reply from GitHub: {e}"))?;
-    let tag = rel["tag_name"].as_str().ok_or("The latest release has no version tag.")?;
-    crate::trace(&format!("update: latest {tag}, running {current}"));
+    let list: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("Unexpected reply from GitHub: {e}"))?;
+    // the newest release with this platform's file; none yet: nothing newer for us
+    let Some(rel) = pick_release(&list, platform_asset()) else {
+        crate::trace("update: no release carries this platform's file");
+        return Ok(Outcome::UpToDate);
+    };
+    let tag = rel["tag_name"].as_str().ok_or("The release has no version tag.")?;
+    crate::trace(&format!("update: newest for this platform {tag}, running {current}"));
     if !is_newer(tag, current) {
         return Ok(Outcome::UpToDate);
     }
@@ -335,5 +366,32 @@ mod tests {
         assert!(!is_newer("v1.0.0", "1.0.0"));
         assert!(!is_newer("v0.9.9", "1.0.0"));
         assert!(!is_newer("garbage", "1.0.0"));
+    }
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::pick_release;
+
+    /// The newest release carrying this platform's file wins; one with only the other
+    /// platform's file, a draft and a pre-release are passed over.
+    #[test]
+    fn newest_with_our_file() {
+        let list: serde_json::Value = serde_json::from_str(
+            r#"[
+            {"tag_name": "v1.3.0", "draft": true, "prerelease": false, "assets": [{"name": "arkimage.exe"}, {"name": "ArkImage-macOS.zip"}]},
+            {"tag_name": "v1.2.1", "draft": false, "prerelease": true, "assets": [{"name": "arkimage.exe"}]},
+            {"tag_name": "v1.2.0", "draft": false, "prerelease": false, "assets": [{"name": "ArkImage-macOS.zip"}, {"name": "ArkImage-1.2.0-macOS.dmg"}]},
+            {"tag_name": "v1.1.9", "draft": false, "prerelease": false, "assets": [{"name": "arkimage.exe"}, {"name": "ArkImage-macOS.zip"}]}
+        ]"#,
+        )
+        .unwrap();
+        let tag = |a: &str| pick_release(&list, a).map(|r| r["tag_name"].as_str().unwrap().to_string());
+        assert_eq!(tag("ArkImage-macOS.zip").as_deref(), Some("v1.2.0"));
+        assert_eq!(tag("arkimage.exe").as_deref(), Some("v1.1.9"));
+        assert_eq!(tag("nothing.bin"), None);
+        // one release object (the old /latest reply) still works
+        let one = list[2].clone();
+        assert_eq!(pick_release(&one, "ArkImage-macOS.zip").map(|r| r["tag_name"].clone()), Some("v1.2.0".into()));
     }
 }

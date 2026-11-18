@@ -59,13 +59,20 @@ mod mac {
 
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
-        fn CFDataCreate(alloc: CFTypeRef, bytes: *const u8, len: isize) -> CFTypeRef;
+        fn CFDataCreateWithBytesNoCopy(alloc: CFTypeRef, bytes: *const u8, len: isize, dealloc: CFTypeRef) -> CFTypeRef;
+        fn CFDictionaryCreate(alloc: CFTypeRef, keys: *const CFTypeRef, values: *const CFTypeRef, n: isize, kcb: *const c_void, vcb: *const c_void) -> CFTypeRef;
         fn CFRelease(cf: CFTypeRef);
+        static kCFAllocatorNull: CFTypeRef;
+        static kCFBooleanFalse: CFTypeRef;
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
     }
     #[link(name = "ImageIO", kind = "framework")]
     extern "C" {
         fn CGImageSourceCreateWithData(data: CFTypeRef, opts: CFTypeRef) -> CFTypeRef;
         fn CGImageSourceCreateImageAtIndex(src: CFTypeRef, i: usize, opts: CFTypeRef) -> CFTypeRef;
+        static kCGImageSourceShouldCache: CFTypeRef;
+        static kCGImageSourceShouldCacheImmediately: CFTypeRef;
     }
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
@@ -86,17 +93,25 @@ mod mac {
 
     pub fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
         unsafe {
-            let data = CFDataCreate(std::ptr::null(), bytes.as_ptr(), bytes.len() as isize);
+            // read the file where it is (no copy into a CFData); `bytes` outlives the decode
+            let data = CFDataCreateWithBytesNoCopy(std::ptr::null(), bytes.as_ptr(), bytes.len() as isize, kCFAllocatorNull);
             if data.is_null() {
                 return Err("CFDataCreate failed".into());
             }
-            let src = CGImageSourceCreateWithData(data, std::ptr::null());
-            CFRelease(data);
+            // ImageIO must not keep its own decoded copy: it draws into our buffer below
+            let keys = [kCGImageSourceShouldCache, kCGImageSourceShouldCacheImmediately];
+            let vals = [kCFBooleanFalse, kCFBooleanFalse];
+            let opts = CFDictionaryCreate(std::ptr::null(), keys.as_ptr(), vals.as_ptr(), 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            let src = CGImageSourceCreateWithData(data, opts);
             if src.is_null() {
+                CFRelease(data);
+                CFRelease(opts);
                 return Err("ImageIO can't read this file".into());
             }
-            let img = CGImageSourceCreateImageAtIndex(src, 0, std::ptr::null());
+            let img = CGImageSourceCreateImageAtIndex(src, 0, opts);
+            CFRelease(opts);
             CFRelease(src);
+            CFRelease(data);
             if img.is_null() {
                 return Err("ImageIO can't decode this file".into());
             }

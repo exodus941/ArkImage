@@ -170,6 +170,98 @@ pub fn window_glass(w: &Window, on: bool) -> bool {
     }
 }
 
+/// macOS reports no part of the window on screen (covered, minimized, other Space).
+pub fn is_occluded(w: &Window) -> bool {
+    let Some(view) = ns_view(w) else { return false };
+    unsafe {
+        let win: *mut AnyObject = msg_send![view, window];
+        if win.is_null() {
+            return false;
+        }
+        // NSWindowOcclusionStateVisible = 1 << 1
+        let state: usize = msg_send![win, occlusionState];
+        if state & 2 == 0 {
+            return true;
+        }
+        // macOS does not count the app's own windows stacked exactly on one another as
+        // covering (their rounded corners are see-through): with 100 maximized windows all
+        // were reported visible. Covered too: a visible window of ours above this one
+        // whose frame holds this one's.
+        let me: NSRect = msg_send![win, frame];
+        // the window list, front to back, built once per 100 ms for all windows: each
+        // window asking for it itself grew with the square of the count (100 windows:
+        // 57% CPU at idle)
+        thread_local! {
+            static LIST: std::cell::RefCell<(Option<std::time::Instant>, Vec<(usize, bool, NSRect)>)> = const { std::cell::RefCell::new((None, Vec::new())) };
+        }
+        LIST.with(|l| {
+            let mut l = l.borrow_mut();
+            if l.0.is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(100)) {
+                let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+                let list: *mut AnyObject = msg_send![app, orderedWindows];
+                let n: usize = msg_send![list, count];
+                let mut v = Vec::with_capacity(n);
+                for i in 0..n {
+                    let o: *mut AnyObject = msg_send![list, objectAtIndex: i];
+                    let vis: bool = msg_send![o, isVisible];
+                    let mini: bool = msg_send![o, isMiniaturized];
+                    // a window with its glass on shows the ones below through the blur;
+                    // counted as covering, they stopped drawing and their last frame (a
+                    // slide or Lottie frame) stayed in the glass
+                    let opaque: bool = msg_send![o, isOpaque];
+                    let f: NSRect = msg_send![o, frame];
+                    v.push((o as usize, vis && !mini && opaque, f));
+                }
+                *l = (Some(std::time::Instant::now()), v);
+            }
+            for &(o, covers, f) in &l.1 {
+                if o == win as usize {
+                    return false;
+                }
+                if covers
+                    && f.origin.x <= me.origin.x
+                    && f.origin.y <= me.origin.y
+                    && f.origin.x + f.size.width >= me.origin.x + me.size.width
+                    && f.origin.y + f.size.height >= me.origin.y + me.size.height
+                {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+}
+
+/// Keep only the newest drawing layer in the window's view. wgpu (through raw-window-metal)
+/// and softbuffer each add a layer of their own when a surface is made, and neither takes
+/// it away when the surface is dropped: every cover and uncover, full screen switch or
+/// change between GPU and processor left the old layer under the new one, holding its last
+/// frame, and it showed through wherever the new frame was not opaque (a stale Lottie or
+/// slide frame under the image). Returns how many were removed.
+pub fn drop_stale_layers(w: &Window) -> usize {
+    let Some(view) = ns_view(w) else { return 0 };
+    unsafe {
+        let root: *mut AnyObject = msg_send![view, layer];
+        if root.is_null() {
+            return 0;
+        }
+        let subs: *mut AnyObject = msg_send![root, sublayers];
+        if subs.is_null() {
+            return 0;
+        }
+        // copy first: removing changes the array
+        let n: usize = msg_send![subs, count];
+        let list: Vec<*mut AnyObject> = (0..n).map(|i| msg_send![subs, objectAtIndex: i]).collect();
+        let mut gone = 0;
+        // the newest is the last added
+        for &l in list.iter().take(n.saturating_sub(1)) {
+            let _: () = msg_send![l, removeFromSuperlayer];
+            gone += 1;
+        }
+        gone
+    }
+}
+
 /// Show or hide the window's close, minimize and zoom buttons (the traffic lights).
 pub fn traffic_lights(w: &Window, on: bool) {
     let Some(view) = ns_view(w) else { return };

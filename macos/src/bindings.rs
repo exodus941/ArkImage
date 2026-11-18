@@ -13,8 +13,6 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("exit", "Exit"),
     ("open", "Open File"),
     ("open_folder", "Open Folder"),
-    ("next1", "Next 1 Page (Double view)"),
-    ("prev1", "Previous 1 Page (Double view)"),
     ("next", "Next Image"),
     ("prev", "Previous Image"),
     ("rnext", "Next Random Image"),
@@ -159,6 +157,8 @@ mod tests {
         assert_eq!(display("ArrowLeft"), "Left");
         assert_eq!(display(""), "None");
         assert_eq!(label("next10"), "Next 10th Image");
-        assert_eq!(ACTIONS.len(), 39);
+        // 37: the two double-page actions are gone (a saved slot naming one loads as none)
+        assert_eq!(ACTIONS.len(), 37);
+        assert_eq!(label("next1"), "Do nothing");
     }
 }

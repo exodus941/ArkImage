@@ -92,7 +92,7 @@ pub fn spawn_workers(n: usize, proxy: EventLoopProxy<UserEvent>, exif: Arc<Atomi
             let cpath = if jobs.disk.load(Ordering::Relaxed) { crate::thumbcache::path_for(&e, size, exif_on) } else { None };
             let (t, fresh) = match cpath.as_deref().and_then(crate::thumbcache::load) {
                 Some(img) => (Some(Arc::new(img)), false),
-                None => (crate::decode::decode(&e, exif_on).ok().map(|d| Arc::new(fit(&d.frames[0].img, size))), true),
+                None => (crate::decode::decode(&e, exif_on, false).ok().map(|d| Arc::new(fit(&d.frames[0].img, size))), true),
             };
             // stays busy until the grid has it (App calls Jobs::done), so a redraw in between
             // cannot queue it again: before this, 78 thumbnails were made for 40 cells.
@@ -320,7 +320,7 @@ impl Picker {
         if self.bg_dims == (c.w, c.h) && self.bg.len() == c.buf.len() {
             c.buf.copy_from_slice(&self.bg);
         } else {
-            c.blur(0, 0, c.w as i32, c.h as i32, (12.0 * sf) as usize);
+            c.blur(0, 0, c.w as i32, c.h as i32, (12.0 * sf) as usize, crate::render::BLUR_PICKER);
             c.rect_alpha(0, 0, c.w as i32, c.h as i32, 0x0C0C0C, 160);
             // the panel: the icon's base grey, nearly opaque, no outline
             c.fill_rrect(px, py, pw, ph, PANEL_R * sf, crate::ui::ICON_GREY, 0.94);
