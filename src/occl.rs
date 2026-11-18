@@ -27,8 +27,9 @@ type Hwnd = isize;
 
 #[link(name = "user32")]
 extern "system" {
-    fn EnumWindows(cb: unsafe extern "system" fn(Hwnd, isize) -> i32, l: isize) -> i32;
-    fn IsWindowVisible(h: Hwnd) -> i32;
+    // the same types as backup.rs declares them (Rust checks the two match)
+    fn EnumWindows(cb: extern "system" fn(*mut c_void, isize) -> i32, l: isize) -> i32;
+    fn IsWindowVisible(h: *mut c_void) -> i32;
     fn IsIconic(h: Hwnd) -> i32;
     fn GetWindowLongPtrW(h: Hwnd, i: i32) -> isize;
 }
@@ -40,9 +41,14 @@ extern "system" {
 /// Top to bottom: (window, frame on screen, may cover others).
 static LIST: Mutex<Option<(Instant, Vec<(Hwnd, Rect, bool)>)>> = Mutex::new(None);
 
-unsafe extern "system" fn add(h: Hwnd, l: isize) -> i32 {
+extern "system" fn add(hp: *mut c_void, l: isize) -> i32 {
+    unsafe { add_one(hp, l) }
+}
+
+unsafe fn add_one(hp: *mut c_void, l: isize) -> i32 {
+    let h = hp as Hwnd;
     let v = &mut *(l as *mut Vec<(Hwnd, Rect, bool)>);
-    if IsWindowVisible(h) == 0 {
+    if IsWindowVisible(hp) == 0 {
         return 1;
     }
     let mut cloaked = 0u32;

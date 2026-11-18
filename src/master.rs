@@ -301,6 +301,18 @@ impl ApplicationHandler<UserEvent> for Master {
         match ev {
             UserEvent::Loaded(e, res) => {
                 self.sh.inflight.borrow_mut().remove(&e);
+                // decoded to the GPU while a window still used it, arriving after every
+                // window went to the processor: RAM holds only its 512 px thumbnail, which
+                // the processor drew as the image (the first image of a lone window stayed
+                // pixelated). Decode it again for the processor.
+                let stale_gpu = res.as_ref().is_ok_and(|d| d.frames.iter().any(|f| f.gpu.is_some())) && !crate::gpu::DECODE_TO_GPU.load(std::sync::atomic::Ordering::Relaxed);
+                if stale_gpu {
+                    crate::trace(&format!("decoded to the GPU after the switch to the processor: decoding {} again", e.name()));
+                    if self.sh.is_wanted(&e) {
+                        self.sh.request(e);
+                    }
+                    return;
+                }
                 match &res {
                     Ok(d) => {
                         self.sh.cache.borrow_mut().insert(e.clone(), d.clone());

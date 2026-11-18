@@ -57,7 +57,11 @@ struct Slide {
     /// +1: the new image enters from the right (forward); -1: from the left.
     dir: i32,
     start: Option<Instant>,
+    /// The old image's rows: the motion blur changes only those and the new image's.
+    oy0: usize,
+    oy1: usize,
 }
+
 
 
 pub enum MenuEntry {
@@ -400,7 +404,10 @@ impl Shared {
     pub fn new(proxy: EventLoopProxy<UserEvent>, cfg: &Config) -> Self {
         // the first image decodes before any window has a GPU surface: upload from the
         // start when the setting is on (a GPU that then fails turns this off again)
-        let gpu_on = cfg.gpu && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0");
+        // Windows: off until a window takes the GPU. The first window is alone and draws on
+        // the processor (the glass); its image went to the GPU and showed as the 512 px
+        // thumbnail.
+        let gpu_on = cfg.gpu && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0") && !cfg!(windows);
         crate::gpu::DECODE_TO_GPU.store(gpu_on, Ordering::Relaxed);
         let wanted = Arc::new(Mutex::new(HashMap::new()));
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 3);
@@ -574,6 +581,9 @@ pub struct App {
     fs_restore_at: Option<Instant>,
     /// What the master asked for (one window open), before the full-screen exception.
     glass_want: bool,
+    /// set_glass has run once: until then the window does not know whether it is alone,
+    /// and stays on the processor (taking the GPU for one frame sent the first image there).
+    glass_known: bool,
     glass_loaded: bool,
     glass_from: f32,
     glass_at: Instant,
@@ -794,6 +804,7 @@ impl App {
             slide_drawn: Instant::now(),
             glass_on: false,
             fs_restore_at: None,
+            glass_known: false,
             glass_want: false,
             glass_loaded: false,
             glass_from: 1.0,
@@ -947,6 +958,10 @@ impl App {
     /// The master calls this when the window count changes: glass while this is the only
     /// window. `instant` skips the fade (a window just opened).
     pub fn set_glass(&mut self, on: bool, instant: bool) {
+        if !self.glass_known {
+            self.glass_known = true;
+            self.request_redraw();
+        }
         self.glass_want = on;
         // macOS full screen has nothing behind the window to blur
         let on = on && !(cfg!(target_os = "macos") && self.fullscreen);
@@ -971,6 +986,8 @@ impl App {
             acrylic(&w, false, self.cfg.bg_color);
             self.glass_loaded = false;
             crate::trace("glass unloaded");
+            // Windows: the window can take the GPU now; draw again so it does
+            self.request_redraw();
         }
         self.glass_loaded
     }
@@ -1246,7 +1263,11 @@ impl App {
                     // newest image take the incoming place, so a fast scroll moves on
                     // smoothly instead of restarting from the old image every step
                     Some(s) if s.w == w && s.h == h && s.dir == dir => {}
-                    _ => self.slide = Some(Slide { old: self.last_frame.clone(), w, h, dir, start: None }),
+                    _ => {
+                        // the old image's rows, from the layout it was drawn with
+                        let (oy0, oy1) = self.layout.map(|l| (l.oy.floor().max(0.0) as usize, (l.oy + l.sh).ceil().max(0.0) as usize)).unwrap_or((0, h));
+                        self.slide = Some(Slide { old: self.last_frame.clone(), w, h, dir, start: None, oy0, oy1 })
+                    }
                 }
             }
         }
@@ -2032,7 +2053,7 @@ impl App {
     /// with the Windows 11 Acrylic backdrop). The window switches to the GPU once the
     /// glass has faded out, when a second window opens.
     fn gpu_wanted(&self) -> bool {
-        let glass = cfg!(windows) && (self.glass_on || self.glass_loaded) && std::env::var_os("ARKIMAGE_GPU_SELFTEST").is_none();
+        let glass = cfg!(windows) && (self.glass_on || self.glass_loaded || !self.glass_known) && std::env::var_os("ARKIMAGE_GPU_SELFTEST").is_none();
         self.cfg.gpu && !glass && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0") && !self.too_big_for_gpu()
     }
 
@@ -2482,6 +2503,7 @@ impl App {
                     let frame_ms = if since > 0.05 { 16.7 } else { since.max(0.004) * 1000.0 };
                     let per_frame = w * 3.0 * (1.0 - t).powi(2) * frame_ms / self.cfg.slide_ms as f64;
                     self.gpu_motion = (per_frame * 0.5 * 0.5) as f32;
+                    crate::trace(&format!("slide motion blur {:.1} px", self.gpu_motion));
                 }
             }
         }
@@ -2539,6 +2561,15 @@ impl App {
             if let Some((dx_new, _)) = slide_at {
                 // during the slide: sample only the visible pixels, no filters (as pinch zoom)
                 render::blit_sample(c, &base, l.ox + dx_new, l.oy, l.z, true, bg, checker);
+                // the GPU's slide motion blur, on the processor (a lone window draws here)
+                if self.gpu_motion > 1.0 {
+                    let t0 = Instant::now();
+                    // the old image slides out at the same height, sized for this window
+                    let (y0, y1) = (l.oy.floor().max(0.0) as usize, (l.oy + l.sh).ceil().max(0.0) as usize);
+                    let (o0, o1) = self.slide.as_ref().map(|s| (s.oy0, s.oy1)).unwrap_or((y0, y1));
+                    render::motion_blur(c, self.gpu_motion, y0.min(o0), y1.max(o1));
+                    crate::trace(&format!("cpu motion blur {:.1} px in {:.1} ms", self.gpu_motion, t0.elapsed().as_secs_f64() * 1000.0));
+                }
                 self.slide_drawn = Instant::now();
             } else {
             // Enlarged images go through the resize path too when the preset sharpens,

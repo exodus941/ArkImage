@@ -653,3 +653,94 @@ pub fn resize(img: &RgbaImage, w: u32, h: u32, filter: u8) -> RgbaImage {
     RgbaImage::from_raw(w, h, dst.into_vec()).unwrap_or_else(fallback)
 }
 
+
+/// A slide's motion blur on the processor, as the GPU's `mblur`: each row smeared along x
+/// over [-r, +r] (a box of 2r + 1 px), then a second box of r / 12 to soften the steps.
+/// Glass pixels stay glass (their marker cannot hold a blended colour); in the image they
+/// count as the background colour, so the smear ends inside the image, not over the glass.
+/// Only rows `y0..y1` (the image's) change: a flat row stays as it is. Rows are split across
+/// the processor's cores.
+pub fn motion_blur(c: &mut Canvas, r: f32, y0: usize, y1: usize) {
+    let r1 = r.round() as usize;
+    let (y0, y1) = (y0.min(c.h), y1.min(c.h));
+    if r1 < 1 || c.w < 2 || y0 >= y1 {
+        return;
+    }
+    let r2 = ((r / 12.0).round() as usize).max(1);
+    let w = c.w;
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
+    let per = (y1 - y0).div_ceil(threads);
+    std::thread::scope(|sc| {
+        for chunk in c.buf[y0 * w..y1 * w].chunks_mut(per * w) {
+            sc.spawn(move || {
+                let mut row = vec![[0u32; 3]; w];
+                let mut tmp = vec![[0u32; 3]; w];
+                for line in chunk.chunks_mut(w) {
+                    let mut any_glass = false;
+                    for (x, &p) in line.iter().enumerate() {
+                        let q = if p >> 24 == 1 {
+                            any_glass = true;
+                            glass_real(p)
+                        } else {
+                            p
+                        };
+                        row[x] = [q >> 16 & 255, q >> 8 & 255, q & 255];
+                    }
+                    box_row(&row, &mut tmp, r1);
+                    box_row(&tmp, &mut row, r2);
+                    for (x, p) in line.iter_mut().enumerate() {
+                        if any_glass && *p >> 24 == 1 {
+                            continue;
+                        }
+                        let [a, b, cc] = row[x];
+                        *p = rgb(a, b, cc);
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// One box pass of radius `r` along a row, edges clamped (running sums: O(width)).
+fn box_row(src: &[[u32; 3]], dst: &mut [[u32; 3]], r: usize) {
+    let w = src.len();
+    let n = (2 * r + 1) as u32;
+    let half = n / 2;
+    let (first, last) = (src[0], src[w - 1]);
+    // the window starts centred on x = 0: r copies of the first pixel, then src[0..=r]
+    let mut s = [first[0] * r as u32, first[1] * r as u32, first[2] * r as u32];
+    for i in 0..=r {
+        let v = if i < w { src[i] } else { last };
+        for k in 0..3 {
+            s[k] += v[k];
+        }
+    }
+    for x in 0..w {
+        dst[x] = [(s[0] + half) / n, (s[1] + half) / n, (s[2] + half) / n];
+        let add = if x + r + 1 < w { src[x + r + 1] } else { last };
+        let sub = if x >= r { src[x - r] } else { first };
+        for k in 0..3 {
+            s[k] = s[k] + add[k] - sub[k];
+        }
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::box_row;
+
+    #[test]
+    fn box_keeps_flat_and_spreads_a_point() {
+        let flat = vec![[100u32, 50, 25]; 40];
+        let mut out = vec![[0u32; 3]; 40];
+        box_row(&flat, &mut out, 7);
+        assert!(out.iter().all(|p| *p == [100, 50, 25]));
+        let mut pt = vec![[0u32; 3]; 41];
+        pt[20] = [255 * 11, 0, 0];
+        let mut out = vec![[0u32; 3]; 41];
+        box_row(&pt, &mut out, 5);
+        assert_eq!(out.iter().filter(|p| p[0] > 0).count(), 11);
+        assert_eq!(out[20][0], 255);
+        assert_eq!(out[14][0], 0);
+    }
+}
