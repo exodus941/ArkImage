@@ -107,6 +107,27 @@ fn new_path(exe: &Path) -> PathBuf {
     exe.with_extension("exe.new")
 }
 
+/// What a failed request tells the user. GitHub answers 403 or 429 with no requests left
+/// once an address has used its 60 an hour; that was shown as "Can't reach GitHub".
+fn reach_error(e: &ureq::Error) -> String {
+    if let ureq::Error::Status(code, r) = e {
+        if (*code == 403 || *code == 429) && r.header("x-ratelimit-remaining") == Some("0") {
+            let mins = r
+                .header("x-ratelimit-reset")
+                .and_then(|v| v.parse::<u64>().ok())
+                .and_then(|t| t.checked_sub(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()))
+                .map(|s| s.div_ceil(60).max(1));
+            return match mins {
+                Some(1) => "GitHub's limit of update checks is used up. Try again in 1 minute.".into(),
+                Some(m) => format!("GitHub's limit of update checks is used up. Try again in {m} minutes."),
+                None => "GitHub's limit of update checks is used up. Try again later.".into(),
+            };
+        }
+        return format!("GitHub answered with an error ({code}).");
+    }
+    "Can't reach GitHub.".into()
+}
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(10))
@@ -134,7 +155,10 @@ fn run(on_found: &dyn Fn(&str)) -> Result<Outcome, String> {
     }
     let current = env!("CARGO_PKG_VERSION");
     let a = agent();
-    let body = a.get(&api_url()).set("Accept", "application/vnd.github+json").call().map_err(|e| { crate::trace(&format!("update: {e}")); "Can't reach GitHub.".to_string() })?.into_string().map_err(|e| e.to_string())?;
+    let body = a.get(&api_url()).set("Accept", "application/vnd.github+json").call().map_err(|e| {
+        crate::trace(&format!("update: {e}"));
+        reach_error(&e)
+    })?.into_string().map_err(|e| e.to_string())?;
     let list: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("Unexpected reply from GitHub: {e}"))?;
     // the newest release with this platform's file; none yet: nothing newer for us
     let Some(rel) = pick_release(&list, platform_asset()) else {
