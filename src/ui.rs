@@ -1,7 +1,8 @@
 //! Cards drawn over the image: the info panel, the empty state, messages and hotkey help.
 //! Style: dark surfaces, the slate text ramp, Geist / Figtree / Geist Mono, 14/20 rows, 4 px grid.
 
-use crate::render::Canvas;
+use crate::icons::Icon;
+use crate::render::{mix, Canvas};
 use crate::text::{Face, Text};
 
 // Dark design tokens.
@@ -54,6 +55,18 @@ pub fn line(c: &mut Canvas, t: &mut Text, face: Face, x: f32, top: f32, s: &str,
     let w = t.width(s, px);
     t.face(prev);
     w
+}
+
+/// The middle of the cap band of a line that `line` draws at `top`: where a mark beside it
+/// is centred.
+pub fn cap_mid(t: &mut Text, face: Face, top: f32, (px, lh): (f32, f32)) -> f32 {
+    let prev = t.face(face);
+    let asc = t.ascent(px);
+    let desc = t.line_height(px) - asc;
+    let base = top + ((lh - (asc + desc)) / 2.0 + asc).round();
+    let cap = t.cap_height(px);
+    t.face(prev);
+    base - cap / 2.0
 }
 
 pub fn width(t: &mut Text, face: Face, s: &str, px: f32) -> f32 {
@@ -163,6 +176,7 @@ pub fn card(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, sf: f32, fill: u32, 
     frost(c, x, y, w, h, r, CARD_BLUR * sf, fill, CARD_TINT);
 }
 
+
 /// Shorten `s` from the middle with "…" until it fits `max` px.
 fn fit_middle(t: &mut Text, face: Face, s: &str, px: f32, max: f32) -> String {
     if width(t, face, s, px) <= max {
@@ -232,12 +246,23 @@ pub fn info_card(c: &mut Canvas, t: &mut Text, x: f32, y: f32, sf: f32, title: &
     }
 }
 
-/// The empty state: app name, what to do, and the three hotkeys as key chips.
-pub fn empty_card(c: &mut Canvas, t: &mut Text, cw: f32, ch: f32, sf: f32) {
+/// The empty state's three actions: hit id, icon, label, hotkey.
+pub const EMPTY_ACTIONS: [(&str, Icon, &str, &str); 3] = [
+    ("empty_file", Icon::FileText, "Open a file", "F2"),
+    ("empty_folder", Icon::FolderOpen, "Open a folder", "F"),
+    ("empty_help", Icon::Keyboard, "Show hotkeys", "F1"),
+];
+
+/// The empty state: app name, what to do, and the three actions as clickable rows (icon,
+/// label, key chip). `hover`: each action's hover amount 0-1. Returns each row's
+/// rectangle (x0, y0, x1, y1), in EMPTY_ACTIONS order.
+pub fn empty_card(c: &mut Canvas, t: &mut Text, cw: f32, ch: f32, sf: f32, hover: [f32; 3]) -> Vec<(f32, f32, f32, f32)> {
     let d = |v: f32| v * sf;
-    let keys = [("Open a file", "F2"), ("Open a folder", "F"), ("Show hotkeys", "F1")];
+    // rows 32 px, 4 px apart; the hover fill reaches 8 px past the text on both sides,
+    // inside the card's 24 px padding
+    let (row, gap, reach) = (32.0, 4.0, 8.0);
     let w = d(320.0);
-    let h = d(24.0 * 2.0 + TITLE.1 + 8.0 + BODY.1 + 24.0 + 3.0 * 28.0 - 4.0);
+    let h = d(24.0 * 2.0 + TITLE.1 + 8.0 + BODY.1 + 16.0 + 3.0 * row + 2.0 * gap);
     let (x, y) = (((cw - w) / 2.0).round(), ((ch - h) / 2.0).round());
     card(c, x, y, w, h, sf, PANEL, LINE);
     let x0 = x + d(24.0);
@@ -246,17 +271,32 @@ pub fn empty_card(c: &mut Canvas, t: &mut Text, cw: f32, ch: f32, sf: f32) {
     line(c, t, Face::Title, x0, top, "ArkImage", (d(TITLE.0), d(TITLE.1)), SLATE100);
     top += d(TITLE.1 + 8.0);
     line(c, t, Face::Regular, x0, top, "Drop an image, a folder or an archive here.", (d(BODY.0), d(BODY.1)), SLATE400);
-    top += d(BODY.1 + 24.0);
-    for (label, key) in keys {
-        // row 24 px: label left, key chip right, 4 px apart vertically
-        line(c, t, Face::Regular, x0, top + d(2.0), label, (d(BODY.0), d(BODY.1)), SLATE300);
+    top += d(BODY.1 + 16.0);
+    let mut rects = Vec::new();
+    for (i, (_, icon, label, key)) in EMPTY_ACTIONS.iter().enumerate() {
+        let (rx, rw) = (x0 - d(reach), inner + 2.0 * d(reach));
+        let ha = hover[i];
+        if ha > 0.0 {
+            c.fill_rrect(rx, top, rw, d(row), d(8.0), 0xFFFFFF, 0.08 * ha);
+        }
+        let col = mix(SLATE300, 0xFFFFFF, (ha * 255.0) as u32);
+        // the label's line box centred in the row; the icon on its cap band
+        let lt = top + d((row - BODY.1) / 2.0);
+        let mid = cap_mid(t, Face::Regular, lt, (d(BODY.0), d(BODY.1)));
+        let isz = d(16.0);
+        crate::icons::draw(c, *icon, x0 + isz / 2.0, mid, isz, col);
+        line(c, t, Face::Regular, x0 + isz + d(8.0), lt, label, (d(BODY.0), d(BODY.1)), col);
+        // key chip: 24 px tall, centred in the row
         let kpx = d(LABEL.0);
         let kw = width(t, Face::Mono, key, kpx) + d(16.0);
         let kx = x0 + inner - kw;
-        c.fill_rrect(kx, top, kw, d(24.0), d(4.0), LINE, 1.0);
-        line(c, t, Face::Mono, kx + d(8.0), top + d(4.0), key, (kpx, d(LABEL.1)), SLATE200);
-        top += d(28.0);
+        let ky = top + d((row - 24.0) / 2.0);
+        c.fill_rrect(kx, ky, kw, d(24.0), d(4.0), LINE, 1.0);
+        line(c, t, Face::Mono, kx + d(8.0), ky + d(4.0), key, (kpx, d(LABEL.1)), SLATE200);
+        rects.push((rx, top, rx + rw, top + d(row)));
+        top += d(row + gap);
     }
+    rects
 }
 
 /// A plain message card: first line as the title, the rest as body text.
@@ -395,24 +435,42 @@ fn modal_card_solid(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, body: &[
 }
 
 /// Hotkey help: a card of "keys — action" rows in two columns.
-pub fn help_card(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, rows: &[(String, String)]) {
+/// Returns the close button's rectangle (x0, y0, x1, y1).
+/// `band`: the free height (top, bottom) between the title strip and the bottom bar; the
+/// card is centred in it (centred in the window, it ran under the bar).
+pub fn help_card(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, rows: &[(String, String)], close_hover: f32, band: (f32, f32)) -> (f32, f32, f32, f32) {
     let d = |v: f32| v * sf;
     let (bpx, blh) = (d(BODY.0), d(BODY.1));
     let kw = rows.iter().map(|(k, _)| width(t, Face::Mono, k, d(LABEL.0))).fold(0.0, f32::max);
     let aw = rows.iter().map(|(_, a)| width(t, Face::Regular, a, bpx)).fold(0.0, f32::max);
     let w = (kw + d(KV_GAP) + aw + 2.0 * d(PAD)).min(c.w as f32 - d(32.0)).round();
-    let h = (2.0 * d(PAD) + d(CARD_TITLE.1) + d(SECTION_GAP) + rows.len() as f32 * (blh + d(ROW_GAP))).round();
-    let (x, y) = (((c.w as f32 - w) / 2.0).max(0.0).round(), ((c.h as f32 - h) / 2.0).max(0.0).round());
+    let h = (2.0 * d(PAD) + d(TITLE.1) + d(SECTION_GAP) + rows.len() as f32 * (blh + d(ROW_GAP))).round();
+    let x = ((c.w as f32 - w) / 2.0).max(0.0).round();
+    let y = (band.0 + ((band.1 - band.0 - h) / 2.0).max(0.0)).round();
     card(c, x, y, w, h, sf, PANEL2, SLATE600);
     let x0 = x + d(PAD);
     let mut top = y + d(PAD);
-    line(c, t, Face::Title, x0, top, title, (d(CARD_TITLE.0), d(CARD_TITLE.1)), SLATE100);
-    top += d(CARD_TITLE.1 + SECTION_GAP);
+    // the title as the other cards' titles (20/28), the close button on its right: a
+    // 28 px target centred on the title's cap band, its 16 px glyph inside
+    line(c, t, Face::Title, x0, top, title, (d(TITLE.0), d(TITLE.1)), SLATE100);
+    let mid = cap_mid(t, Face::Title, top, (d(TITLE.0), d(TITLE.1)));
+    let bs = d(28.0);
+    // the icon's right edge on the content edge: the 28 px button overhangs the
+    // padding by (28 - 16) / 2 = 6 px, off the 4 px grid for that reason
+    let bx = x + w - d(PAD) - bs + d(6.0);
+    let by = (mid - bs / 2.0).round();
+    // no fill: the glyph brightens on hover
+    let col = mix(SLATE400, 0xFFFFFF, (close_hover * 255.0) as u32);
+    crate::icons::draw(c, Icon::Close, bx + bs / 2.0, mid, d(16.0), col);
+    top += d(TITLE.1 + SECTION_GAP);
     for (k, a) in rows {
         line(c, t, Face::Mono, x0, top, k, (d(LABEL.0), blh), ACCENT);
-        line(c, t, Face::Regular, x0 + kw + d(KV_GAP), top, a, (bpx, blh), SLATE200);
+        // the legend right-aligned on the content edge
+        let lw = width(t, Face::Regular, a, bpx);
+        line(c, t, Face::Regular, x + w - d(PAD) - lw, top, a, (bpx, blh), SLATE200);
         top += blh + d(ROW_GAP);
     }
+    (bx, by, bx + bs, by + bs)
 }
 
 #[cfg(test)]

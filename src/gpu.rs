@@ -1223,6 +1223,12 @@ impl GpuWin {
     /// Covered: drop the surface and its presenting buffers (the textures go in
     /// `release`). The next frame makes a new one.
     pub fn park(&mut self) {
+        // Windows: keep the swap chain. Dropped, it uncovered the window's own surface,
+        // which the GPU path never paints: a raised window showed white for 285 to 411 ms
+        // (60 maximized windows, 1440x3440) until a new swap chain presented.
+        if cfg!(windows) {
+            return;
+        }
         if self.surface.take().is_some() {
             self.configured = false;
             crate::trace("gpu: surface dropped (window covered)");

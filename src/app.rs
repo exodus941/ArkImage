@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -60,6 +60,9 @@ struct Slide {
     /// The old image's rows: the motion blur changes only those and the new image's.
     oy0: usize,
     oy1: usize,
+    /// When the newest page took the incoming place of this running slide: its motion blur
+    /// counts from then (else a fast scroll blurred only the first page).
+    entered: Option<Instant>,
 }
 
 
@@ -389,7 +392,7 @@ pub enum Place {
 #[derive(Clone)]
 pub struct Shared {
     pub proxy: EventLoopProxy<UserEvent>,
-    pub job_tx: mpsc::Sender<Entry>,
+    pub job_tx: Arc<Jobs>,
     /// Images each window wants, by window id; a queued decode no window wants is skipped.
     pub wanted: Arc<Mutex<HashMap<u64, HashSet<Entry>>>>,
     pub exif_flag: Arc<AtomicBool>,
@@ -444,7 +447,7 @@ impl Shared {
             return;
         }
         self.inflight.borrow_mut().insert(e.clone());
-        let _ = self.job_tx.send(e);
+        let _ = self.job_tx.send(e, false);
     }
 
     pub fn is_wanted(&self, e: &Entry) -> bool {
@@ -508,7 +511,7 @@ pub struct App {
     failed: Rc<RefCell<HashMap<Entry, String>>>,
     inflight: Rc<RefCell<HashSet<Entry>>>,
     wanted: Arc<Mutex<HashMap<u64, HashSet<Entry>>>>,
-    job_tx: mpsc::Sender<Entry>,
+    job_tx: Arc<Jobs>,
     current: Option<(Entry, Arc<Decoded>)>,
     frame_idx: usize,
     /// Two-finger swipe state: sideways travel so far, whether this gesture already stepped,
@@ -632,6 +635,9 @@ pub struct App {
     rename_orig: Option<String>,
     /// Hover fade per chrome control (0-1), and when it was last stepped.
     hover_fx: Vec<(&'static str, f32)>,
+    /// The empty card's action rows and the hotkeys card's close button, as drawn last.
+    empty_hits: Vec<chrome::Hit>,
+    help_hit: Option<chrome::Hit>,
     /// Tooltip fades of the bottom-bar buttons (see chrome::State::tip_fx).
     tip_fx: Vec<(&'static str, f32)>,
     hover_at: Instant,
@@ -645,22 +651,63 @@ pub struct App {
     thumb_jobs: Arc<picker::Jobs>,
 }
 
+/// The decoders' queue. Two lanes: the page a focused window turned to goes first, the
+/// newest such page first; preloads and every other window's images follow in order.
+/// One first-in-first-out queue made a turned page wait behind 60 windows' start-up
+/// decodes and preloads.
+pub struct Jobs {
+    q: Mutex<(std::collections::VecDeque<Entry>, std::collections::VecDeque<Entry>)>,
+    cv: std::sync::Condvar,
+}
+
+impl Jobs {
+    /// Queue `e`. An urgent page replaces the urgent pages still waiting: they were
+    /// passed over (after a jump on the scrub bar the decoders worked through pages
+    /// already left: 33 of 137 turned pages drew). Returns the entries dropped, which
+    /// the caller takes out of its in-flight set.
+    pub fn send(&self, e: Entry, urgent: bool) -> Vec<Entry> {
+        let mut g = self.q.lock().unwrap();
+        let dropped = if urgent {
+            let old: Vec<Entry> = g.0.drain(..).collect();
+            g.0.push_back(e);
+            old
+        } else {
+            g.1.push_back(e);
+            Vec::new()
+        };
+        drop(g);
+        self.cv.notify_one();
+        dropped
+    }
+
+    fn take(&self) -> Entry {
+        let mut g = self.q.lock().unwrap();
+        loop {
+            if let Some(e) = g.0.pop_back() {
+                return e;
+            }
+            if let Some(e) = g.1.pop_front() {
+                return e;
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
+
 fn spawn_workers(
     n: usize,
     proxy: EventLoopProxy<UserEvent>,
     wanted: Arc<Mutex<HashMap<u64, HashSet<Entry>>>>,
     exif_rotate: Arc<AtomicBool>,
-) -> mpsc::Sender<Entry> {
-    let (tx, rx) = mpsc::channel::<Entry>();
-    let rx = Arc::new(Mutex::new(rx));
+) -> Arc<Jobs> {
+    let jobs = Arc::new(Jobs { q: Mutex::new(Default::default()), cv: std::sync::Condvar::new() });
     for _ in 0..n {
-        let rx = rx.clone();
+        let rx = jobs.clone();
         let proxy = proxy.clone();
         let wanted = wanted.clone();
         let exif_rotate = exif_rotate.clone();
         std::thread::spawn(move || loop {
-            let job = { rx.lock().unwrap().recv() };
-            let Ok(e) = job else { break };
+            let e = rx.take();
             if !wanted.lock().unwrap().values().any(|s| s.contains(&e)) {
                 if proxy.send_event(UserEvent::Skipped(e)).is_err() {
                     break;
@@ -674,7 +721,7 @@ fn spawn_workers(
             }
         });
     }
-    tx
+    jobs
 }
 
 fn fmt_size(b: u64) -> String {
@@ -837,6 +884,8 @@ impl App {
             at_pointer: false,
             rename_orig: None,
             hover_fx: Vec::new(),
+            empty_hits: Vec::new(),
+            help_hit: None,
             tip_fx: Vec::new(),
             hover_at: Instant::now(),
             num_edit_orig: None,
@@ -1117,7 +1166,11 @@ impl App {
             return;
         }
         self.inflight.borrow_mut().insert(e.clone());
-        let _ = self.job_tx.send(e);
+        // the page a focused window shows now jumps the queue
+        let urgent = self.cur_entry().as_ref() == Some(&e) && self.window.as_ref().is_some_and(|w| w.has_focus());
+        for d in self.job_tx.send(e, urgent) {
+            self.inflight.borrow_mut().remove(&d);
+        }
     }
 
     /// True if `e` is nearer the current index than the image now on screen.
@@ -1251,7 +1304,7 @@ impl App {
         }
         let before = pl.index;
         pl.index = i.min(pl.entries.len() - 1);
-        crate::trace(&format!("go_to {}", pl.index));
+        crate::trace(&format!("go_to {} in window {}", pl.index, self.id));
         // slide from the last settled frame; a fast scrub keeps sliding from that one
         let hint = self.nav_hint.take();
         let after = self.index();
@@ -1262,11 +1315,11 @@ impl App {
                     // a slide already running the same way: keep it going and let the
                     // newest image take the incoming place, so a fast scroll moves on
                     // smoothly instead of restarting from the old image every step
-                    Some(s) if s.w == w && s.h == h && s.dir == dir => {}
+                    Some(s) if s.w == w && s.h == h && s.dir == dir => s.entered = Some(Instant::now()),
                     _ => {
                         // the old image's rows, from the layout it was drawn with
                         let (oy0, oy1) = self.layout.map(|l| (l.oy.floor().max(0.0) as usize, (l.oy + l.sh).ceil().max(0.0) as usize)).unwrap_or((0, h));
-                        self.slide = Some(Slide { old: self.last_frame.clone(), w, h, dir, start: None, oy0, oy1 })
+                        self.slide = Some(Slide { old: self.last_frame.clone(), w, h, dir, start: None, oy0, oy1, entered: None })
                     }
                 }
             }
@@ -1483,12 +1536,18 @@ impl App {
         if o == self.occluded {
             return;
         }
-        crate::trace(&format!("window covered: {o}"));
+        crate::trace(&format!("window {} covered: {o}", self.id));
         self.occluded = o;
         if o {
-            self.strip();
-            if let Some(g) = &mut self.gpu {
-                g.park();
+            // Windows: a covered window keeps its swap chain and textures, so it shows
+            // its last frame at once and the sharp copy without a new upload when raised.
+            // The GPU budget (note_use, cache_mb) still strips the least recent windows.
+            #[cfg(not(windows))]
+            {
+                self.strip();
+                if let Some(g) = &mut self.gpu {
+                    g.park();
+                }
             }
         } else {
             self.unstrip();
@@ -2501,7 +2560,9 @@ impl App {
                     // old timestamp gave a 349 px smear on the first frame)
                     let since = self.slide_drawn.elapsed().as_secs_f64();
                     let frame_ms = if since > 0.05 { 16.7 } else { since.max(0.004) * 1000.0 };
-                    let per_frame = w * 3.0 * (1.0 - t).powi(2) * frame_ms / self.cfg.slide_ms as f64;
+                    // a page that entered a running slide blurs as at its own start
+                    let te = s.entered.map_or(t, |at| (at.elapsed().as_secs_f64() * 1000.0 / self.cfg.slide_ms as f64).min(t));
+                    let per_frame = w * 3.0 * (1.0 - te).powi(2) * frame_ms / self.cfg.slide_ms as f64;
                     self.gpu_motion = (per_frame * 0.5 * 0.5) as f32;
                     crate::trace(&format!("slide motion blur {:.1} px", self.gpu_motion));
                 }
@@ -2631,13 +2692,21 @@ impl App {
         // the "Drop an image" card fades in over 250 ms when it appears
         if self.playlist.is_none() {
             let at = *self.empty_at.get_or_insert_with(Instant::now);
-            let a = crate::ui::fade_amount(at, true);
-            crate::ui::faded(c, a, |c| crate::ui::empty_card(c, &mut t, cw, ch, sf));
-            if a < 1.0 {
+            // the hotkeys card covers it: it fades out as that card fades in (seen through
+            // the frost over the window glass, its text stayed readable)
+            let own = crate::ui::fade_amount(at, true);
+            let a = own * (1.0 - crate::ui::fade_amount(self.help_at, self.show_help));
+            let hover = crate::ui::EMPTY_ACTIONS.map(|(id, ..)| self.hover_fx.iter().find(|(k, _)| *k == id).map_or(0.0, |(_, v)| *v));
+            let mut rects = Vec::new();
+            crate::ui::faded(c, a, |c| rects = crate::ui::empty_card(c, &mut t, cw, ch, sf, hover));
+            self.empty_hits = rects.into_iter().zip(crate::ui::EMPTY_ACTIONS).map(|((x0, y0, x1, y1), (id, ..))| chrome::Hit { x0, y0, x1, y1, id }).collect();
+            // its own fade-in only; the hotkeys card's fade asks for its own frames
+            if own < 1.0 {
                 self.request_redraw();
             }
         } else {
             self.empty_at = None;
+            self.empty_hits.clear();
         }
         if self.picker.open {
             if let Some(pl) = &self.playlist {
@@ -2726,9 +2795,15 @@ impl App {
         }
         // the hotkeys card fades in and out over 250 ms
         let ha = crate::ui::fade_amount(self.help_at, self.show_help);
+        self.help_hit = None;
         if ha > 0.0 {
             let rows: Vec<(String, String)> = HELP.iter().map(|(k, a)| (k.to_string(), a.to_string())).collect();
-            crate::ui::faded(c, ha, |c| crate::ui::help_card(c, &mut t, sf, "Hotkeys", &rows));
+            let close_hover = self.hover_fx.iter().find(|(k, _)| *k == "help_close").map_or(0.0, |(_, v)| *v);
+            // 16 px clear of the title strip and of the bottom bar
+            let band = ((chrome::TITLE_H + 16.0) * sf, ch - (chrome::BAR_H + chrome::BAR_GAP + 16.0) * sf);
+            let mut r = (0.0, 0.0, 0.0, 0.0);
+            crate::ui::faded(c, ha, |c| r = crate::ui::help_card(c, &mut t, sf, "Hotkeys", &rows, close_hover, band));
+            self.help_hit = self.show_help.then_some(chrome::Hit { x0: r.0, y0: r.1, x1: r.2, y1: r.3, id: "help_close" });
             if ha < 1.0 {
                 self.request_redraw();
             }
@@ -2736,6 +2811,10 @@ impl App {
             self.request_redraw();
         }
         self.hits.clear();
+        // the empty card's actions, under the chrome; none while the hotkeys card covers it
+        if !self.show_help {
+            self.hits.extend(self.empty_hits.iter().copied());
+        }
         let title = self.chrome_title();
         // Hover fades: each control's amount moves toward 1 while hovered and 0 after,
         // linearly over 250 ms, both ways.
@@ -2817,6 +2896,10 @@ impl App {
         let mut hits = std::mem::take(&mut self.hits);
         chrome::draw(c, Some(&mut t), &st, &mut hits);
         self.hits = hits;
+        // the hotkeys card's close button, over everything
+        if let Some(h) = self.help_hit {
+            self.hits.push(h);
+        }
         for (saved, off, a) in [(saved_top, 0, self.fade.0), (saved_bot, bot_from * c.w, self.fade.1)] {
             if let Some(saved) = saved {
                 let a = (a * 255.0) as u32;
@@ -3234,6 +3317,13 @@ impl App {
     fn on_chrome_click(&mut self, el: &ActiveEventLoop, h: chrome::Hit, right: bool) {
         let n = if right { 10 } else { 1 };
         match h.id {
+            "empty_file" => self.open_dialog(),
+            "empty_folder" => self.open_folder_dialog(),
+            "empty_help" | "help_close" => {
+                self.show_help = !self.show_help;
+                self.help_at = Instant::now();
+                self.request_redraw();
+            }
             "title" => {
                 let now = Instant::now();
                 let dbl = self.last_click.map(|(t, _)| now - t < Duration::from_millis(400)).unwrap_or(false);
@@ -4631,6 +4721,8 @@ impl App {
             #[cfg(not(any(windows, target_os = "macos")))]
             WindowEvent::Occluded(o) => self.set_covered(o),
             WindowEvent::Focused(true) => {
+                // a focused window is in front: draw it now, not at the next covered check
+                self.set_covered(false);
                 self.unstrip();
                 // the focused window preloads its neighbours (GPU mode)
                 self.update_wanted();
@@ -4767,6 +4859,14 @@ impl App {
                         if let Some(w) = &self.window {
                             let _ = w.drag_resize_window(dir);
                         }
+                        return;
+                    }
+                    // the hotkeys card closes on a click anywhere but a toolbar button: on
+                    // the card, its close button or the image
+                    if self.show_help && self.hit_at(self.cursor).is_none_or(|h| h.id == "help_close") {
+                        self.show_help = false;
+                        self.help_at = Instant::now();
+                        self.request_redraw();
                         return;
                     }
                     if let Some(h) = self.hit_at(self.cursor) {
@@ -4922,6 +5022,9 @@ impl App {
                 if dy == 0.0 {
                     return;
                 }
+                crate::trace(&format!("wheel {dy} in window {}", self.id));
+                // one page per event, as 1.1.9: a fast spin packs 12 to 16 notches into one
+                // event, and a page per notch jumped that far with no slide in between
                 if self.primary() || self.cfg.wheel_zoom {
                     let a = Some(self.cursor);
                     self.zoom_step(dy > 0.0, a);
@@ -5041,6 +5144,28 @@ impl App {
                 self.step(1, false);
             } else if !DONE.load(std::sync::atomic::Ordering::Relaxed) {
                 hook_at = Some(*T0.get().unwrap() + Duration::from_millis(ms));
+            }
+        }
+        // test hook: ARKIMAGE_TEST_FLIP_MS=<n> turns a page every 30 ms for 3 s from n ms
+        // after start, as a spun mouse wheel does (the first window to ask takes it)
+        if let Some(ms) = std::env::var("ARKIMAGE_TEST_FLIP_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            static OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+            static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+            let t0 = *T0.get_or_init(Instant::now);
+            let (start, end) = (t0 + Duration::from_millis(ms), t0 + Duration::from_millis(ms + 3000));
+            let me = self.id as u64;
+            if now >= start && now < end && !self.occluded && OWNER.compare_exchange(u64::MAX, me, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).map_or_else(|o| o == me, |_| true) {
+                let mut last = LAST.lock().unwrap();
+                if last.is_none_or(|l| now >= l + Duration::from_millis(30)) {
+                    *last = Some(now);
+                    drop(last);
+                    crate::trace(&format!("test: flip in window {}", self.id));
+                    self.step(1, false);
+                }
+                hook_at = Some(now + Duration::from_millis(30));
+            } else if now < start {
+                hook_at = Some(start);
             }
         }
         if self.gpu.as_mut().is_some_and(|g| g.poll_budget()) {

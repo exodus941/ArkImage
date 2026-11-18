@@ -45,6 +45,7 @@ pub enum Icon {
     TextRtl,
     FlipH,
     FlipV,
+    Keyboard,
 }
 
 fn svg(i: Icon) -> &'static str {
@@ -61,6 +62,7 @@ fn svg(i: Icon) -> &'static str {
         Icon::ChevronRight => include_str!("../assets/icons/chevron-right.svg"),
         Icon::ChevronDown => include_str!("../assets/icons/chevron-down.svg"),
         Icon::Close => include_str!("../assets/icons/x.svg"),
+        Icon::Keyboard => include_str!("../assets/icons/keyboard.svg"),
         Icon::Square => include_str!("../assets/icons/square.svg"),
         Icon::Squares => include_str!("../assets/icons/squares.svg"),
         Icon::Maximize => include_str!("../assets/icons/maximize.svg"),

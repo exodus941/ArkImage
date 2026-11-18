@@ -113,12 +113,22 @@ unsafe extern "system" fn read_mem(p: *mut c_void, addr: u64, buf: *mut c_void, 
 pub fn start() {
     MAIN_TID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
     beat();
-    std::thread::spawn(|| {
+    // ARKIMAGE_WATCHDOG_MS: the silence that counts as a stall (default 3000)
+    let limit: u64 = std::env::var("ARKIMAGE_WATCHDOG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+    std::thread::spawn(move || {
         let mut dumped_at = u64::MAX;
+        let mut last = BEAT.load(Ordering::Relaxed);
         loop {
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(50));
             let b = BEAT.load(Ordering::Relaxed);
-            if now_ms().saturating_sub(b) > 3000 && dumped_at != b {
+            // a beat after a stall: how long the stall lasted
+            if b != last {
+                if dumped_at == last {
+                    note(&format!("{} ms: main thread back after {} ms", now_ms(), b.saturating_sub(last)));
+                }
+                last = b;
+            }
+            if now_ms().saturating_sub(b) > limit && dumped_at != b {
                 // no beat yet past the first event: idle in the message wait counts too
                 dumped_at = b;
                 dump();
@@ -199,13 +209,20 @@ fn dump() {
                 lines.push(format!("  {m}+0x{:x} {name}", a - base));
             }
         }
-        // its own file: the trace lock may be held by the stuck thread
-        if let Some(t) = std::env::var_os("ARKIMAGE_TRACE") {
-            use std::io::Write;
-            let p = std::path::PathBuf::from(t).with_extension("stacks.txt");
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                let _ = writeln!(f, "{} ms: main thread silent 3 s; stack:\n{}", now_ms(), lines.join("\n"));
-            }
+        note(&format!("{} ms: main thread silent; stack:
+{}", now_ms(), lines.join("
+")));
+    }
+}
+
+/// A line in `<trace>.stacks.txt`: its own file, as the trace lock may be held by the
+/// stuck thread.
+fn note(line: &str) {
+    if let Some(t) = std::env::var_os("ARKIMAGE_TRACE") {
+        use std::io::Write;
+        let p = std::path::PathBuf::from(t).with_extension("stacks.txt");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "{line}");
         }
     }
 }
