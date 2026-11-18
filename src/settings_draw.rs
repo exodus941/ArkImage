@@ -68,7 +68,7 @@ fn upd_status(c: &mut Canvas, t: &mut Text, x: f32, mid: f32, sf: f32, u: &Upd, 
         Upd::Idle => (None, 0, 0, format!("Version {}", env!("CARGO_PKG_VERSION")), SLATE200),
         // one turn every 0.9 s, in 10 degree steps (36 cached masks)
         Upd::Checking => (Some(Icon::Loader), SLATE300, (((secs / 0.9).fract() * 36.0) as u16) * 10, "Checking for updates...".into(), SLATE200),
-        Upd::Found(v) => (Some(Icon::Download), ACCENT, 0, format!("Update found, downloading version {v}"), SLATE200),
+        Upd::Found(v) => (Some(Icon::Download), ACCENT, 0, format!("Downloading update {v}..."), SLATE200),
         Upd::Latest => (Some(Icon::CircleCheck), GREEN, 0, "You are already on the latest version.".into(), SLATE200),
         Upd::Failed(e) => (None, 0, 0, format!("Update check failed: {e}"), u::ROSE400),
     };

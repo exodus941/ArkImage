@@ -428,7 +428,7 @@ pub enum Upd {
     Idle,
     /// Throbber, "Checking for updates..."
     Checking,
-    /// Download icon, "Update found, downloading version x.y.z"
+    /// Download icon, "Downloading update x.y.z..."
     Found(String),
     /// Check icon, "You are already on the latest version."
     Latest,
