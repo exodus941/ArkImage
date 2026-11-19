@@ -146,6 +146,65 @@ fn mica(_w: &Window) -> bool {
     false
 }
 
+/// Windows 11's acrylic backdrop (DWMWA_SYSTEMBACKDROP_TYPE = 38, DWMSBT_TRANSIENTWINDOW
+/// = 3) over the frame extended into the whole client area. The accent below lets the
+/// sharp desktop through where a maximized window meets the screen edge: 4 px stripes
+/// behind kept a contrast of 21 grey levels at the edge, fading to 2 over 80 px; this
+/// backdrop measured 0. The extended frame draws the system caption buttons unless the
+/// window drops WS_SYSMENU, so it does while the backdrop is on. False where the system
+/// has no backdrop (Windows 10): the accent is used then.
+#[cfg(windows)]
+fn backdrop(hwnd: isize, on: bool) -> bool {
+    #[repr(C)]
+    struct Margins(i32, i32, i32, i32);
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(h: isize, attr: u32, val: *const std::ffi::c_void, size: u32) -> i32;
+        fn DwmExtendFrameIntoClientArea(h: isize, m: *const Margins) -> i32;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetWindowLongPtrW(h: isize, i: i32) -> isize;
+        fn SetWindowLongPtrW(h: isize, i: i32, v: isize) -> isize;
+    }
+    const WS_SYSMENU: isize = 0x0008_0000;
+    let kind: i32 = if on { 3 } else { 1 };
+    if unsafe { DwmSetWindowAttribute(hwnd, 38, &kind as *const i32 as _, 4) } < 0 {
+        return false;
+    }
+    if on {
+        keep_active(hwnd);
+    }
+    unsafe {
+        let s = GetWindowLongPtrW(hwnd, -16);
+        SetWindowLongPtrW(hwnd, -16, if on { s & !WS_SYSMENU } else { s | WS_SYSMENU });
+        let m = if on { Margins(-1, -1, -1, -1) } else { Margins(0, 0, 0, 0) };
+        DwmExtendFrameIntoClientArea(hwnd, &m);
+    }
+    true
+}
+
+/// The backdrop turns into a flat lighter grey when the window loses focus. DWM keys
+/// that on the frame's active state, so WM_NCACTIVATE always passes "active" on. Our own
+/// title bar draws focus itself; winit takes focus from WM_SETFOCUS and WM_KILLFOCUS.
+#[cfg(windows)]
+fn keep_active(hwnd: isize) {
+    #[link(name = "comctl32")]
+    extern "system" {
+        fn SetWindowSubclass(h: isize, f: unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize, id: usize, data: usize) -> i32;
+        fn DefSubclassProc(h: isize, m: u32, w: usize, l: isize) -> isize;
+    }
+    unsafe extern "system" fn proc(h: isize, m: u32, w: usize, l: isize, _id: usize, _d: usize) -> isize {
+        const WM_NCACTIVATE: u32 = 0x0086;
+        if m == WM_NCACTIVATE {
+            return unsafe { DefSubclassProc(h, m, 1, l) };
+        }
+        unsafe { DefSubclassProc(h, m, w, l) }
+    }
+    // the same id again only updates the existing subclass
+    unsafe { SetWindowSubclass(hwnd, proc, 0x41524B, 0) };
+}
+
 /// Frosted glass behind a lone window: the acrylic blur-behind accent
 /// (SetWindowCompositionAttribute, WCA_ACCENT_POLICY = 19, ACCENT_ENABLE_ACRYLICBLURBEHIND
 /// = 4). Live content behind the window shows blurred through pixels drawn with alpha
@@ -182,6 +241,9 @@ fn acrylic(w: &Window, on: bool, bg: u32) -> bool {
     let set: unsafe extern "system" fn(isize, *const Data) -> i32 = unsafe { std::mem::transmute(f) };
     let Ok(h) = w.window_handle() else { return false };
     let RawWindowHandle::Win32(h) = h.as_raw() else { return false };
+    if backdrop(h.hwnd.get(), on) {
+        return on;
+    }
     // flags 0: no system tint. Its tint darkened far past its alpha (a 33% grey tint
     // gave #1A310C over lime); the 33% grey is drawn in our own pixels instead.
     let _ = bg;

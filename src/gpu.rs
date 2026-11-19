@@ -1797,8 +1797,8 @@ impl GpuWin {
 }
 
 /// True on a machine with a system battery (a laptop or tablet). Windows:
-/// GetSystemPowerStatus, battery flag 128 = no system battery. macOS: every Mac with two
-/// GPUs is a MacBook Pro, except the iMac and Mac Pro; it keeps LowPower, as before.
+/// GetSystemPowerStatus, battery flag 128 = no system battery. macOS: IOKit's power source
+/// list is empty on a desktop.
 fn on_battery_machine() -> bool {
     #[cfg(windows)]
     {
@@ -1821,7 +1821,36 @@ fn on_battery_machine() -> bool {
         }
         has_battery(s.battery_flag)
     }
-    #[cfg(not(windows))]
+    // macOS: IOKit's power sources; a Mac with none is a desktop (an iMac or Mac Pro
+    // with two GPUs then takes the stronger one; Apple silicon has one GPU either way)
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::c_void;
+        #[link(name = "IOKit", kind = "framework")]
+        extern "C" {
+            fn IOPSCopyPowerSourcesInfo() -> *const c_void;
+            fn IOPSCopyPowerSourcesList(blob: *const c_void) -> *const c_void;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFArrayGetCount(a: *const c_void) -> isize;
+            fn CFRelease(cf: *const c_void);
+        }
+        unsafe {
+            let info = IOPSCopyPowerSourcesInfo();
+            if info.is_null() {
+                return true;
+            }
+            let list = IOPSCopyPowerSourcesList(info);
+            let n = if list.is_null() { 0 } else { CFArrayGetCount(list) };
+            if !list.is_null() {
+                CFRelease(list);
+            }
+            CFRelease(info);
+            n > 0
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     true
 }
 

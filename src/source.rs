@@ -630,7 +630,28 @@ pub fn seek_penalty(p: &Path) -> bool {
     v
 }
 
-#[cfg(not(windows))]
+/// True when the volume holding `p` is on a spinning disk (an external HDD, say), as
+/// `diskutil` reports it ("SolidState" false). Asked once per volume (its device id).
+#[cfg(target_os = "macos")]
+pub fn seek_penalty(p: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt;
+    static SEEN: Mutex<Option<HashMap<u64, bool>>> = Mutex::new(None);
+    let Ok(dev) = std::fs::metadata(p).map(|m| m.dev()) else { return false };
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = g.as_ref().and_then(|m| m.get(&dev)) {
+        return *v;
+    }
+    let out = std::process::Command::new("/usr/sbin/diskutil").args(["info", "-plist"]).arg(p).output();
+    let text = out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    // <key>SolidState</key> then <true/> or <false/>; missing (a network volume): not spinning
+    let v = text.split("<key>SolidState</key>").nth(1).is_some_and(|r| r.trim_start().starts_with("<false/>"));
+    crate::trace(&format!("volume {dev}: seek penalty {v}"));
+    g.get_or_insert_with(HashMap::new).insert(dev, v);
+    v
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn seek_penalty(_p: &Path) -> bool {
     false
 }
