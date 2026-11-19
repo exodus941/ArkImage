@@ -327,6 +327,8 @@ pub enum UserEvent {
     MadeDefault(String),
     /// An update check finished; true when the user asked for it (Settings).
     Update(crate::update::Outcome, bool),
+    /// The folder poll replaced the list of at least one open folder.
+    Polled,
 }
 
 /// Two-finger swipe: logical px of sideways travel for one image, the quiet time that ends
