@@ -393,6 +393,14 @@ fn poll_only(only: Option<&Path>) -> bool {
 /// Lists made by `poll()`, kept until the master hands them to the windows.
 static KEEP: Mutex<Vec<Arc<Vec<Entry>>>> = Mutex::new(Vec::new());
 
+/// As `remove`, from another thread: the new list stays alive until the master hands it
+/// to the windows (send `UserEvent::Polled`).
+pub fn remove_polled(dir: &Path, e: &Entry) {
+    if let Some(l) = remove(dir, e) {
+        KEEP.lock().unwrap().push(l);
+    }
+}
+
 /// Drop the lists `poll()` kept; the windows hold them now.
 pub fn release_polled() {
     // a busy window asks again later, so keep the lists until none waits

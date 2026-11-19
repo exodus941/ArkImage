@@ -329,6 +329,8 @@ pub enum UserEvent {
     Update(crate::update::Outcome, bool),
     /// The folder poll replaced the list of at least one open folder.
     Polled,
+    /// A delete on another thread failed; the message to show.
+    DeleteFailed(String),
 }
 
 /// Two-finger swipe: logical px of sideways travel for one image, the quiet time that ends
@@ -1901,6 +1903,15 @@ impl App {
         let idx = pl.index.min(pl.entries.len() - 1);
         self.pos_map = source::pos_map(&pl.entries);
         self.go_to(idx);
+        crate::trace("delete moved on");
+    }
+
+    pub fn has_focus(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.has_focus())
+    }
+
+    pub fn show_msg(&mut self, s: String) {
+        self.msg(s);
     }
 
     fn delete_current(&mut self) {
@@ -1915,7 +1926,41 @@ impl App {
                 return;
             }
         }
-        match trash::delete(p) {
+        // A folder list shared through the master: show the next image now, and move the
+        // file and rebuild the list on another thread. In a 300,000-file folder the Recycle
+        // Bin took 82 ms and the list 167 ms, all before the next image showed.
+        let shared = self.playlist.as_ref().is_some_and(|pl| {
+            !pl.rev && pl.entries.len() > 1 && matches!(source::held(&pl.container), Ok(Some((l, _))) if Arc::ptr_eq(&l, &pl.entries))
+        });
+        if shared {
+            let Some(pl) = &self.playlist else { return };
+            let (dir, at, n) = (pl.container.clone(), pl.index, pl.entries.len());
+            crate::trace(&format!("delete {} at {at} of {n}; next {:?}", e.name(), pl.get(at + 1).map(|x| x.name())));
+            self.cache.borrow_mut().remove(&e);
+            // the next image takes the deleted one's place, without a slide
+            self.go_to(if at + 1 < n { at + 1 } else { at - 1 });
+            self.slide = None;
+            self.msg(format!("Deleted: {}", e.name()));
+            crate::trace("delete moved on");
+            let proxy = self.proxy.clone();
+            let path = p.clone();
+            std::thread::spawn(move || {
+                let r = trash::delete(&path);
+                crate::trace("delete done");
+                let _ = proxy.send_event(match r {
+                    Ok(()) => {
+                        source::remove_polled(&dir, &e);
+                        UserEvent::Polled
+                    }
+                    Err(err) => UserEvent::DeleteFailed(format!("Delete failed: {err}")),
+                });
+            });
+            return;
+        }
+        crate::trace("delete start");
+        let r = trash::delete(p);
+        crate::trace("delete done");
+        match r {
             Ok(()) => {
                 self.remove_current_from_list();
                 self.msg(format!("Deleted: {}", e.name()));

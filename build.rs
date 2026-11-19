@@ -31,6 +31,14 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
     let mut res = winresource::WindowsResource::new();
     res.set_icon("assets/icon.ico");
+    // Common Controls 6: TaskDialogIndirect (silent message boxes, src/dialog.rs) exists
+    // only there; without it the exe does not start.
+    res.set_manifest(
+        r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+<dependency><dependentAssembly><assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/></dependentAssembly></dependency>
+<trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false"/></requestedPrivileges></security></trustInfo>
+</assembly>"#,
+    );
     if let Err(e) = res.compile() {
         println!("cargo:warning=exe icon not embedded: {e}");
     }

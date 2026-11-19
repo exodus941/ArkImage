@@ -369,6 +369,12 @@ impl ApplicationHandler<UserEvent> for Master {
                 self.adopt_lists();
                 crate::source::release_polled();
             }
+            UserEvent::DeleteFailed(m) => {
+                let i = self.windows.iter().position(|w| w.has_focus()).unwrap_or(0);
+                if let Some(w) = self.windows.get_mut(i) {
+                    w.show_msg(m);
+                }
+            }
             UserEvent::Update(o, manual) => {
                 // shown once: in the window whose Settings asked, else the first window
                 let i = self.windows.iter().position(|w| w.settings_open()).unwrap_or(0);
