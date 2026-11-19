@@ -394,6 +394,11 @@ impl Guard {
     }
 
     fn spawn(&mut self) {
+        // the GPU self-test exits on its own when done; a backup counted each exit as a
+        // crash and, after 3, showed "crashed 3 times in a row"
+        if std::env::var_os("ARKIMAGE_GPU_SELFTEST").is_some() {
+            return;
+        }
         let Ok(exe) = std::env::current_exe() else { return };
         self.child = Command::new(exe).args(["--backup", &self.crashes.to_string()]).spawn().ok();
         self.last_spawn = Instant::now();

@@ -135,8 +135,12 @@ impl Master {
     /// Give every window in a folder whose list changed the master's new list.
     fn adopt_lists(&mut self) {
         for d in crate::source::changed() {
+            let mut busy = false;
             for w in &mut self.windows {
-                w.adopt(&d);
+                busy |= !w.adopt(&d);
+            }
+            if busy {
+                crate::source::retry_changed(&d);
             }
         }
     }
@@ -292,9 +296,23 @@ impl ApplicationHandler<UserEvent> for Master {
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
+        #[cfg(windows)]
+        crate::stackdump::beat();
         match ev {
             UserEvent::Loaded(e, res) => {
                 self.sh.inflight.borrow_mut().remove(&e);
+                // decoded to the GPU while a window still used it, arriving after every
+                // window went to the processor: RAM holds only its 512 px thumbnail, which
+                // the processor drew as the image (the first image of a lone window stayed
+                // pixelated). Decode it again for the processor.
+                let stale_gpu = res.as_ref().is_ok_and(|d| d.frames.iter().any(|f| f.gpu.is_some())) && !crate::gpu::DECODE_TO_GPU.load(std::sync::atomic::Ordering::Relaxed);
+                if stale_gpu {
+                    crate::trace(&format!("decoded to the GPU after the switch to the processor: decoding {} again", e.name()));
+                    if self.sh.is_wanted(&e) {
+                        self.sh.request(e);
+                    }
+                    return;
+                }
                 match &res {
                     Ok(d) => {
                         self.sh.cache.borrow_mut().insert(e.clone(), d.clone());
@@ -376,6 +394,8 @@ impl ApplicationHandler<UserEvent> for Master {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, ev: WindowEvent) {
+        #[cfg(windows)]
+        crate::stackdump::beat();
         if let Some(w) = self.windows.iter_mut().find(|w| w.owns(id)) {
             w.window_event(el, id, ev);
         }
@@ -386,6 +406,13 @@ impl ApplicationHandler<UserEvent> for Master {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        #[cfg(windows)]
+        crate::stackdump::beat();
+        // Test hook: ARKIMAGE_TEST_STALL stops the main thread once for 5 s (the watchdog's check)
+        static STALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var_os("ARKIMAGE_TEST_STALL").is_some() && self.started && !STALLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(5));
+        }
         // a window found its file gone and read the folder again
         self.adopt_lists();
         if self.speed_menu_at.is_some_and(|t| Instant::now() >= t) {

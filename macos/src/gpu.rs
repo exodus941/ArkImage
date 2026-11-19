@@ -441,9 +441,21 @@ impl Gpu {
     async fn new() -> Result<Gpu, String> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = if cfg!(target_os = "macos") { wgpu::Backends::METAL } else { wgpu::Backends::DX12 };
+        // Windows: the swap chain goes on a DirectComposition layer over the window, not on
+        // the window itself. One made from the HWND (flip model) took the window over for
+        // good: after it was released, the processor's drawing never reached the screen
+        // again, so a window going back to the processor (the glass with one window left,
+        // an image past the texture limit, a GPU failure) kept the GPU's last frame.
+        // ARKIMAGE_GPU_HWND=1: the HWND swap chain again (to check the fault this avoids)
+        desc.backend_options.dx12.presentation_system = if std::env::var_os("ARKIMAGE_GPU_HWND").is_some() { wgpu::Dx12SwapchainKind::DxgiFromHwnd } else { wgpu::Dx12SwapchainKind::DxgiFromVisual };
         let instance = wgpu::Instance::new(desc);
+        // The user's rule: a desktop always takes its graphics card (LowPower picked the
+        // Intel UHD 770 beside an RTX 4070 Ti SUPER); a laptop keeps the processor's own
+        // chip when it has one, for the battery.
+        let power_preference = if on_battery_machine() { wgpu::PowerPreference::LowPower } else { wgpu::PowerPreference::HighPerformance };
+        crate::trace(&format!("gpu: {} machine, asking for {power_preference:?}", if on_battery_machine() { "battery" } else { "desktop" }));
         let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, ..Default::default() })
+            .request_adapter(&wgpu::RequestAdapterOptions { power_preference, ..Default::default() })
             .await
             .map_err(|e| e.to_string())?;
         let info = adapter.get_info();
@@ -1131,6 +1143,10 @@ impl Drop for GpuWin {
             l.wins.remove(&self.id);
             l.evict.remove(&self.id);
         }
+        // release the swap chain now, not when the device next idles: on Windows its last
+        // frame stayed on screen over the processor's drawing after a switch
+        self.surface = None;
+        let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
     }
 }
 
@@ -1176,9 +1192,15 @@ impl GpuWin {
         // synthetic pinch: event to present 3.7 ms median against 15.6 ms with Fifo, 3.6 ms
         // of work per frame against 16.1 ms. macOS composites windows, so nothing tears.
         // ARKIMAGE_GPU_FIFO=1 waits for the refresh again (for comparison).
-        if std::env::var_os("ARKIMAGE_GPU_FIFO").is_none() && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
-            config.present_mode = wgpu::PresentMode::Immediate;
+        // Windows: Mailbox first. DirectX composes windows too, but Immediate there may tear
+        // (a flip swap chain allowed to tear); Mailbox also never waits and never tears.
+        let order: &[wgpu::PresentMode] = if cfg!(windows) { &[wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate] } else { &[wgpu::PresentMode::Immediate] };
+        if std::env::var_os("ARKIMAGE_GPU_FIFO").is_none() {
+            if let Some(m) = order.iter().find(|m| caps.present_modes.contains(m)) {
+                config.present_mode = *m;
+            }
         }
+        crate::trace(&format!("gpu: present {:?} of {:?}", config.present_mode, caps.present_modes));
         let configured = configure(&surface, &gpu.device, &config);
         crate::trace(&format!("gpu surface: alpha {alpha_mode:?} of {:?}", caps.alpha_modes));
         Some(GpuWin { configured, id: NEXT_ID.fetch_add(1, Ordering::Relaxed), gpu, surface: Some(surface), window, clear_mode: alpha_ok.then_some(alpha_mode), config, alpha_ok, image: None, layer: None, settled: None, quarter: None, ui: None, hq: None, moved: None, moved2: None, prev_ui: Vec::new(), row_classes: Vec::new() })
@@ -1201,6 +1223,12 @@ impl GpuWin {
     /// Covered: drop the surface and its presenting buffers (the textures go in
     /// `release`). The next frame makes a new one.
     pub fn park(&mut self) {
+        // Windows: keep the swap chain. Dropped, it uncovered the window's own surface,
+        // which the GPU path never paints: a raised window showed white for 285 to 411 ms
+        // (60 maximized windows, 1440x3440) until a new swap chain presented.
+        if cfg!(windows) {
+            return;
+        }
         if self.surface.take().is_some() {
             self.configured = false;
             crate::trace("gpu: surface dropped (window covered)");
@@ -1765,5 +1793,82 @@ impl GpuWin {
             return Err(Fail::Lost);
         }
         Ok(())
+    }
+}
+
+/// True on a machine with a system battery (a laptop or tablet). Windows:
+/// GetSystemPowerStatus, battery flag 128 = no system battery. macOS: IOKit's power source
+/// list is empty on a desktop.
+fn on_battery_machine() -> bool {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct PowerStatus {
+            ac: u8,
+            battery_flag: u8,
+            percent: u8,
+            saver: u8,
+            life: u32,
+            full: u32,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetSystemPowerStatus(s: *mut PowerStatus) -> i32;
+        }
+        let mut s = PowerStatus { ac: 0, battery_flag: 0, percent: 0, saver: 0, life: 0, full: 0 };
+        if unsafe { GetSystemPowerStatus(&mut s) } == 0 {
+            return false;
+        }
+        has_battery(s.battery_flag)
+    }
+    // macOS: IOKit's power sources; a Mac with none is a desktop (an iMac or Mac Pro
+    // with two GPUs then takes the stronger one; Apple silicon has one GPU either way)
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::c_void;
+        #[link(name = "IOKit", kind = "framework")]
+        extern "C" {
+            fn IOPSCopyPowerSourcesInfo() -> *const c_void;
+            fn IOPSCopyPowerSourcesList(blob: *const c_void) -> *const c_void;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFArrayGetCount(a: *const c_void) -> isize;
+            fn CFRelease(cf: *const c_void);
+        }
+        unsafe {
+            let info = IOPSCopyPowerSourcesInfo();
+            if info.is_null() {
+                return true;
+            }
+            let list = IOPSCopyPowerSourcesList(info);
+            let n = if list.is_null() { 0 } else { CFArrayGetCount(list) };
+            if !list.is_null() {
+                CFRelease(list);
+            }
+            CFRelease(info);
+            n > 0
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    true
+}
+
+/// GetSystemPowerStatus' battery flag: 128 means no system battery, 255 unknown (both
+/// count as a desktop); anything else (high, low, critical, charging) is a battery.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn has_battery(flag: u8) -> bool {
+    !matches!(flag, 128 | 255)
+}
+
+#[cfg(test)]
+mod battery_tests {
+    #[test]
+    fn desktop_takes_the_card_laptop_the_chip() {
+        assert!(!super::has_battery(128)); // desktop
+        assert!(!super::has_battery(255)); // unknown
+        for f in [0u8, 1, 2, 4, 8, 9] {
+            assert!(super::has_battery(f), "flag {f}");
+        }
     }
 }

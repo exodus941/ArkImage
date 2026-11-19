@@ -89,7 +89,12 @@ impl Entry {
         }
     }
 
+    /// The file's bytes. On a spinning disk one read at a time: decoders reading several
+    /// files at once made the head seek between them, and a turned page waited up to
+    /// 1.9 s for its read (4 TB HDD, 46,000-file folder; 50 ms at most on an SSD).
     pub fn read_bytes(&self) -> io::Result<Vec<u8>> {
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = seek_penalty(self.fs_path()).then(|| ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner()));
         match self {
             Entry::File(p) => fs::read(p),
             Entry::Zip { archive, name } => crate::archive::read(archive, name),
@@ -356,11 +361,19 @@ fn list_dir_shared(dir: &Path, sort: u8, desc: bool, fresh: bool) -> io::Result<
     Ok(l)
 }
 
-/// The held list of `dir` and its position map, if any window holds one.
-pub fn held(dir: &Path) -> Option<(Arc<Vec<Entry>>, Arc<PosMap>)> {
-    let g = LISTS.lock().unwrap();
-    let s = g.as_ref()?.get(dir)?.lock().unwrap();
-    Some((s.list.upgrade()?, s.pos.clone()))
+/// The held list of `dir` and its position map, if any window holds one. Err: the slot
+/// is busy (a folder being read); the main thread never waits for it, so ask again later.
+/// Waiting here, with LISTS held, froze the master behind a queue of 5 s listings.
+pub fn held(dir: &Path) -> Result<Option<(Arc<Vec<Entry>>, Arc<PosMap>)>, ()> {
+    let slot = { LISTS.lock().unwrap().as_ref().and_then(|m| m.get(dir).cloned()) };
+    let Some(slot) = slot else { return Ok(None) };
+    let Ok(s) = slot.try_lock() else { return Err(()) };
+    Ok(s.list.upgrade().map(|l| (l, s.pos.clone())))
+}
+
+/// Hand `dir` to `changed()` again (its slot was busy).
+pub fn retry_changed(dir: &Path) {
+    CHANGED.lock().unwrap().push(dir.to_path_buf());
 }
 
 /// Folders whose list was replaced since the last call.
@@ -499,7 +512,7 @@ mod store_tests {
         let n = open_fresh(&d.join("a.png"), 0, false).unwrap();
         assert_eq!(n.len(), 4);
         assert!(changed().contains(&d));
-        assert!(Arc::ptr_eq(&held(&d).unwrap().0, &n.entries));
+        assert!(Arc::ptr_eq(&held(&d).unwrap().unwrap().0, &n.entries));
         // a delete: one list without it, for everyone
         let e = n.get(1).unwrap().clone();
         let r = remove(&d, &e).unwrap();
@@ -516,7 +529,7 @@ mod store_tests {
         let z = open(&d, 0, true).unwrap();
         assert!(!Arc::ptr_eq(&a.entries, &z.entries));
         assert_eq!(z.get(0).unwrap().name(), "b.png");
-        assert!(Arc::ptr_eq(&held(&d).unwrap().0, &z.entries));
+        assert!(Arc::ptr_eq(&held(&d).unwrap().unwrap().0, &z.entries));
         drop((a, z));
         let _ = fs::remove_dir_all(&d);
     }
@@ -557,4 +570,88 @@ mod tests {
         assert_eq!(natural_cmp("p001", "p1"), Greater);
         assert_eq!(natural_cmp("ch 9 p3", "ch 10 p1"), Less);
     }
+}
+
+/// True when the drive holding `p` has a seek penalty (a spinning disk), as Windows reports
+/// it (IOCTL_STORAGE_QUERY_PROPERTY, StorageDeviceSeekPenaltyProperty). Asked once per drive.
+#[cfg(windows)]
+pub fn seek_penalty(p: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::ffi::c_void;
+    use std::path::Component;
+    static SEEN: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+    let letter = std::path::absolute(p).ok().and_then(|a| match a.components().next() {
+        Some(Component::Prefix(x)) => match x.kind() {
+            std::path::Prefix::Disk(d) | std::path::Prefix::VerbatimDisk(d) => Some(d as char),
+            _ => None,
+        },
+        _ => None,
+    });
+    let Some(letter) = letter else { return false };
+    let key = letter.to_ascii_uppercase().to_string();
+    if let Some(v) = SEEN.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
+        return *v;
+    }
+    #[repr(C)]
+    struct Query {
+        property: u32,
+        query: u32,
+        extra: [u8; 4],
+    }
+    #[repr(C)]
+    struct Penalty {
+        version: u32,
+        size: u32,
+        incurs: u8,
+        pad: [u8; 3],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(name: *const u16, access: u32, share: u32, sa: *mut c_void, disp: u32, flags: u32, tmpl: *mut c_void) -> isize;
+        fn DeviceIoControl(h: isize, code: u32, inb: *const c_void, insz: u32, outb: *mut c_void, outsz: u32, ret: *mut u32, ov: *mut c_void) -> i32;
+        fn CloseHandle(h: isize) -> i32;
+    }
+    let name: Vec<u16> = format!(r"\\.\{key}:").encode_utf16().chain(std::iter::once(0)).collect();
+    // no access needed to ask the property; share read and write; OPEN_EXISTING
+    let h = unsafe { CreateFileW(name.as_ptr(), 0, 3, std::ptr::null_mut(), 3, 0, std::ptr::null_mut()) };
+    let mut v = false;
+    if h != -1 {
+        let q = Query { property: 7, query: 0, extra: [0; 4] };
+        let mut out = Penalty { version: 0, size: 0, incurs: 0, pad: [0; 3] };
+        let mut got = 0u32;
+        // IOCTL_STORAGE_QUERY_PROPERTY
+        if unsafe { DeviceIoControl(h, 0x002D_1400, &q as *const Query as *const c_void, std::mem::size_of::<Query>() as u32, &mut out as *mut Penalty as *mut c_void, std::mem::size_of::<Penalty>() as u32, &mut got, std::ptr::null_mut()) } != 0 {
+            v = out.incurs != 0;
+        }
+        unsafe { CloseHandle(h) };
+    }
+    crate::trace(&format!("drive {key}: seek penalty {v}"));
+    SEEN.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, v);
+    v
+}
+
+/// True when the volume holding `p` is on a spinning disk (an external HDD, say), as
+/// `diskutil` reports it ("SolidState" false). Asked once per volume (its device id).
+#[cfg(target_os = "macos")]
+pub fn seek_penalty(p: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt;
+    static SEEN: Mutex<Option<HashMap<u64, bool>>> = Mutex::new(None);
+    let Ok(dev) = std::fs::metadata(p).map(|m| m.dev()) else { return false };
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = g.as_ref().and_then(|m| m.get(&dev)) {
+        return *v;
+    }
+    let out = std::process::Command::new("/usr/sbin/diskutil").args(["info", "-plist"]).arg(p).output();
+    let text = out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    // <key>SolidState</key> then <true/> or <false/>; missing (a network volume): not spinning
+    let v = text.split("<key>SolidState</key>").nth(1).is_some_and(|r| r.trim_start().starts_with("<false/>"));
+    crate::trace(&format!("volume {dev}: seek penalty {v}"));
+    g.get_or_insert_with(HashMap::new).insert(dev, v);
+    v
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn seek_penalty(_p: &Path) -> bool {
+    false
 }

@@ -118,13 +118,19 @@ pub fn cache_mb() -> u64 {
     static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MB.get_or_init(|| {
         let gb = machine_memory().unwrap_or(8 << 30) as f64 / (1u64 << 30) as f64;
-        if gb <= 16.0 {
+        let tier = if gb <= 16.0 {
             1024
         } else if gb <= 32.0 {
             2048
         } else {
             4096
-        }
+        };
+        // a separate graphics card: no more than half its dedicated memory
+        #[cfg(windows)]
+        let tier = dedicated_vram().map_or(tier, |v| tier.min(v / 2 / (1 << 20)));
+        #[cfg(windows)]
+        crate::trace(&format!("cache: {tier} MB ({gb:.1} GB RAM, {} MB dedicated VRAM)", dedicated_vram().unwrap_or(0) >> 20));
+        tier
     })
 }
 
@@ -140,23 +146,189 @@ pub fn machine_memory() -> Option<u64> {
     (r == 0).then_some(v)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The machine's memory, bytes (Windows: GlobalMemoryStatusEx).
+#[cfg(windows)]
+pub fn machine_memory() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        len: u32,
+        load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page: u64,
+        avail_page: u64,
+        total_virt: u64,
+        avail_virt: u64,
+        avail_ext: u64,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(m: *mut MemoryStatusEx) -> i32;
+    }
+    let mut m = MemoryStatusEx { len: std::mem::size_of::<MemoryStatusEx>() as u32, load: 0, total_phys: 0, avail_phys: 0, total_page: 0, avail_page: 0, total_virt: 0, avail_virt: 0, avail_ext: 0 };
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.total_phys)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn machine_memory() -> Option<u64> {
     None
 }
 
+/// Windows: the largest dedicated video memory of any graphics card, bytes (DXGI adapter
+/// descriptions; a chip that shares the system memory reports 128 MB or less and counts
+/// as none). None without a separate card.
+#[cfg(windows)]
+pub fn dedicated_vram() -> Option<u64> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Guid(u32, u16, u16, [u8; 8]);
+    #[repr(C)]
+    struct AdapterDesc1 {
+        description: [u16; 128],
+        vendor: u32,
+        device: u32,
+        subsys: u32,
+        revision: u32,
+        dedicated_video: usize,
+        dedicated_system: usize,
+        shared_system: usize,
+        luid: u64,
+        flags: u32,
+    }
+    #[link(name = "dxgi")]
+    extern "system" {
+        fn CreateDXGIFactory1(riid: *const Guid, f: *mut *mut c_void) -> i32;
+    }
+    // IID_IDXGIFactory1
+    let iid = Guid(0x770aae78, 0xf26f, 0x4dba, [0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87]);
+    type Release = unsafe extern "system" fn(*mut c_void) -> u32;
+    type EnumAdapters1 = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+    type GetDesc1 = unsafe extern "system" fn(*mut c_void, *mut AdapterDesc1) -> i32;
+    unsafe {
+        let mut f: *mut c_void = std::ptr::null_mut();
+        if CreateDXGIFactory1(&iid, &mut f) < 0 || f.is_null() {
+            return None;
+        }
+        // vtables: IUnknown (3), IDXGIObject (4), IDXGIFactory (5): EnumAdapters1 is slot 12;
+        // IDXGIAdapter1::GetDesc1 is slot 10
+        let fv = *(f as *const *const usize);
+        let enum1: EnumAdapters1 = std::mem::transmute(*fv.add(12));
+        let rel_f: Release = std::mem::transmute(*fv.add(2));
+        let mut best = 0u64;
+        for i in 0..16 {
+            let mut a: *mut c_void = std::ptr::null_mut();
+            if enum1(f, i, &mut a) < 0 || a.is_null() {
+                break;
+            }
+            let av = *(a as *const *const usize);
+            let desc1: GetDesc1 = std::mem::transmute(*av.add(10));
+            let rel_a: Release = std::mem::transmute(*av.add(2));
+            let mut d: AdapterDesc1 = std::mem::zeroed();
+            // flag 2: DXGI_ADAPTER_FLAG_SOFTWARE
+            if desc1(a, &mut d) >= 0 && d.flags & 2 == 0 {
+                best = best.max(d.dedicated_video as u64);
+            }
+            rel_a(a);
+        }
+        rel_f(f);
+        (best > 128 << 20).then_some(best)
+    }
+}
+
+
+/// Where this copy keeps its settings (the user's rules, 2026-11-16):
+/// 1. ARKIMAGE_CONFIG_DIR, when set (tests: a test copy never touches the user's settings).
+/// 2. AppData's ArkImage.ini, when it exists: it always wins.
+/// 3. Else ArkImage.ini beside the exe (portable).
+/// 4. Else, on Windows, a new empty ArkImage.ini beside the exe (filled with the defaults
+///    by `load`). A folder it cannot write to falls back to AppData.
+/// An install moves the portable ini to AppData, so rule 2 then holds for every copy.
+fn pick_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("ARKIMAGE_CONFIG_DIR") {
+        return PathBuf::from(d);
+    }
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    pick(Config::appdata_dir(), exe_dir, cfg!(windows))
+}
+
+/// `pick_dir` without the environment: `create` allows a new ini beside the exe.
+fn pick(appdata: PathBuf, exe_dir: Option<PathBuf>, create: bool) -> PathBuf {
+    if appdata.join("ArkImage.ini").exists() {
+        return appdata;
+    }
+    let Some(exe_dir) = exe_dir else { return appdata };
+    let ini = exe_dir.join("ArkImage.ini");
+    if ini.exists() {
+        return exe_dir;
+    }
+    if create && fs::write(&ini, "").is_ok() {
+        crate::trace(&format!("portable: created {}", ini.display()));
+        return exe_dir;
+    }
+    appdata
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::pick;
+    use std::{fs, path::PathBuf};
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("arkimage-pick-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("appdata")).unwrap();
+        fs::create_dir_all(d.join("exe")).unwrap();
+        d
+    }
+
+    /// The user's rules: AppData's ini wins; else the local one; else a new local one.
+    #[test]
+    fn appdata_wins_then_local_then_new() {
+        let d = tmp("rules");
+        let (a, e) = (d.join("appdata"), d.join("exe"));
+        // nothing anywhere: a new empty ini beside the exe
+        assert_eq!(pick(a.clone(), Some(e.clone()), true), e);
+        assert!(e.join("ArkImage.ini").exists());
+        // a local ini and no AppData: the local one
+        assert_eq!(pick(a.clone(), Some(e.clone()), true), e);
+        // AppData's exists (after an install): it wins, and no new local ini is made
+        fs::write(a.join("ArkImage.ini"), "").unwrap();
+        fs::remove_file(e.join("ArkImage.ini")).unwrap();
+        assert_eq!(pick(a.clone(), Some(e.clone()), true), a);
+        assert!(!e.join("ArkImage.ini").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A folder the copy cannot write to falls back to AppData.
+    #[test]
+    fn unwritable_folder_uses_appdata() {
+        let d = tmp("ro");
+        let (a, e) = (d.join("appdata"), d.join("exe").join("missing"));
+        assert_eq!(pick(a.clone(), Some(e), true), a);
+        let _ = fs::remove_dir_all(&d);
+    }
+}
 impl Config {
+    /// The folder that holds ArkImage.ini, the session and crash log. Windows: `pick_dir`.
     pub fn dir() -> PathBuf {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(d) = exe.parent() {
-                if d.join("ArkImage.ini").exists() {
-                    return d.to_path_buf();
+        #[cfg(windows)]
+        return pick_dir();
+        #[cfg(not(windows))]
+        {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(d) = exe.parent() {
+                    if d.join("ArkImage.ini").exists() {
+                        return d.to_path_buf();
+                    }
                 }
             }
+            Self::appdata_dir()
         }
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("ArkImage")
+    }
+
+    /// The per-user settings folder (%APPDATA%\ArkImage, ~/Library/Application Support/ArkImage).
+    pub fn appdata_dir() -> PathBuf {
+        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("ArkImage")
     }
 
     /// "" for the normal copy; "-p<hash of its folder>" for a portable copy, so a portable
@@ -178,7 +350,12 @@ impl Config {
 
     pub fn load() -> Self {
         let mut c = Self::default();
-        if let Ok(s) = fs::read_to_string(Self::path()) {
+        let text = fs::read_to_string(Self::path());
+        // a new portable ini starts empty: fill it with the defaults so it reads as settings
+        if text.as_ref().is_ok_and(|s| s.trim().is_empty()) {
+            c.save();
+        }
+        if let Ok(s) = text {
             for line in s.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with(['#', ';', '[']) {

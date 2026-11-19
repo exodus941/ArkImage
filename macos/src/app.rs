@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -57,7 +57,14 @@ struct Slide {
     /// +1: the new image enters from the right (forward); -1: from the left.
     dir: i32,
     start: Option<Instant>,
+    /// The old image's rows: the motion blur changes only those and the new image's.
+    oy0: usize,
+    oy1: usize,
+    /// When the newest page took the incoming place of this running slide: its motion blur
+    /// counts from then (else a fast scroll blurred only the first page).
+    entered: Option<Instant>,
 }
+
 
 
 pub enum MenuEntry {
@@ -215,7 +222,7 @@ fn is_maximized(w: &Window) -> bool {
     w.is_maximized()
 }
 
-fn menu_label(text: &str, key: &str) -> String {
+pub(crate) fn menu_label(text: &str, key: &str) -> String {
     // Windows right-aligns text after a tab; macOS would print it literally.
     if cfg!(windows) && !key.is_empty() {
         format!("{text}\t{key}")
@@ -280,6 +287,20 @@ const GONE_EVERY: Duration = Duration::from_millis(2500);
 /// The next tick of a clock shared by every window, `every` apart. Periodic checks wait for
 /// it, so all windows wake together: each on its own timer, 100 windows woke the loop about
 /// 200 times a second at idle, and each wake ran every window's timers.
+/// Whether another window covers `w` now (macOS: mac::is_occluded; Windows: occl).
+#[cfg(target_os = "macos")]
+fn covered_now(w: &Arc<Window>) -> bool {
+    crate::mac::is_occluded(w)
+}
+
+#[cfg(windows)]
+fn covered_now(w: &Arc<Window>) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(h) = w.window_handle() else { return false };
+    let RawWindowHandle::Win32(h) = h.as_raw() else { return false };
+    crate::occl::is_covered(h.hwnd.get())
+}
+
 fn shared_tick(now: Instant, every: Duration) -> Instant {
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let e = *EPOCH.get_or_init(Instant::now);
@@ -371,7 +392,7 @@ pub enum Place {
 #[derive(Clone)]
 pub struct Shared {
     pub proxy: EventLoopProxy<UserEvent>,
-    pub job_tx: mpsc::Sender<Entry>,
+    pub job_tx: Arc<Jobs>,
     /// Images each window wants, by window id; a queued decode no window wants is skipped.
     pub wanted: Arc<Mutex<HashMap<u64, HashSet<Entry>>>>,
     pub exif_flag: Arc<AtomicBool>,
@@ -386,7 +407,10 @@ impl Shared {
     pub fn new(proxy: EventLoopProxy<UserEvent>, cfg: &Config) -> Self {
         // the first image decodes before any window has a GPU surface: upload from the
         // start when the setting is on (a GPU that then fails turns this off again)
-        let gpu_on = cfg.gpu && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0");
+        // Windows: off until a window takes the GPU. The first window is alone and draws on
+        // the processor (the glass); its image went to the GPU and showed as the 512 px
+        // thumbnail.
+        let gpu_on = cfg.gpu && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0") && !cfg!(windows);
         crate::gpu::DECODE_TO_GPU.store(gpu_on, Ordering::Relaxed);
         let wanted = Arc::new(Mutex::new(HashMap::new()));
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 3);
@@ -423,7 +447,7 @@ impl Shared {
             return;
         }
         self.inflight.borrow_mut().insert(e.clone());
-        let _ = self.job_tx.send(e);
+        let _ = self.job_tx.send(e, false);
     }
 
     pub fn is_wanted(&self, e: &Entry) -> bool {
@@ -487,7 +511,7 @@ pub struct App {
     failed: Rc<RefCell<HashMap<Entry, String>>>,
     inflight: Rc<RefCell<HashSet<Entry>>>,
     wanted: Arc<Mutex<HashMap<u64, HashSet<Entry>>>>,
-    job_tx: mpsc::Sender<Entry>,
+    job_tx: Arc<Jobs>,
     current: Option<(Entry, Arc<Decoded>)>,
     frame_idx: usize,
     /// Two-finger swipe state: sideways travel so far, whether this gesture already stepped,
@@ -560,6 +584,9 @@ pub struct App {
     fs_restore_at: Option<Instant>,
     /// What the master asked for (one window open), before the full-screen exception.
     glass_want: bool,
+    /// set_glass has run once: until then the window does not know whether it is alone,
+    /// and stays on the processor (taking the GPU for one frame sent the first image there).
+    glass_known: bool,
     glass_loaded: bool,
     glass_from: f32,
     glass_at: Instant,
@@ -596,8 +623,8 @@ pub struct App {
     pending_choice: Option<settings::ChoiceF>,
     /// When a popup last closed, which control opened it, and whether the cursor moved since.
     popup_closed: Option<(Instant, String, bool)>,
-    /// macOS: open the next popup above its control, this many physical px wide (speed menu).
-    #[cfg(target_os = "macos")]
+    /// Open the next popup above its control, this many physical px wide; true: the main
+    /// menu, left-aligned with the button (Windows: popup_win; macOS: mac::popup_over).
     popup_select: Option<(f64, bool)>,
     /// The next popup is a dropdown of this width (physical px): macOS opens it under the
     /// field, exactly as wide.
@@ -608,6 +635,9 @@ pub struct App {
     rename_orig: Option<String>,
     /// Hover fade per chrome control (0-1), and when it was last stepped.
     hover_fx: Vec<(&'static str, f32)>,
+    /// The empty card's action rows and the hotkeys card's close button, as drawn last.
+    empty_hits: Vec<chrome::Hit>,
+    help_hit: Option<chrome::Hit>,
     /// Tooltip fades of the bottom-bar buttons (see chrome::State::tip_fx).
     tip_fx: Vec<(&'static str, f32)>,
     hover_at: Instant,
@@ -621,22 +651,63 @@ pub struct App {
     thumb_jobs: Arc<picker::Jobs>,
 }
 
+/// The decoders' queue. Two lanes: the page a focused window turned to goes first, the
+/// newest such page first; preloads and every other window's images follow in order.
+/// One first-in-first-out queue made a turned page wait behind 60 windows' start-up
+/// decodes and preloads.
+pub struct Jobs {
+    q: Mutex<(std::collections::VecDeque<Entry>, std::collections::VecDeque<Entry>)>,
+    cv: std::sync::Condvar,
+}
+
+impl Jobs {
+    /// Queue `e`. An urgent page replaces the urgent pages still waiting: they were
+    /// passed over (after a jump on the scrub bar the decoders worked through pages
+    /// already left: 33 of 137 turned pages drew). Returns the entries dropped, which
+    /// the caller takes out of its in-flight set.
+    pub fn send(&self, e: Entry, urgent: bool) -> Vec<Entry> {
+        let mut g = self.q.lock().unwrap();
+        let dropped = if urgent {
+            let old: Vec<Entry> = g.0.drain(..).collect();
+            g.0.push_back(e);
+            old
+        } else {
+            g.1.push_back(e);
+            Vec::new()
+        };
+        drop(g);
+        self.cv.notify_one();
+        dropped
+    }
+
+    fn take(&self) -> Entry {
+        let mut g = self.q.lock().unwrap();
+        loop {
+            if let Some(e) = g.0.pop_back() {
+                return e;
+            }
+            if let Some(e) = g.1.pop_front() {
+                return e;
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
+
 fn spawn_workers(
     n: usize,
     proxy: EventLoopProxy<UserEvent>,
     wanted: Arc<Mutex<HashMap<u64, HashSet<Entry>>>>,
     exif_rotate: Arc<AtomicBool>,
-) -> mpsc::Sender<Entry> {
-    let (tx, rx) = mpsc::channel::<Entry>();
-    let rx = Arc::new(Mutex::new(rx));
+) -> Arc<Jobs> {
+    let jobs = Arc::new(Jobs { q: Mutex::new(Default::default()), cv: std::sync::Condvar::new() });
     for _ in 0..n {
-        let rx = rx.clone();
+        let rx = jobs.clone();
         let proxy = proxy.clone();
         let wanted = wanted.clone();
         let exif_rotate = exif_rotate.clone();
         std::thread::spawn(move || loop {
-            let job = { rx.lock().unwrap().recv() };
-            let Ok(e) = job else { break };
+            let e = rx.take();
             if !wanted.lock().unwrap().values().any(|s| s.contains(&e)) {
                 if proxy.send_event(UserEvent::Skipped(e)).is_err() {
                     break;
@@ -650,7 +721,7 @@ fn spawn_workers(
             }
         });
     }
-    tx
+    jobs
 }
 
 fn fmt_size(b: u64) -> String {
@@ -780,6 +851,7 @@ impl App {
             slide_drawn: Instant::now(),
             glass_on: false,
             fs_restore_at: None,
+            glass_known: false,
             glass_want: false,
             glass_loaded: false,
             glass_from: 1.0,
@@ -807,12 +879,13 @@ impl App {
             settings: None,
             pending_choice: None,
             popup_closed: None,
-            #[cfg(target_os = "macos")]
             popup_select: None,
             below_w: None,
             at_pointer: false,
             rename_orig: None,
             hover_fx: Vec::new(),
+            empty_hits: Vec::new(),
+            help_hit: None,
             tip_fx: Vec::new(),
             hover_at: Instant::now(),
             num_edit_orig: None,
@@ -934,6 +1007,10 @@ impl App {
     /// The master calls this when the window count changes: glass while this is the only
     /// window. `instant` skips the fade (a window just opened).
     pub fn set_glass(&mut self, on: bool, instant: bool) {
+        if !self.glass_known {
+            self.glass_known = true;
+            self.request_redraw();
+        }
         self.glass_want = on;
         // macOS full screen has nothing behind the window to blur
         let on = on && !(cfg!(target_os = "macos") && self.fullscreen);
@@ -958,6 +1035,8 @@ impl App {
             acrylic(&w, false, self.cfg.bg_color);
             self.glass_loaded = false;
             crate::trace("glass unloaded");
+            // Windows: the window can take the GPU now; draw again so it does
+            self.request_redraw();
         }
         self.glass_loaded
     }
@@ -992,19 +1071,21 @@ impl App {
 
     /// Take the master's new list for folder `dir` (re-read or a file deleted elsewhere),
     /// staying on the image shown.
-    pub fn adopt(&mut self, dir: &Path) {
-        let Some(pl) = &self.playlist else { return };
+    /// False: the folder's slot was busy; ask again later.
+    pub fn adopt(&mut self, dir: &Path) -> bool {
+        let Some(pl) = &self.playlist else { return true };
         if pl.container != dir || pl.rev {
-            return;
+            return true;
         }
-        let Some((l, pos)) = source::held(dir) else { return };
+        let Ok(h) = source::held(dir) else { return false };
+        let Some((l, pos)) = h else { return true };
         if Arc::ptr_eq(&l, &pl.entries) || l.is_empty() {
-            return;
+            return true;
         }
         let cur = self.cur_entry();
         let at = cur.as_ref().and_then(|c| pos.get(c)).copied();
         let old = pl.index;
-        let Some(pl) = &mut self.playlist else { return };
+        let Some(pl) = &mut self.playlist else { return true };
         pl.entries = l;
         self.pos_map = pos;
         match at {
@@ -1020,6 +1101,7 @@ impl App {
                 self.go_to(i);
             }
         }
+        true
     }
 
     /// True while this window shows `e` as a one-entry list, waiting for its folder list.
@@ -1084,7 +1166,11 @@ impl App {
             return;
         }
         self.inflight.borrow_mut().insert(e.clone());
-        let _ = self.job_tx.send(e);
+        // the page a focused window shows now jumps the queue
+        let urgent = self.cur_entry().as_ref() == Some(&e) && self.window.as_ref().is_some_and(|w| w.has_focus());
+        for d in self.job_tx.send(e, urgent) {
+            self.inflight.borrow_mut().remove(&d);
+        }
     }
 
     /// True if `e` is nearer the current index than the image now on screen.
@@ -1218,7 +1304,7 @@ impl App {
         }
         let before = pl.index;
         pl.index = i.min(pl.entries.len() - 1);
-        crate::trace(&format!("go_to {}", pl.index));
+        crate::trace(&format!("go_to {} in window {}", pl.index, self.id));
         // slide from the last settled frame; a fast scrub keeps sliding from that one
         let hint = self.nav_hint.take();
         let after = self.index();
@@ -1229,8 +1315,12 @@ impl App {
                     // a slide already running the same way: keep it going and let the
                     // newest image take the incoming place, so a fast scroll moves on
                     // smoothly instead of restarting from the old image every step
-                    Some(s) if s.w == w && s.h == h && s.dir == dir => {}
-                    _ => self.slide = Some(Slide { old: self.last_frame.clone(), w, h, dir, start: None }),
+                    Some(s) if s.w == w && s.h == h && s.dir == dir => s.entered = Some(Instant::now()),
+                    _ => {
+                        // the old image's rows, from the layout it was drawn with
+                        let (oy0, oy1) = self.layout.map(|l| (l.oy.floor().max(0.0) as usize, (l.oy + l.sh).ceil().max(0.0) as usize)).unwrap_or((0, h));
+                        self.slide = Some(Slide { old: self.last_frame.clone(), w, h, dir, start: None, oy0, oy1, entered: None })
+                    }
                 }
             }
         }
@@ -1446,12 +1536,18 @@ impl App {
         if o == self.occluded {
             return;
         }
-        crate::trace(&format!("window covered: {o}"));
+        crate::trace(&format!("window {} covered: {o}", self.id));
         self.occluded = o;
         if o {
-            self.strip();
-            if let Some(g) = &mut self.gpu {
-                g.park();
+            // Windows: a covered window keeps its swap chain and textures, so it shows
+            // its last frame at once and the sharp copy without a new upload when raised.
+            // The GPU budget (note_use, cache_mb) still strips the least recent windows.
+            #[cfg(not(windows))]
+            {
+                self.strip();
+                if let Some(g) = &mut self.gpu {
+                    g.park();
+                }
             }
         } else {
             self.unstrip();
@@ -2010,8 +2106,14 @@ impl App {
     }
 
     /// The GPU setting, with the ARKIMAGE_GPU=0 test override (never saved).
+    /// Windows: never while the window glass shows (one window open). A DirectX swap chain
+    /// covers the glass: the blur behind the window reached neither an HWND swap chain
+    /// (Opaque only) nor a DirectComposition one (#000000 under a clear GPU frame, also
+    /// with the Windows 11 Acrylic backdrop). The window switches to the GPU once the
+    /// glass has faded out, when a second window opens.
     fn gpu_wanted(&self) -> bool {
-        self.cfg.gpu && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0") && !self.too_big_for_gpu()
+        let glass = cfg!(windows) && (self.glass_on || self.glass_loaded || !self.glass_known) && std::env::var_os("ARKIMAGE_GPU_SELFTEST").is_none();
+        self.cfg.gpu && !glass && std::env::var("ARKIMAGE_GPU").as_deref() != Ok("0") && !self.too_big_for_gpu()
     }
 
     /// The image shown has a side past the GPU's texture limit (16,384 px on Apple
@@ -2458,8 +2560,11 @@ impl App {
                     // old timestamp gave a 349 px smear on the first frame)
                     let since = self.slide_drawn.elapsed().as_secs_f64();
                     let frame_ms = if since > 0.05 { 16.7 } else { since.max(0.004) * 1000.0 };
-                    let per_frame = w * 3.0 * (1.0 - t).powi(2) * frame_ms / self.cfg.slide_ms as f64;
+                    // a page that entered a running slide blurs as at its own start
+                    let te = s.entered.map_or(t, |at| (at.elapsed().as_secs_f64() * 1000.0 / self.cfg.slide_ms as f64).min(t));
+                    let per_frame = w * 3.0 * (1.0 - te).powi(2) * frame_ms / self.cfg.slide_ms as f64;
                     self.gpu_motion = (per_frame * 0.5 * 0.5) as f32;
+                    crate::trace(&format!("slide motion blur {:.1} px", self.gpu_motion));
                 }
             }
         }
@@ -2517,6 +2622,15 @@ impl App {
             if let Some((dx_new, _)) = slide_at {
                 // during the slide: sample only the visible pixels, no filters (as pinch zoom)
                 render::blit_sample(c, &base, l.ox + dx_new, l.oy, l.z, true, bg, checker);
+                // the GPU's slide motion blur, on the processor (a lone window draws here)
+                if self.gpu_motion > 1.0 {
+                    let t0 = Instant::now();
+                    // the old image slides out at the same height, sized for this window
+                    let (y0, y1) = (l.oy.floor().max(0.0) as usize, (l.oy + l.sh).ceil().max(0.0) as usize);
+                    let (o0, o1) = self.slide.as_ref().map(|s| (s.oy0, s.oy1)).unwrap_or((y0, y1));
+                    render::motion_blur(c, self.gpu_motion, y0.min(o0), y1.max(o1));
+                    crate::trace(&format!("cpu motion blur {:.1} px in {:.1} ms", self.gpu_motion, t0.elapsed().as_secs_f64() * 1000.0));
+                }
                 self.slide_drawn = Instant::now();
             } else {
             // Enlarged images go through the resize path too when the preset sharpens,
@@ -2578,13 +2692,21 @@ impl App {
         // the "Drop an image" card fades in over 250 ms when it appears
         if self.playlist.is_none() {
             let at = *self.empty_at.get_or_insert_with(Instant::now);
-            let a = crate::ui::fade_amount(at, true);
-            crate::ui::faded(c, a, |c| crate::ui::empty_card(c, &mut t, cw, ch, sf));
-            if a < 1.0 {
+            // the hotkeys card covers it: it fades out as that card fades in (seen through
+            // the frost over the window glass, its text stayed readable)
+            let own = crate::ui::fade_amount(at, true);
+            let a = own * (1.0 - crate::ui::fade_amount(self.help_at, self.show_help));
+            let hover = crate::ui::EMPTY_ACTIONS.map(|(id, ..)| self.hover_fx.iter().find(|(k, _)| *k == id).map_or(0.0, |(_, v)| *v));
+            let mut rects = Vec::new();
+            crate::ui::faded(c, a, |c| rects = crate::ui::empty_card(c, &mut t, cw, ch, sf, hover));
+            self.empty_hits = rects.into_iter().zip(crate::ui::EMPTY_ACTIONS).map(|((x0, y0, x1, y1), (id, ..))| chrome::Hit { x0, y0, x1, y1, id }).collect();
+            // its own fade-in only; the hotkeys card's fade asks for its own frames
+            if own < 1.0 {
                 self.request_redraw();
             }
         } else {
             self.empty_at = None;
+            self.empty_hits.clear();
         }
         if self.picker.open {
             if let Some(pl) = &self.playlist {
@@ -2673,9 +2795,15 @@ impl App {
         }
         // the hotkeys card fades in and out over 250 ms
         let ha = crate::ui::fade_amount(self.help_at, self.show_help);
+        self.help_hit = None;
         if ha > 0.0 {
             let rows: Vec<(String, String)> = HELP.iter().map(|(k, a)| (k.to_string(), a.to_string())).collect();
-            crate::ui::faded(c, ha, |c| crate::ui::help_card(c, &mut t, sf, "Hotkeys", &rows));
+            let close_hover = self.hover_fx.iter().find(|(k, _)| *k == "help_close").map_or(0.0, |(_, v)| *v);
+            // 16 px clear of the title strip and of the bottom bar
+            let band = ((chrome::TITLE_H + 16.0) * sf, ch - (chrome::BAR_H + chrome::BAR_GAP + 16.0) * sf);
+            let mut r = (0.0, 0.0, 0.0, 0.0);
+            crate::ui::faded(c, ha, |c| r = crate::ui::help_card(c, &mut t, sf, "Hotkeys", &rows, close_hover, band));
+            self.help_hit = self.show_help.then_some(chrome::Hit { x0: r.0, y0: r.1, x1: r.2, y1: r.3, id: "help_close" });
             if ha < 1.0 {
                 self.request_redraw();
             }
@@ -2683,6 +2811,10 @@ impl App {
             self.request_redraw();
         }
         self.hits.clear();
+        // the empty card's actions, under the chrome; none while the hotkeys card covers it
+        if !self.show_help {
+            self.hits.extend(self.empty_hits.iter().copied());
+        }
         let title = self.chrome_title();
         // Hover fades: each control's amount moves toward 1 while hovered and 0 after,
         // linearly over 250 ms, both ways.
@@ -2764,6 +2896,10 @@ impl App {
         let mut hits = std::mem::take(&mut self.hits);
         chrome::draw(c, Some(&mut t), &st, &mut hits);
         self.hits = hits;
+        // the hotkeys card's close button, over everything
+        if let Some(h) = self.help_hit {
+            self.hits.push(h);
+        }
         for (saved, off, a) in [(saved_top, 0, self.fade.0), (saved_bot, bot_from * c.w, self.fade.1)] {
             if let Some(saved) = saved {
                 let a = (a * 255.0) as u32;
@@ -3181,6 +3317,13 @@ impl App {
     fn on_chrome_click(&mut self, el: &ActiveEventLoop, h: chrome::Hit, right: bool) {
         let n = if right { 10 } else { 1 };
         match h.id {
+            "empty_file" => self.open_dialog(),
+            "empty_folder" => self.open_folder_dialog(),
+            "empty_help" | "help_close" => {
+                self.show_help = !self.show_help;
+                self.help_at = Instant::now();
+                self.request_redraw();
+            }
             "title" => {
                 let now = Instant::now();
                 let dbl = self.last_click.map(|(t, _)| now - t < Duration::from_millis(400)).unwrap_or(false);
@@ -3229,11 +3372,8 @@ impl App {
                 self.slider_seek();
             }
             "anim_speed" => {
-                // macOS: above the pill, at least as wide, right-aligned (mac::popup_over)
-                #[cfg(target_os = "macos")]
-                {
-                    self.popup_select = Some(((h.x1 - h.x0) as f64, false));
-                }
+                // above the pill, at least as wide, right-aligned
+                self.popup_select = Some(((h.x1 - h.x0) as f64, false));
                 self.show_menu(el, "speed", h.x0, h.y0)
             }
             "anim_slider" => {
@@ -3398,6 +3538,33 @@ impl App {
     fn popup_show(&mut self, el: &ActiveEventLoop, w: &Arc<Window>, items: Vec<MenuEntry>, x: f32, y: f32) {
         use muda::ContextMenu;
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        // Windows: native dark Win32 menus (popup_win). Bar menus open above the button,
+        // 4 px over it; a settings dropdown opens 2 px under the field, right edges aligned.
+        #[cfg(windows)]
+        if let Ok(h) = w.window_handle() {
+            if let RawWindowHandle::Win32(h) = h.as_raw() {
+                use crate::popup_win::{show_above, show_below, Edge};
+                let hwnd = h.hwnd.get();
+                let sf = w.scale_factor() as f32;
+                let chosen = if let Some((pw, left)) = self.popup_select.take() {
+                    let pw = pw as f32;
+                    let (ax, edge) = if left { (x, Edge::Left) } else { (x + pw, Edge::Right) };
+                    // menu text is 9 pt Segoe UI: a figure space is about 7 px at 100%, and the
+                    // check column and margins take about 64 px; the main menu needs no minimum
+                    let min_chars = if left { 0 } else { ((pw / sf - 64.0) / 7.0).ceil().max(0.0) as usize };
+                    show_above(hwnd, items, ax as i32, (y - 4.0 * sf).round() as i32, edge, min_chars)
+                } else if let Some(bw) = self.below_w.take() {
+                    show_below(hwnd, items, (x + bw as f32) as i32, (y + (2.0 * sf).round()) as i32, Edge::Right)
+                } else {
+                    show_below(hwnd, items, x as i32, y as i32, Edge::Left)
+                };
+                if let Some(id) = chosen {
+                    self.menu_action(el, &id);
+                }
+                self.request_redraw();
+                return;
+            }
+        }
         let menu = muda::Menu::new();
         for b in build_menu(items) {
             let _ = menu.append(b.as_ref());
@@ -4546,9 +4713,16 @@ impl App {
                 let c = o || self.window.as_ref().is_some_and(|w| crate::mac::is_occluded(w));
                 self.set_covered(c);
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(windows)]
+            WindowEvent::Occluded(o) => {
+                let c = o || self.window.as_ref().is_some_and(covered_now);
+                self.set_covered(c);
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
             WindowEvent::Occluded(o) => self.set_covered(o),
             WindowEvent::Focused(true) => {
+                // a focused window is in front: draw it now, not at the next covered check
+                self.set_covered(false);
                 self.unstrip();
                 // the focused window preloads its neighbours (GPU mode)
                 self.update_wanted();
@@ -4685,6 +4859,14 @@ impl App {
                         if let Some(w) = &self.window {
                             let _ = w.drag_resize_window(dir);
                         }
+                        return;
+                    }
+                    // the hotkeys card closes on a click anywhere but a toolbar button: on
+                    // the card, its close button or the image
+                    if self.show_help && self.hit_at(self.cursor).is_none_or(|h| h.id == "help_close") {
+                        self.show_help = false;
+                        self.help_at = Instant::now();
+                        self.request_redraw();
                         return;
                     }
                     if let Some(h) = self.hit_at(self.cursor) {
@@ -4840,6 +5022,9 @@ impl App {
                 if dy == 0.0 {
                     return;
                 }
+                crate::trace(&format!("wheel {dy} in window {}", self.id));
+                // one page per event, as 1.1.9: a fast spin packs 12 to 16 notches into one
+                // event, and a page per notch jumped that far with no slide in between
                 if self.primary() || self.cfg.wheel_zoom {
                     let a = Some(self.cursor);
                     self.zoom_step(dy > 0.0, a);
@@ -4887,13 +5072,14 @@ impl App {
     /// Timers for this window (animation, toast, fade); returns the next deadline.
     pub fn about_to_wait(&mut self) -> Option<Instant> {
         let now = Instant::now();
-        // macOS: ask whether the window is covered, twice a second (winit only passed on
-        // "visible": stacked windows were never reported covered)
-        #[cfg(target_os = "macos")]
+        // ask whether the window is covered, twice a second (winit reports only "visible"
+        // on macOS and only a minimize on Windows: stacked windows were never covered)
+        #[cfg(any(windows, target_os = "macos"))]
         if self.gpu.is_some() && now >= self.occ_checked {
             self.occ_checked = shared_tick(now, Duration::from_millis(500));
             if let Some(w) = self.window.clone() {
-                self.set_covered(crate::mac::is_occluded(&w));
+                let minimized = w.is_minimized() == Some(true);
+                self.set_covered(minimized || covered_now(&w));
             }
             // a window covered before its image arrived was not stripped then (see strip);
             // still covered half a second on, it gives the full image back now
@@ -4901,9 +5087,9 @@ impl App {
                 self.strip();
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(windows, target_os = "macos"))]
         let occ_at = self.gpu.is_some().then_some(self.occ_checked);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let occ_at: Option<Instant> = None;
         // test hook: ARKIMAGE_TEST_PINCH_MS=<n> pinches from n ms after start: a zoom step
         // every 8 ms for 1.5 s (in, then out), as trackpad events arrive
@@ -4958,6 +5144,28 @@ impl App {
                 self.step(1, false);
             } else if !DONE.load(std::sync::atomic::Ordering::Relaxed) {
                 hook_at = Some(*T0.get().unwrap() + Duration::from_millis(ms));
+            }
+        }
+        // test hook: ARKIMAGE_TEST_FLIP_MS=<n> turns a page every 30 ms for 3 s from n ms
+        // after start, as a spun mouse wheel does (the first window to ask takes it)
+        if let Some(ms) = std::env::var("ARKIMAGE_TEST_FLIP_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            static OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+            static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+            let t0 = *T0.get_or_init(Instant::now);
+            let (start, end) = (t0 + Duration::from_millis(ms), t0 + Duration::from_millis(ms + 3000));
+            let me = self.id as u64;
+            if now >= start && now < end && !self.occluded && OWNER.compare_exchange(u64::MAX, me, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).map_or_else(|o| o == me, |_| true) {
+                let mut last = LAST.lock().unwrap();
+                if last.is_none_or(|l| now >= l + Duration::from_millis(30)) {
+                    *last = Some(now);
+                    drop(last);
+                    crate::trace(&format!("test: flip in window {}", self.id));
+                    self.step(1, false);
+                }
+                hook_at = Some(now + Duration::from_millis(30));
+            } else if now < start {
+                hook_at = Some(start);
             }
         }
         if self.gpu.as_mut().is_some_and(|g| g.poll_budget()) {

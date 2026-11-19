@@ -132,7 +132,7 @@ fn svg(bytes: &[u8]) -> Result<RgbaImage, String> {
     RgbaImage::from_raw(w.max(1), h.max(1), px).ok_or_else(|| "bad SVG data".into())
 }
 
-/// A Lottie animation, set by decode_frames for the caller (frames are drawn when shown).
+// A Lottie animation, set by decode_frames for the caller (frames are drawn when shown).
 thread_local! {
     static LOTTIE: std::cell::RefCell<Option<Arc<crate::lottie::Player>>> = const { std::cell::RefCell::new(None) };
 }
@@ -334,7 +334,7 @@ fn decode_inner(e: &Entry, exif_rotate: bool, to_gpu: bool) -> Result<Decoded, S
         let (exif, o) = read_exif(&bytes);
         // an EXIF-turned photo goes up as stored; the GPU turns it (HEIF decoders apply
         // the container rotation themselves)
-        let turn = if exif_rotate && o > 1 && o <= 8 { o as u8 } else { 1 };
+        let turn = if exif_rotate && o > 1 && o <= 8 && !crate::heic::is_heif(&bytes) { o as u8 } else { 1 };
         if let Some(r) = decode_bands(&bytes, &ext) {
             let (t, thumb, format) = r?;
             let swaps = turn >= 5;
@@ -822,8 +822,31 @@ fn webp_bands(bytes: &[u8]) -> Option<Result<(Arc<crate::gpu::Tex>, RgbaImage), 
     Some(sink.finish())
 }
 
+/// HEIF through the band path (Windows: libheif): its decoded plane goes up row by row,
+/// so RAM holds libheif's one copy, not a second one of the image's size (145 MB each at
+/// 6016x6016).
+#[cfg(not(target_os = "macos"))]
+fn heif_bands(bytes: &[u8]) -> Option<Result<(Arc<crate::gpu::Tex>, RgbaImage), String>> {
+    let r = crate::heic::with_plane(bytes, |w, h, stride, data| {
+        let mut sink = BandSink::new(w as u32, h as u32)?;
+        for y in 0..h {
+            sink.push_row(&data[y * stride..y * stride + w * 4]);
+        }
+        Some(sink.finish())
+    });
+    match r {
+        Ok(Some(r)) => Some(r),
+        Ok(None) => None,
+        Err(e) => Some(Err(e)),
+    }
+}
+
 /// The band path for formats that decode row by row; None when it does not apply.
 fn decode_bands(bytes: &[u8], ext: &str) -> Option<Result<(Arc<crate::gpu::Tex>, RgbaImage, String), String>> {
+    #[cfg(not(target_os = "macos"))]
+    if crate::heic::is_heif(bytes) {
+        return heif_bands(bytes).map(|r| r.map(|(t, th)| (t, th, "HEIF".to_string())));
+    }
     match image::guess_format(bytes).ok() {
         Some(ImageFormat::Png) => png_bands(bytes).map(|r| r.map(|(t, th)| (t, th, "PNG".to_string()))),
         Some(ImageFormat::Jpeg) => jpeg_bands(bytes).map(|r| r.map(|(t, th)| (t, th, "JPEG".to_string()))),
