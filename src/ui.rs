@@ -114,6 +114,16 @@ fn box_pass(v: &mut [f32], tmp: &mut [f32], len: usize, n: usize, step: usize, l
 /// px (three box passes), under `tint` at `ta`. Over the window glass the pixels stay
 /// glass, darkened by `ta`.
 #[allow(clippy::too_many_arguments)]
+thread_local! {
+    /// The last plain-pixel blur of `frost`: its key (box, blur, pixels) and its values.
+    static KEPT: std::cell::RefCell<(u64, Vec<f32>)> = const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+#[cfg(test)]
+fn frost_forget() {
+    KEPT.with(|k| *k.borrow_mut() = (0, Vec::new()));
+}
+
 fn frost(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, blur: f32, tint: u32, ta: f32) {
     use crate::render::{glass_real, mix, sd_rrect};
     let (x0, y0) = (x.floor().max(0.0) as usize, y.floor().max(0.0) as usize);
@@ -143,20 +153,32 @@ fn frost(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, blur: f32, tint
     let e = blur.ceil() as usize;
     let (sx0, sy0, sx1, sy1) = if any_plain { (bx0.saturating_sub(e), by0.saturating_sub(e), (bx1 + e).min(c.w), (by1 + e).min(c.h)) } else { (x0, y0, x0, y0) };
     let (sw, sh) = (sx1 - sx0, sy1 - sy0);
-    let mut v = vec![0f32; sw * sh * 3];
+    // A fade or a hover redraws the card over the same pixels each frame, so the blur of
+    // those pixels is kept and reused while they and the box stay the same: over plain
+    // interface the blur alone took 92 ms a frame at 1840x1040 (Windows' measure).
+    let mut key = 0xcbf2_9ce4_8422_2325u64 ^ (sx0 as u64) << 48 ^ (sy0 as u64) << 32 ^ (sw as u64) << 16 ^ sh as u64 ^ (blur.to_bits() as u64) << 20;
     for yy in 0..sh {
-        for xx in 0..sw {
-            let mut p = c.buf[(sy0 + yy) * c.w + sx0 + xx];
-            if p >> 24 == 1 {
-                p = glass_real(p);
-            }
-            let i = (yy * sw + xx) * 3;
-            v[i] = (p >> 16 & 0xFF) as f32;
-            v[i + 1] = (p >> 8 & 0xFF) as f32;
-            v[i + 2] = (p & 0xFF) as f32;
+        for &p in &c.buf[(sy0 + yy) * c.w + sx0..(sy0 + yy) * c.w + sx1] {
+            key = (key ^ p as u64).wrapping_mul(0x100_0000_01b3);
         }
     }
-    if any_plain {
+    let kept = any_plain && KEPT.with(|k| k.borrow().0 == key && k.borrow().1.len() == sw * sh * 3);
+    let mut v = if kept { KEPT.with(|k| std::mem::take(&mut k.borrow_mut().1)) } else { vec![0f32; sw * sh * 3] };
+    if !kept {
+        for yy in 0..sh {
+            for xx in 0..sw {
+                let mut p = c.buf[(sy0 + yy) * c.w + sx0 + xx];
+                if p >> 24 == 1 {
+                    p = glass_real(p);
+                }
+                let i = (yy * sw + xx) * 3;
+                v[i] = (p >> 16 & 0xFF) as f32;
+                v[i + 1] = (p >> 8 & 0xFF) as f32;
+                v[i + 2] = (p & 0xFF) as f32;
+            }
+        }
+    }
+    if any_plain && !kept {
         let mut tmp = vec![0f32; v.len()];
         let br = ((blur / 3.0).round() as usize).max(1);
         for _ in 0..3 {
@@ -200,6 +222,9 @@ fn frost(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, blur: f32, tint
             // a plain pixel's result depends on the blur at its place, not on its value
             last = (orig, out, cov >= 1.0 && !plain_px);
         }
+    }
+    if any_plain {
+        KEPT.with(|k| *k.borrow_mut() = (key, v));
     }
 }
 
@@ -521,6 +546,32 @@ pub fn help_card(c: &mut Canvas, t: &mut Text, sf: f32, title: &str, rows: &[(St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A card redrawn over the same plain interface reuses its blur and paints the same pixels.
+    #[test]
+    fn frost_reuses_its_blur() {
+        let (w, h) = (3440usize, 1440usize);
+        let base: Vec<u32> = (0..w * h).map(|i| 0xFF00_0000 | ((i as u32).wrapping_mul(2_654_435_761) >> 8 & 0xFF_FFFF)).collect();
+        let run = |n: usize| {
+            let mut out = Vec::new();
+            let mut ms = Vec::new();
+            for _ in 0..n {
+                let mut b = base.clone();
+                let t = std::time::Instant::now();
+                card(&mut Canvas { buf: &mut b, w, h }, 800.0, 200.0, 1840.0, 1040.0, 2.0, 0x101418, 0);
+                ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                out = b;
+            }
+            (out, ms)
+        };
+        let (a, ms) = run(4);
+        eprintln!("frost over plain interface, ms per frame: {ms:.1?}");
+        let mut fresh = base.clone();
+        frost_forget();
+        card(&mut Canvas { buf: &mut fresh, w, h }, 800.0, 200.0, 1840.0, 1040.0, 2.0, 0x101418, 0);
+        assert!(a == fresh, "kept blur painted other pixels");
+        assert!(ms[3] * 3.0 < ms[0], "no reuse: {ms:?}");
+    }
 
     /// The error card must fit its own text: no middle cut when the window has room.
     #[test]
