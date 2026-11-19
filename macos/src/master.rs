@@ -45,6 +45,14 @@ pub struct Master {
 impl Master {
     pub fn new(proxy: EventLoopProxy<UserEvent>, arg: Option<PathBuf>, takeover: Option<backup::Takeover>) -> Self {
         let cfg = Config::load();
+        // one thread checks every open folder for new files
+        let pp = proxy.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(crate::source::POLL);
+            if crate::source::poll() && pp.send_event(UserEvent::Polled).is_err() {
+                break;
+            }
+        });
         let sh = Shared::new(proxy, &cfg);
         let crashes = takeover.as_ref().map(|t| t.crashes).unwrap_or(0);
         let restore = takeover.map(|t| t.session).unwrap_or_default();
@@ -355,6 +363,11 @@ impl ApplicationHandler<UserEvent> for Master {
                     }
                 }
                 self.adopt_lists();
+            }
+            UserEvent::Polled => {
+                crate::trace("polled");
+                self.adopt_lists();
+                crate::source::release_polled();
             }
             UserEvent::Update(o, manual) => {
                 // shown once: in the window whose Settings asked, else the first window

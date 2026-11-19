@@ -227,6 +227,13 @@ pub fn explorer_cmp(a: &str, b: &str) -> Ordering {
 }
 
 fn list_dir(dir: &Path, sort: u8, desc: bool) -> io::Result<Vec<Entry>> {
+    let mut items = dir_items(dir)?;
+    sort_items(&mut items, sort, desc);
+    Ok(items.into_iter().map(|i| i.entry).collect())
+}
+
+/// The images in `dir`, unsorted.
+fn dir_items(dir: &Path) -> io::Result<Vec<Item>> {
     let mut items = Vec::new();
     for de in fs::read_dir(dir)? {
         let Ok(de) = de else { continue };
@@ -254,8 +261,7 @@ fn list_dir(dir: &Path, sort: u8, desc: bool) -> io::Result<Vec<Entry>> {
             entry: Entry::File(p),
         });
     }
-    sort_items(&mut items, sort, desc);
-    Ok(items.into_iter().map(|i| i.entry).collect())
+    Ok(items)
 }
 
 /// Images in a ZIP/CBZ, RAR/CBR or 7z/CB7 archive (entries keep the `Zip` variant name).
@@ -309,6 +315,90 @@ struct Slot {
     gen: u64,
     list: Weak<Vec<Entry>>,
     pos: Arc<PosMap>,
+    /// The folder's own modified time when it was last read. Adding, removing or
+    /// renaming a file changes it, so an equal time means no new file.
+    seen: Option<SystemTime>,
+    /// New files still growing at the last poll, with their size then. A file joins the
+    /// list once its size holds for one poll, so a half-copied file never decodes.
+    growing: HashMap<PathBuf, u64>,
+}
+
+/// How often the master checks each open folder for new files.
+pub const POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The folder time to keep, or None when it is under 1 s old. A file added in the same
+/// clock tick as the read leaves the time unchanged; the test failed 2 runs in 6 that way.
+fn settled(t: SystemTime) -> Option<SystemTime> {
+    let age = SystemTime::now().duration_since(t).unwrap_or_default();
+    (age >= std::time::Duration::from_secs(1)).then_some(t)
+}
+
+/// Check every folder a window shows for new or removed files, and replace the list of
+/// each one that changed (see `changed()`). Runs on its own thread. True: a list changed.
+pub fn poll() -> bool {
+    poll_only(None)
+}
+
+/// As `poll`, for one folder only when `only` names it (tests run beside other tests).
+fn poll_only(only: Option<&Path>) -> bool {
+    let slots: Vec<(PathBuf, Arc<Mutex<Slot>>)> = LISTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.iter().filter(|(d, _)| only.is_none_or(|o| o == *d)).map(|(d, s)| (d.clone(), s.clone())).collect())
+        .unwrap_or_default();
+    let mut any = false;
+    for (dir, slot) in slots {
+        let mut s = slot.lock().unwrap();
+        let Some(held) = s.list.upgrade() else { continue };
+        // read the time before the folder, so a file added during the read is seen next time
+        let Ok(now) = fs::metadata(&dir).and_then(|m| m.modified()) else { continue };
+        if s.seen == Some(now) && s.growing.is_empty() {
+            continue;
+        }
+        let Ok(mut items) = dir_items(&dir) else { continue };
+        s.seen = settled(now);
+        let known: std::collections::HashSet<&Entry> = held.iter().collect();
+        let mut growing = HashMap::new();
+        items.retain(|i| {
+            if known.contains(&i.entry) {
+                return true;
+            }
+            let Entry::File(p) = &i.entry else { return true };
+            let still = s.growing.get(p) == Some(&i.size) && i.size > 0;
+            if !still {
+                growing.insert(p.clone(), i.size);
+            }
+            still
+        });
+        s.growing = growing;
+        let (sort, desc) = s.sort;
+        sort_items(&mut items, sort, desc);
+        let new: Vec<Entry> = items.into_iter().map(|i| i.entry).collect();
+        if new == *held || new.is_empty() {
+            continue;
+        }
+        let l = Arc::new(new);
+        s.gen += 1;
+        s.pos = Arc::new(build_pos(&l));
+        s.list = Arc::downgrade(&l);
+        // the windows take it from changed(); until then this thread keeps it alive
+        KEEP.lock().unwrap().push(l);
+        CHANGED.lock().unwrap().push(dir);
+        any = true;
+    }
+    any
+}
+
+/// Lists made by `poll()`, kept until the master hands them to the windows.
+static KEEP: Mutex<Vec<Arc<Vec<Entry>>>> = Mutex::new(Vec::new());
+
+/// Drop the lists `poll()` kept; the windows hold them now.
+pub fn release_polled() {
+    // a busy window asks again later, so keep the lists until none waits
+    if CHANGED.lock().unwrap().is_empty() {
+        KEEP.lock().unwrap().clear();
+    }
 }
 
 static LISTS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<Slot>>>>> = Mutex::new(None);
@@ -324,7 +414,7 @@ fn slot(dir: &Path) -> Arc<Mutex<Slot>> {
     // drop folders no window shows any more (a slot being filled is locked: keep it)
     m.retain(|_, s| s.try_lock().map(|s| s.list.strong_count() > 0).unwrap_or(true));
     m.entry(dir.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(Slot { sort: (u8::MAX, false), gen: 0, list: Weak::new(), pos: Arc::default() })))
+        .or_insert_with(|| Arc::new(Mutex::new(Slot { sort: (u8::MAX, false), gen: 0, list: Weak::new(), pos: Arc::default(), seen: None, growing: HashMap::new() })))
         .clone()
 }
 
@@ -343,7 +433,9 @@ fn list_dir_shared(dir: &Path, sort: u8, desc: bool, fresh: bool) -> io::Result<
             return Ok(l.clone());
         }
     }
+    let seen = fs::metadata(dir).and_then(|m| m.modified()).ok();
     let new = list_dir(dir, sort, desc)?;
+    s.seen = seen.and_then(settled);
     s.gen += 1;
     if let Some(l) = held {
         if *l == new {
@@ -560,6 +652,33 @@ mod tests {
         assert_eq!(explorer_cmp("img2.jpg", "img10.jpg"), Less);
         assert_eq!(explorer_cmp("b.jpg", "A.jpg"), Greater);
         assert_eq!(explorer_cmp("a.jpg", "a.jpg"), Equal);
+    }
+
+    #[test]
+    fn poll_adds_new_files_once_whole() {
+        let dir = std::env::temp_dir().join(format!("arkimage-poll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.png"), b"x").unwrap();
+        let pl = super::open(&dir.join("a.png"), 0, false).unwrap();
+        assert_eq!(pl.entries.len(), 1);
+        // other tests share the lists, so read only this folder's held list
+        let len = || super::held(&dir).unwrap().unwrap().0.len();
+        super::poll_only(Some(&dir));
+        assert_eq!(len(), 1);
+        std::fs::write(dir.join("b.png"), b"xy").unwrap();
+        // first poll sees b growing, second sees its size hold
+        super::poll_only(Some(&dir));
+        assert_eq!(len(), 1);
+        super::poll_only(Some(&dir));
+        assert_eq!(len(), 2);
+        // a deleted file leaves on the next poll
+        std::fs::remove_file(dir.join("b.png")).unwrap();
+        super::poll_only(Some(&dir));
+        assert_eq!(len(), 1);
+        drop(pl);
+        super::release_polled();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
