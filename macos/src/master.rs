@@ -459,6 +459,7 @@ impl ApplicationHandler<UserEvent> for Master {
         // once this process has ended, then end
         if crate::update::RESTART.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.save_session(true);
+            crate::events::log("update installed: restart");
             crate::update::restart();
             for w in &mut self.windows {
                 w.exiting();
@@ -469,7 +470,7 @@ impl ApplicationHandler<UserEvent> for Master {
         // Close All Instances (confirmed on a card): every window exits now; the last one
         // ends the process through reap
         if crate::install::CLOSE_ALL.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            crate::trace("close all instances");
+            crate::events::log("close all instances");
             for w in &mut self.windows {
                 w.exit(el);
             }

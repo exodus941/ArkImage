@@ -15,6 +15,7 @@ mod chrome;
 mod config;
 mod decode;
 mod dialog;
+mod events;
 mod filters;
 mod heic;
 mod icon;
@@ -71,6 +72,7 @@ fn main() {
     std::panic::set_hook(Box::new(move |info| {
         let msg = format!("{info}\n{}", std::backtrace::Backtrace::force_capture());
         trace(&format!("PANIC {info}"));
+        events::log(&format!("panic: {}", info.to_string().replace('\n', " ")));
         let p = config::Config::dir().join("crash.log");
         let _ = std::fs::create_dir_all(config::Config::dir());
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
@@ -132,7 +134,7 @@ fn main() {
             takeover = Some(backup::Takeover { crashes: 0, session });
         }
         arg = None;
-        trace("resumed after update");
+        events::log("resumed after update");
     }
     if arg.as_deref() == Some(std::path::Path::new("--backup")) {
         let n = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -141,7 +143,7 @@ fn main() {
             None => return,
         }
         arg = None;
-        trace("backup takes over");
+        events::log("backup takes over as master");
     }
     // A master is already running: hand it the file and leave.
     if takeover.is_none() && ipc::forward(&arg) {
@@ -193,6 +195,7 @@ fn main() {
     if let Some(l) = listener {
         ipc::serve(l, proxy.clone());
     }
+    events::log(&format!("master starts, version {}{}", env!("CARGO_PKG_VERSION"), if takeover.is_some() { ", reopening the session" } else { "" }));
     let mut master = master::Master::new(proxy, arg, takeover);
     event_loop.run_app(&mut master).expect("run event loop");
 }

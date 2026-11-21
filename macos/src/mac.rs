@@ -62,6 +62,17 @@ pub fn reveal(files: &[PathBuf]) -> bool {
     true
 }
 
+/// The window's alpha (0 hides it from the user while the compositor still has it).
+pub fn set_alpha(w: &Window, a: f64) {
+    let Some(view) = ns_view(w) else { return };
+    unsafe {
+        let win: *mut AnyObject = msg_send![view, window];
+        if !win.is_null() {
+            let _: () = msg_send![win, setAlphaValue: a];
+        }
+    }
+}
+
 fn ns_view(w: &Window) -> Option<*mut AnyObject> {
     let h = w.window_handle().ok()?;
     let RawWindowHandle::AppKit(h) = h.as_raw() else { return None };

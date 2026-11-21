@@ -104,7 +104,7 @@ pub fn run_backup(mut crashes: u32) -> Option<Takeover> {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    crate::trace(&format!("backup connected, crash count {crashes}"));
+    crate::events::log(&format!("backup connected, crash count {crashes}"));
     // Lines arrive on their own thread, so this one can also watch for a hang.
     let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
     std::thread::spawn(move || {
@@ -130,9 +130,15 @@ pub fn run_backup(mut crashes: u32) -> Option<Takeover> {
     let mut alive: Option<Instant> = None;
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // gone without bye
+            Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                crate::events::log(&format!("master {} ended without saying bye", pid.map_or("?".into(), |p| p.to_string())));
+                break;
+            }
             Ok(Some(l)) => match l.as_str() {
-                "bye" => return None,
+                "bye" => {
+                    crate::events::log("master exited normally");
+                    return None;
+                }
                 "stable" => crashes = 0,
                 "alive" => alive = Some(Instant::now()),
                 _ => {
@@ -153,27 +159,31 @@ pub fn run_backup(mut crashes: u32) -> Option<Takeover> {
         let not_responding = hang::not_responding;
         if let Some(p) = pid {
             if not_responding(p) {
-                let since = *hung_since.get_or_insert_with(Instant::now);
+                let since = *hung_since.get_or_insert_with(|| {
+                    crate::events::log(&format!("master {p} stopped answering"));
+                    Instant::now()
+                });
                 if since.elapsed() >= HANG_AFTER {
-                    crate::trace(&format!("master {p} not responding for {:?}", since.elapsed()));
+                    crate::events::log(&format!("master {p} not answering for {:.1} s: dump and kill", since.elapsed().as_secs_f64()));
                     hang::dump_and_kill(p);
                     break;
                 }
-            } else {
-                hung_since = None;
+            } else if let Some(t) = hung_since.take() {
+                crate::events::log(&format!("master {p} answers again after {:.1} s", t.elapsed().as_secs_f64()));
             }
         }
     }
     crashes += 1;
-    crate::trace(&format!("master crashed or hung; {crashes} in a row"));
+    crate::events::log(&format!("master crashed or hung; {crashes} in a row"));
     if crashes >= MAX_CRASHES {
+        crate::events::log("chain stops: crash message shown");
         let msg = format!("ArkImage crashed {MAX_CRASHES} times in a row and was not restarted.");
         crash_dialog(&msg);
-        crate::trace("crash dialog closed");
         return None;
     }
     let session = load_session();
     if session.is_empty() {
+        crate::events::log("no session to reopen; backup ends");
         return None;
     }
     Some(Takeover { crashes, session })
@@ -242,15 +252,19 @@ mod hang {
         // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE
         let h = unsafe { OpenProcess(0x0400 | 0x0010 | 0x0001, 0, pid) };
         if h.is_null() {
+            crate::events::log(&format!("could not open master {pid} to dump and kill it"));
             return;
         }
         let dir = crate::config::Config::dir();
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let path = dir.join(format!("hang-{secs}.dmp"));
-        if let Ok(f) = std::fs::File::create(&path) {
-            // MiniDumpWithDataSegs | MiniDumpWithHandleData | MiniDumpWithThreadInfo
-            let ok = unsafe { MiniDumpWriteDump(h, pid, f.as_raw_handle() as _, 0x1 | 0x4 | 0x1000, std::ptr::null(), std::ptr::null(), std::ptr::null()) };
-            crate::trace(&format!("hang dump {} written: {}", path.display(), ok != 0));
+        match std::fs::File::create(&path) {
+            Ok(f) => {
+                // MiniDumpWithDataSegs | MiniDumpWithHandleData | MiniDumpWithThreadInfo
+                let ok = unsafe { MiniDumpWriteDump(h, pid, f.as_raw_handle() as _, 0x1 | 0x4 | 0x1000, std::ptr::null(), std::ptr::null(), std::ptr::null()) };
+                crate::events::log(&format!("hang dump {} written: {}", path.display(), ok != 0));
+            }
+            Err(e) => crate::events::log(&format!("hang dump {} not created: {e}", path.display())),
         }
         let mut dumps: Vec<_> = std::fs::read_dir(&dir)
             .into_iter()
