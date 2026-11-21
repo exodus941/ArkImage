@@ -342,6 +342,9 @@ const SWIPE_GAP: Duration = Duration::from_millis(300);
 const PINCH_SETTLE: Duration = Duration::from_millis(150);
 /// A stored image with no paint after this long gets its repaint asked for again.
 const REPAINT_RETRY: Duration = Duration::from_millis(250);
+/// The longest a new window stays cloaked waiting for its image (a slow decode then shows
+/// the window without it).
+const REVEAL_WAIT: Duration = Duration::from_millis(1500);
 const SWIPE_LINE_PX: f64 = 40.0;
 const SWIPE_SIGN: f64 = 1.0;
 
@@ -633,6 +636,10 @@ pub struct App {
     /// lost (Windows drops one made while that window paints; seen after a 100-window
     /// crash takeover, where windows stayed grey until the cursor entered).
     unpainted: Option<Instant>,
+    /// A new window stays cloaked (shown to the compositor, not to the user) until a frame
+    /// with its image is presented, or until this deadline. A shown window is white until it
+    /// paints, and a crash takeover opened every window white at once.
+    reveal_by: Option<Instant>,
     /// The image layer of the last settled frame (before the chrome), and what it showed.
     last_frame: Vec<u32>,
     last_key: Option<(u64, u64, u64, u64, usize, usize)>,
@@ -909,6 +916,7 @@ impl App {
             wheel_acc: 0.0,
             pinch_at: None,
             unpainted: None,
+            reveal_by: None,
             last_frame: Vec::new(),
             last_key: None,
             slide: None,
@@ -2547,6 +2555,7 @@ impl App {
             Some(Ok(())) => {
                 self.unpainted = None;
                 crate::trace("present");
+                self.reveal_if_ready(false);
             }
             Some(Err(crate::gpu::Fail::Skip)) | None => {}
             // the same state the covered check reads: covered now, not at the next check
@@ -2602,14 +2611,44 @@ impl App {
                         self.glass_finish(c.buf);
                     }
                 }
-                if buf.present().is_ok() {
-                    self.unpainted = None;
-                }
+                let ok = buf.present().is_ok();
                 crate::trace("present");
+                if ok {
+                    self.unpainted = None;
+                    self.surface = Some(surface);
+                    self.reveal_if_ready(false);
+                    self.update_title();
+                    return;
+                }
             }
         }
         self.surface = Some(surface);
         self.update_title();
+    }
+
+    /// Uncloak a new window after a presented frame that holds its image (or shows that
+    /// there is none: no file, a failed decode, the grid), or once REVEAL_WAIT has passed
+    /// (`force`).
+    fn reveal_if_ready(&mut self, force: bool) {
+        if self.reveal_by.is_none() {
+            return;
+        }
+        let ready = force
+            || self.base.is_some()
+            || self.picker.open
+            || match self.cur_entry() {
+                None => true,
+                Some(e) => self.failed.borrow().contains_key(&e),
+            };
+        if !ready {
+            return;
+        }
+        let waited = REVEAL_WAIT.saturating_sub(self.reveal_by.map(|t| t.saturating_duration_since(Instant::now())).unwrap_or_default());
+        crate::trace(&format!("reveal after {} ms{}", waited.as_millis(), if force { " (timed out)" } else { "" }));
+        self.reveal_by = None;
+        if let Some(w) = self.window.clone() {
+            cloak(&w, false);
+        }
     }
 
     fn draw(&mut self, c: &mut Canvas) {
@@ -4717,12 +4756,13 @@ impl App {
         // (Created visible, a saved-maximized window showed for 19 ms on the primary
         // monitor at 312,312 before it moved to its own monitor.)
         // A hidden window drops the frame, and a shown one is white until its first
-        // paint; so show it cloaked, draw, then uncloak.
+        // paint; so show it cloaked, draw, and uncloak once a frame with the image is
+        // presented (render calls reveal_if_ready), at most REVEAL_WAIT later.
         if let Some(w) = self.window.clone() {
             cloak(&w, true);
             w.set_visible(true);
+            self.reveal_by = Some(Instant::now() + REVEAL_WAIT);
             self.render();
-            cloak(&w, false);
         }
         // full screen: a crash restore uses the window's own state; a normal start (not a
         // cascaded second window) reopens in full screen if it was closed so
@@ -5346,6 +5386,10 @@ impl App {
         if self.occluded || self.window.as_ref().is_some_and(|w| w.is_visible() == Some(false) || w.is_minimized() == Some(true)) {
             self.unpainted = None;
         }
+        if self.reveal_by.is_some_and(|t| now >= t) {
+            self.reveal_if_ready(true);
+            self.request_redraw();
+        }
         let retry_at = self.unpainted.map(|t| t + REPAINT_RETRY);
         if retry_at.is_some_and(|t| now >= t) {
             if std::env::var_os("ARKIMAGE_REDRAW_LOG").is_some() {
@@ -5354,7 +5398,7 @@ impl App {
             self.unpainted = Some(now);
             self.request_redraw();
         }
-        [self.next_frame_at, self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at, retry_at, self.fs_restore_at, hook_at, pinch_hook_at, occ_at]
+        [self.next_frame_at, self.toast.as_ref().map(|t| t.1), fade_at, gone_at, pinch_end, slide_at, ui_at, retry_at, self.fs_restore_at, hook_at, pinch_hook_at, occ_at, self.reveal_by]
             .into_iter()
             .flatten()
             .min()
