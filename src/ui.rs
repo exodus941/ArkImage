@@ -136,7 +136,7 @@ fn frost(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, blur: f32, tint
     // whole area first took 92 to 121 ms a frame for the Hotkeys card at 3420x2148 (the
     // empty card 32 to 39), so every fade and hover crawled. Blur only the box around
     // those pixels, and nothing when there are none.
-    let plain = |p: u32| p >> 24 != 1 && !crate::render::is_hole(p);
+    let plain = |p: u32| !crate::render::is_glass(p) && !crate::render::is_hole(p);
     let (mut bx0, mut by0, mut bx1, mut by1) = (usize::MAX, usize::MAX, 0, 0);
     for py in y0..y1 {
         let row = &c.buf[py * c.w + x0..py * c.w + x1];
@@ -168,7 +168,7 @@ fn frost(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, blur: f32, tint
         for yy in 0..sh {
             for xx in 0..sw {
                 let mut p = c.buf[(sy0 + yy) * c.w + sx0 + xx];
-                if p >> 24 == 1 {
+                if crate::render::is_glass(p) {
                     p = glass_real(p);
                 }
                 let i = (yy * sw + xx) * 3;
@@ -207,7 +207,7 @@ fn frost(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, blur: f32, tint
                 c.buf[i] = last.1;
                 continue;
             }
-            let out = if orig >> 24 == 1 {
+            let out = if crate::render::is_glass(orig) {
                 mix(orig, 0, ka)
             } else if crate::render::is_hole(orig) {
                 // over the GPU image layer: the GPU blurs the layer, the tint goes over it
@@ -217,7 +217,7 @@ fn frost(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, blur: f32, tint
                 let q = |k: usize| v[j + k].round().clamp(0.0, 255.0) as u32;
                 mix(q(0) << 16 | q(1) << 8 | q(2), tint, ka)
             };
-            let plain_px = orig >> 24 != 1 && !crate::render::is_hole(orig);
+            let plain_px = !crate::render::is_glass(orig) && !crate::render::is_hole(orig);
             c.buf[i] = if cov >= 1.0 { out } else { mix(orig, out, (cov * 255.0) as u32) };
             // a plain pixel's result depends on the blur at its place, not on its value
             last = (orig, out, cov >= 1.0 && !plain_px);
@@ -551,7 +551,8 @@ mod tests {
     #[test]
     fn frost_reuses_its_blur() {
         let (w, h) = (3440usize, 1440usize);
-        let base: Vec<u32> = (0..w * h).map(|i| 0xFF00_0000 | ((i as u32).wrapping_mul(2_654_435_761) >> 8 & 0xFF_FFFF)).collect();
+        // plain interface pixels: top byte 0 (an odd top byte marks window glass)
+        let base: Vec<u32> = (0..w * h).map(|i| (i as u32).wrapping_mul(2_654_435_761) >> 8 & 0xFF_FFFF).collect();
         let run = |n: usize| {
             let mut out = Vec::new();
             let mut ms = Vec::new();

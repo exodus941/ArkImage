@@ -263,10 +263,6 @@ fn acrylic(_w: &Window, _on: bool, _bg: u32) -> bool {
     false
 }
 
-/// Background pixels while the glass is loaded: the background colour with a marker in
-/// the alpha byte. Everything drawn over them writes alpha 0, so after the draw the
-/// pixels still marked are background, and only those turn see-through.
-const GLASS_MARK: u32 = 0x0100_0000;
 /// The background grey over the blur at this alpha: 33%, the user's value (black at 38%
 /// read as too dark and grey).
 const GLASS_OPACITY: u32 = 84;
@@ -342,6 +338,8 @@ const SWIPE_GAP: Duration = Duration::from_millis(300);
 const PINCH_SETTLE: Duration = Duration::from_millis(150);
 /// A stored image with no paint after this long gets its repaint asked for again.
 const REPAINT_RETRY: Duration = Duration::from_millis(250);
+/// Steps closer together than this make a fast run (see App::nav_at).
+const FAST_NAV: Duration = Duration::from_millis(400);
 /// The longest a new window stays cloaked waiting for its image (a slow decode then shows
 /// the window without it).
 const REVEAL_WAIT: Duration = Duration::from_millis(1500);
@@ -646,6 +644,13 @@ pub struct App {
     slide: Option<Slide>,
     /// Direction of the step that caused the next go_to (wrap-around keeps it right).
     nav_hint: Option<i32>,
+    /// The last step through the list (wheel, key, button). Within FAST_NAV of it, a
+    /// fast run of steps shows the nearest decoded image on the way, as a slider drag
+    /// does: a wheel spun fast stepped past images faster than they decoded, and the
+    /// window held its last image until the run stopped, as if frozen.
+    nav_at: Option<Instant>,
+    /// The step before the last one came within FAST_NAV of it.
+    nav_run: bool,
     /// The archive whose pages are reversed (right-to-left reading), if any.
     rtl_for: Option<PathBuf>,
     /// When the last slide frame was drawn; the next one is due 8 ms later.
@@ -921,6 +926,8 @@ impl App {
             last_key: None,
             slide: None,
             nav_hint: None,
+            nav_at: None,
+            nav_run: false,
             rtl_for: None,
             slide_drawn: Instant::now(),
             glass_on: false,
@@ -1128,16 +1135,17 @@ impl App {
         let m = |v: u32| ((v as f32) * t).round() as u32;
         let glass = a << 24 | m(bg >> 16 & 0xFF) << 16 | m(bg >> 8 & 0xFF) << 8 | m(bg & 0xFF);
         for p in buf.iter_mut() {
-            *p = if *p >> 24 != 1 {
+            *p = if !crate::render::is_glass(*p) {
                 0xFF00_0000 | (*p & 0xFF_FFFF)
-            } else if *p & 0xFF == 0xFF {
+            } else if *p == crate::render::GLASS {
                 glass
             } else {
-                // a shadow over the glass: black at strength s, with 1 - s in the blue
-                // byte (see render::GLASS_BG); premultiplied
-                let k = (*p & 0xFF) as f32 / 255.0;
+                // something over the glass: a shadow (black) or a partly clear image, with
+                // the glass left k and the colour over it already premultiplied (see
+                // render::GLASS_BG); the result is premultiplied
+                let k = crate::render::glass_left(*p) as f32 / 255.0;
                 let ga = 255.0 - (255.0 - a as f32) * k;
-                let c = |v: u32| (((glass >> v) & 0xFF) as f32 * k).round() as u32;
+                let c = |v: u32| ((((glass >> v) & 0xFF) as f32 * k).round() as u32 + ((*p >> v) & 0xFF)).min(ga.round() as u32);
                 (ga.round() as u32) << 24 | c(16) << 16 | c(8) << 8 | c(0)
             };
         }
@@ -1248,6 +1256,12 @@ impl App {
     }
 
     /// True if `e` is nearer the current index than the image now on screen.
+    /// How far `e` sits from the list position, in images (i64::MAX when not in the list).
+    fn distance_any(&self, e: &Entry) -> i64 {
+        let Some(pl) = &self.playlist else { return i64::MAX };
+        self.pos_map.get(e).map(|&p| (pl.flip(p) as i64 - pl.index as i64).abs()).unwrap_or(i64::MAX)
+    }
+
     fn closer_than_shown(&self, e: &Entry) -> bool {
         let idx = self.index() as i64;
         let Some(pl) = &self.playlist else { return true };
@@ -1335,6 +1349,17 @@ impl App {
             self.next_frame_at = None;
             self.preload();
         } else {
+            // a fast run: show at once the decoded image nearest the target, so the run
+            // keeps moving on screen instead of holding the image it started from
+            if self.fast_nav() {
+                let near = {
+                    let cache = self.cache.borrow();
+                    cache.iter().filter(|(k, _)| self.closer_than_shown(k)).min_by_key(|(k, _)| self.distance_any(k)).map(|(k, d)| (k.clone(), d.clone()))
+                };
+                if let Some((k, d)) = near {
+                    self.set_current(k, d);
+                }
+            }
             // Decode the current image alone first; neighbours would compete for memory bandwidth.
             self.request(e);
         }
@@ -1351,7 +1376,7 @@ impl App {
                 if is_cur {
                     self.set_current(e.clone(), d.clone());
                     self.preload();
-                } else if self.slider_drag && self.closer_than_shown(e) {
+                } else if (self.slider_drag || self.fast_nav()) && self.closer_than_shown(e) {
                     // While dragging, the exact image is rarely ready before the slider moves
                     // on (1 of 39 decodes was shown in a 672 ms drag). Show the nearest one.
                     self.set_current(e.clone(), d.clone());
@@ -1416,7 +1441,19 @@ impl App {
         self.playlist.as_ref().map(|p| p.index).unwrap_or(0)
     }
 
+    /// A fast run of steps is under way (see nav_at).
+    fn fast_nav(&self) -> bool {
+        // Test hook: ARKIMAGE_NO_FAST_NAV turns this off, for a before/after measurement
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("ARKIMAGE_NO_FAST_NAV").is_some());
+        !*OFF && self.nav_run && self.nav_at.is_some_and(|t| t.elapsed() < FAST_NAV)
+    }
+
     fn step(&mut self, n: isize, single: bool) {
+        // a step soon after the last one makes this a fast run
+        let now = Instant::now();
+        let run = self.nav_at.is_some_and(|t| now.duration_since(t) < FAST_NAV);
+        self.nav_at = Some(now);
+        self.nav_run = run;
         self.dir = if n < 0 { -1 } else { 1 };
         self.nav_hint = Some(self.dir as i32);
         let len = self.len() as isize;
@@ -2673,7 +2710,7 @@ impl App {
             c.fill(crate::render::HOLE);
         } else if self.glass_loaded {
             crate::render::GLASS_BG.store(self.cfg.bg_color, std::sync::atomic::Ordering::Relaxed);
-            c.fill(GLASS_MARK | 0xFF_FFFF);
+            c.fill(crate::render::GLASS);
         } else {
             c.fill(self.cfg.bg_color);
         }
@@ -4182,6 +4219,7 @@ impl App {
                 crate::update::open_repo_page();
                 return;
             }
+            Act::StatusTip => return,
             Act::CheckUpdate => {
                 if let Some(s) = &mut self.settings {
                     s.set_upd(crate::settings::Upd::Checking);

@@ -158,7 +158,40 @@ pub(super) fn draw_bottom(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, h
     }
     // tooltips over the hovered buttons, 8 px above the plate, inside the window
     let Some(t) = t else { return };
-    let prev = t.face(crate::text::Face::Medium);
+    // chips on the icon row, styled as the scrub row's pills: the file type at the
+    // slider's left end, the image number ("593/5,492", as the scrub pill) at its right
+    // end; each is left out when it would come within 16 px of the icons
+    let prev = t.face(crate::text::Face::Mono);
+    {
+        let ph = (PILL_H * sf).round();
+        let pad = PILL_PAD * sf;
+        let px = 12.0 * sf;
+        let py = (cy - ph / 2.0).round();
+        let clear = 16.0 * sf;
+        let (row0, row1) = (ox - PLATE * sf / 2.0, ox + row_w * sf + PLATE * sf / 2.0);
+        // the bar under them is already frosted, so only the tint: a second blur is a
+        // rectangle, and its corners showed past the rounded ends where the image ends
+        let chip = |c: &mut Canvas, t: &mut Text, x: f32, w: f32, label: &str| {
+            c.fill_rrect(x, py, w, ph, ph / 2.0, 0x101010, GLASS_BAR_A as f32 / 255.0);
+            text_mid(c, t, x + pad, cy, label, px, ICON);
+        };
+        if !s.anim_fmt.is_empty() {
+            let w = (t.width(s.anim_fmt, px) + 2.0 * pad).round();
+            if sx + w + clear <= row0 {
+                chip(c, t, sx, w, s.anim_fmt);
+            }
+        }
+        if s.len > 0 {
+            let page = if s.rtl { s.len - s.index } else { s.index + 1 };
+            let label = page_label(page, s.len);
+            let w = (t.width(&label, px) + 2.0 * pad).round();
+            let x = sx + sw - w;
+            if x - clear >= row1 {
+                chip(c, t, x, w, &label);
+            }
+        }
+    }
+    t.face(crate::text::Face::Medium);
     for &(id, off, _, tip) in &buttons {
         let a = s.tip_amt(id);
         if a <= 0.0 {

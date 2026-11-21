@@ -13,17 +13,53 @@ fn rgb(r: u32, g: u32, b: u32) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-/// The background colour while the glass is loaded. A glass pixel (top byte 1) holds
-/// in its blue byte how much of the glass is left after shadows, 255 none darkened;
-/// that keeps a shadow's 256 levels instead of the few between #202020 and black.
+/// The background colour while the glass is loaded.
+///
+/// A window-glass pixel has an odd top byte: bit 0 marks it, bits 1-7 hold how much of
+/// the glass is left (0-127, 127 all of it). The low 24 bits hold what is drawn over the
+/// glass there, premultiplied: black for a shadow, the image's colour for a partly clear
+/// image pixel. So a shadow keeps its many levels, and a see-through image fades into the
+/// glass instead of switching to a solid plate where it stops being fully clear.
 pub static GLASS_BG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Plain glass: all of it left, nothing over it.
+pub const GLASS: u32 = 0xFF00_0000;
+
+#[inline]
+pub fn is_glass(p: u32) -> bool {
+    p >> 24 & 1 == 1
+}
+
+/// How much of the glass is left, 0-255.
+#[inline]
+pub fn glass_left(p: u32) -> u32 {
+    ((p >> 25) * 255 + 63) / 127
+}
+
+/// A glass pixel with `left` (0-255) of the glass and `over` (premultiplied 0xRRGGBB) on it.
+#[inline]
+pub fn glass_px(left: u32, over: u32) -> u32 {
+    let l7 = (left.min(255) * 127 + 127) / 255;
+    (l7 << 1 | 1) << 24 | (over & 0xFF_FFFF)
+}
+
+/// The colour a glass pixel shows over the solid background (for blurs and blends that
+/// need a plain colour).
 #[inline]
 pub fn glass_real(p: u32) -> u32 {
     let bg = GLASS_BG.load(std::sync::atomic::Ordering::Relaxed);
-    let f = p & 0xFF;
-    let s = |v: u32| ((v & 0xFF) * f + 127) / 255;
-    rgb(s(bg >> 16), s(bg >> 8), s(bg))
+    let f = glass_left(p);
+    let s = |sh: u32| (((bg >> sh) & 0xFF) * f + 127) / 255 + ((p >> sh) & 0xFF);
+    rgb(s(16).min(255), s(8).min(255), s(0).min(255))
+}
+
+/// `px` at alpha `a` (1-254) over the glass pixel `d`: the glass left shrinks by `a`, and
+/// the colour drawn over it becomes `px` at `a` over what was there.
+#[inline]
+pub fn over_glass(d: u32, px: u32, a: u32) -> u32 {
+    let ia = 255 - a;
+    let c = |sh: u32| ((((px >> sh) & 0xFF) * a + ((d >> sh) & 0xFF) * ia + 127) / 255) << sh;
+    glass_px((glass_left(d) * ia + 127) / 255, c(16) | c(8) | c(0))
 }
 
 /// GPU image layer: a "hole" pixel shows the GPU-drawn image layer under whatever the
@@ -95,12 +131,17 @@ pub fn mix(dst: u32, src: u32, a: u32) -> u32 {
     if (dst | src) & 0x0200_0000 != 0 && (is_hole(dst) || is_hole(src)) {
         return mix_hole(dst, src, a);
     }
-    let (dm, sm) = (dst >> 24 == 1, src >> 24 == 1);
+    let (dm, sm) = (is_glass(dst), is_glass(src));
     if dm && (sm || src & 0xFF_FFFF == 0) {
-        // glass under glass or under black (a shadow): stays glass, the fraction mixed
-        let sf = if sm { src & 0xFF } else { 0 };
-        let f = (sf * a + (dst & 0xFF) * (255 - a) + 127) / 255;
-        return 0x0100_0000 | f << 16 | f << 8 | f;
+        // glass under glass or under black (a shadow): stays glass, both parts mixed
+        let ia = 255 - a;
+        let sf = if sm { glass_left(src) } else { 0 };
+        let f = (sf * a + glass_left(dst) * ia + 127) / 255;
+        let c = |sh: u32| {
+            let s = if sm { (src >> sh) & 0xFF } else { 0 };
+            ((s * a + ((dst >> sh) & 0xFF) * ia + 127) / 255) << sh
+        };
+        return glass_px(f, c(16) | c(8) | c(0));
     }
     let dst = if dm { glass_real(dst) } else { dst };
     let src = if sm { glass_real(src) } else { src };
@@ -179,7 +220,7 @@ impl Canvas<'_> {
                         if px < x1 && py < y1 {
                             let p = self.buf[py * self.w + px];
                             // a window-glass pixel holds a fraction, not a colour
-                            let p = if p >> 24 == 1 { glass_real(p) } else { p };
+                            let p = if is_glass(p) { glass_real(p) } else { p };
                             r_ += (p >> 16) & 255;
                             g += (p >> 8) & 255;
                             b += p & 255;
@@ -224,7 +265,7 @@ impl Canvas<'_> {
                 // window glass stays glass: the blur is a rectangle, and its corners
                 // outside a rounded shape drew opaque squares over the glass
                 let i = py * self.w + px;
-                if self.buf[i] >> 24 != 1 && !is_hole(self.buf[i]) {
+                if !is_glass(self.buf[i]) && !is_hole(self.buf[i]) {
                     self.buf[i] = rgb(s(&ch[0]), s(&ch[1]), s(&ch[2]));
                 }
             }
@@ -389,9 +430,10 @@ pub fn blit(c: &mut Canvas, img: &RgbaImage, ox: i64, oy: i64, bg: u32, checker:
             let d = drow[x as usize];
             drow[x as usize] = if a == 255 {
                 px
-            } else if !checker && d >> 24 == 1 {
-                // over the window glass: a clear pixel stays glass (SVG, Lottie, PNG)
-                if a == 0 { d } else { mix(d, px, a) }
+            } else if !checker && is_glass(d) {
+                // over the window glass: a clear pixel stays glass (SVG, Lottie, PNG), and a
+                // partly clear one blends into it
+                if a == 0 { d } else { over_glass(d, px, a) }
             } else {
                 mix(bg_at(x as usize, y as usize, bg, checker), px, a)
             };
@@ -431,9 +473,10 @@ pub fn blit_sample(
         let d = drow[x];
         drow[x] = if a >= 255 {
             px
-        } else if !checker && d >> 24 == 1 {
-            // over the window glass: a clear pixel stays glass (SVG, Lottie, PNG)
-            if a == 0 { d } else { mix(d, px, a) }
+        } else if !checker && is_glass(d) {
+            // over the window glass: a clear pixel stays glass (SVG, Lottie, PNG), and a
+            // partly clear one blends into it
+            if a == 0 { d } else { over_glass(d, px, a) }
         } else {
             mix(bg_at(x, y, bg, checker), px, a)
         };
@@ -564,6 +607,30 @@ pub fn sharpen(img: &mut RgbaImage, amount: f32, sigma: f32, threshold: u8) {
 mod tests {
     use super::*;
 
+    /// A see-through image blends into the glass: alpha 0 keeps plain glass, each step of
+    /// alpha takes glass away and adds colour, and alpha 1 is no longer a jump to a solid
+    /// plate (the seam the user saw on a left-to-right alpha ramp).
+    #[test]
+    fn image_alpha_blends_into_glass() {
+        assert!(is_glass(GLASS) && glass_left(GLASS) == 255 && GLASS & 0xFF_FFFF == 0);
+        let px = rgb(200, 100, 50);
+        let mut last = 256;
+        for a in [1, 2, 64, 128, 254] {
+            let p = over_glass(GLASS, px, a);
+            assert!(is_glass(p), "alpha {a} left the glass");
+            let left = glass_left(p);
+            assert!(left < last, "glass left must fall with alpha: {left} after {last}");
+            assert!(left.abs_diff(255 - a) <= 2, "alpha {a}: left {left}");
+            assert_eq!(p >> 16 & 0xFF, (200 * a + 127) / 255, "alpha {a}: red over the glass");
+            last = left;
+        }
+        // a shadow still darkens: black at half over glass leaves half the glass, no colour
+        let s = mix(GLASS, 0, 128);
+        assert!(is_glass(s) && glass_left(s).abs_diff(127) <= 2 && s & 0xFF_FFFF == 0);
+        // plain pixels and GPU holes are never glass
+        assert!(!is_glass(rgb(255, 255, 255)) && !is_glass(HOLE));
+    }
+
     #[test]
     fn sharpen_edges_not_flats() {
         // left half 100, right half 150
@@ -678,7 +745,7 @@ pub fn motion_blur(c: &mut Canvas, r: f32, y0: usize, y1: usize) {
                 for line in chunk.chunks_mut(w) {
                     let mut any_glass = false;
                     for (x, &p) in line.iter().enumerate() {
-                        let q = if p >> 24 == 1 {
+                        let q = if is_glass(p) {
                             any_glass = true;
                             glass_real(p)
                         } else {
@@ -689,7 +756,7 @@ pub fn motion_blur(c: &mut Canvas, r: f32, y0: usize, y1: usize) {
                     box_row(&row, &mut tmp, r1);
                     box_row(&tmp, &mut row, r2);
                     for (x, p) in line.iter_mut().enumerate() {
-                        if any_glass && *p >> 24 == 1 {
+                        if any_glass && is_glass(*p) {
                             continue;
                         }
                         let [a, b, cc] = row[x];

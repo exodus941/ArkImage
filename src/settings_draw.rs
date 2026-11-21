@@ -55,54 +55,119 @@ pub(super) struct DrawState<'a> {
     pub upd: (&'a Upd, &'a Upd, f32, f32),
 }
 
+/// The most lines the update status takes: two fit between the Version card and the
+/// Cancel/OK bar (12 + 20 + 20 = 52 px of the 69 px there at 100%).
+const STATUS_LINES: usize = 2;
+
+/// A status cut to STATUS_LINES: where its text sits (x0, y0, x1, y1) and the whole text,
+/// for the hover tooltip.
+pub(super) struct Cut {
+    pub rect: (f32, f32, f32, f32),
+    pub full: String,
+}
+
 /// One update state, on the page under the Version card, drawn at `a` opacity (0-1).
 /// `x` is the card's text edge, `top` the first line's top, `max_x` the card's text end.
-/// The text wraps at word breaks; it is never cut. Idle draws nothing.
-fn upd_status(c: &mut Canvas, t: &mut Text, x: f32, top: f32, sf: f32, u: &Upd, a: f32, secs: f32, max_x: f32) {
+/// Every state has an icon, centred on the first line. The text wraps at spaces (a word
+/// too long for a line breaks inside); past STATUS_LINES the last line ends in "…" and
+/// the result says what was cut. Idle draws nothing.
+fn upd_status(c: &mut Canvas, t: &mut Text, x: f32, top: f32, sf: f32, u: &Upd, a: f32, secs: f32, max_x: f32) -> Option<Cut> {
     if a <= 0.0 {
-        return;
+        return None;
     }
     let d = |v: f32| v * sf;
     let body = (d(BODY.0), d(BODY.1));
     let col = |k: u32| lerp(PANEL, k, a);
     // icon 20 px, then 8 px, then the text
-    let (icon, icol, deg, msg, tcol): (Option<Icon>, u32, u16, String, u32) = match u {
-        Upd::Idle => return,
+    let (icon, icol, deg, msg, tcol): (Icon, u32, u16, String, u32) = match u {
+        Upd::Idle => return None,
         // one turn every 0.9 s, in 10 degree steps (36 cached masks)
-        Upd::Checking => (Some(Icon::Loader), SLATE300, (((secs / 0.9).fract() * 36.0) as u16) * 10, "Checking for updates…".into(), SLATE200),
-        Upd::Found(v) => (Some(Icon::Download), ACCENT, 0, format!("Downloading version {v}…"), SLATE200),
-        Upd::Latest => (Some(Icon::CircleCheck), GREEN, 0, "You are on the latest version.".into(), SLATE200),
-        Upd::Failed(e) => (None, 0, 0, format!("Update check failed. {e}"), u::ROSE400),
+        Upd::Checking => (Icon::Loader, SLATE300, (((secs / 0.9).fract() * 36.0) as u16) * 10, "Checking for updates…".into(), SLATE200),
+        Upd::Found(v) => (Icon::Download, ACCENT, 0, format!("Downloading version {v}…"), SLATE200),
+        Upd::Latest => (Icon::CircleCheck, GREEN, 0, "You are on the latest version.".into(), SLATE200),
+        Upd::Failed(e) => (Icon::AlertCircle, u::ROSE400, 0, format!("Update check failed. {e}"), u::ROSE400),
     };
     let mid = top + body.1 / 2.0;
-    let mut tx = x;
-    if let Some(i) = icon {
-        let s = d(20.0);
-        crate::icons::draw_ex(c, i, x + s / 2.0, mid, s, icol, deg, a);
-        tx += s + d(8.0);
+    let s = d(20.0);
+    crate::icons::draw_ex(c, icon, x + s / 2.0, mid, s, icol, deg, a);
+    let tx = x + s + d(8.0);
+    let room = max_x - tx;
+    let mut lines = wrap(t, &msg, body.0, room);
+    let cut = lines.len() > STATUS_LINES;
+    if cut {
+        lines.truncate(STATUS_LINES);
+        let last = lines.last_mut().unwrap();
+        while !last.is_empty() && u::width(t, Face::Regular, &format!("{last}…"), body.0) > room {
+            last.pop();
+        }
+        *last = format!("{}…", last.trim_end());
     }
-    for (i, l) in wrap(t, &msg, body.0, max_x - tx).iter().enumerate() {
+    for (i, l) in lines.iter().enumerate() {
         text(c, t, Face::Regular, tx, mid + i as f32 * body.1, l, body, col(tcol));
     }
+    cut.then(|| Cut { rect: (tx, top, max_x, top + lines.len() as f32 * body.1), full: msg })
 }
 
-/// Split `s` into lines no wider than `room`, at spaces; a word wider than `room` gets a
-/// line of its own.
+/// Split `s` into lines no wider than `room`, at spaces. A word wider than `room` is
+/// broken where the line is full (a long path in an OS error has no spaces).
 fn wrap(t: &mut Text, s: &str, px: f32, room: f32) -> Vec<String> {
+    let fits = |t: &mut Text, s: &str| u::width(t, Face::Regular, s, px) <= room;
     let mut lines = Vec::new();
     let mut cur = String::new();
     for w in s.split(' ') {
         let next = if cur.is_empty() { w.to_string() } else { format!("{cur} {w}") };
-        if !cur.is_empty() && u::width(t, Face::Regular, &next, px) > room {
-            lines.push(std::mem::replace(&mut cur, w.to_string()));
-        } else {
+        if fits(t, &next) {
             cur = next;
+            continue;
         }
+        if !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+        }
+        // the word alone, broken into full lines while it is too wide
+        let mut rest = w.to_string();
+        while !fits(t, &rest) && rest.chars().count() > 1 {
+            let mut head = String::new();
+            for ch in rest.chars() {
+                head.push(ch);
+                if !fits(t, &head) {
+                    head.pop();
+                    break;
+                }
+            }
+            if head.is_empty() {
+                head = rest.chars().next().unwrap().to_string();
+            }
+            rest = rest[head.len()..].to_string();
+            lines.push(head);
+        }
+        cur = rest;
     }
     if !cur.is_empty() {
         lines.push(cur);
     }
     lines
+}
+
+/// The whole status text over its cut version, while hovered: the bottom bar's tooltip
+/// style (12 px text, 8 px padding, radius 8, #101010 at 92%), wrapped to the status
+/// width, its bottom edge 8 px above the status text.
+fn status_tip(c: &mut Canvas, t: &mut Text, sf: f32, cut: &Cut, a: f32) {
+    if a <= 0.0 {
+        return;
+    }
+    let d = |v: f32| v * sf;
+    let small = (d(SMALL.0), d(SMALL.1));
+    let (x0, y0, x1, _) = cut.rect;
+    let pad = d(8.0);
+    let lines = wrap(t, &cut.full, small.0, x1 - x0 - 2.0 * pad);
+    let w = lines.iter().map(|l| u::width(t, Face::Regular, l, small.0)).fold(0.0, f32::max) + 2.0 * pad;
+    let h = lines.len() as f32 * small.1 + 2.0 * pad;
+    let (x, y) = (x0.round(), (y0 - d(8.0) - h).round());
+    c.fill_rrect(x, y, w.round(), h.round(), d(8.0), 0x101010, 0.92 * a);
+    let col = lerp(0x101010, 0xF0F0F0, a);
+    for (i, l) in lines.iter().enumerate() {
+        text(c, t, Face::Regular, x + pad, y + pad + (i as f32 + 0.5) * small.1, l, small, col);
+    }
 }
 
 /// The page panel's rectangle (x, y, w, h), physical px.
@@ -416,10 +481,17 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                 // card's text, so a long message wraps instead of running under the buttons
                 let top = y + d(CARD_H + 12.0);
                 upd_status(c, t, x0 + d(CARD_PAD), top, sf, before, 1.0 - m, secs, right);
-                upd_status(c, t, x0 + d(CARD_PAD), top, sf, now, m, secs, right);
+                let cut = upd_status(c, t, x0 + d(CARD_PAD), top, sf, now, m, secs, right);
                 button(c, t, right - bw, mid, bw, sf, verb, false, on, if on { st.amt(Act::CheckUpdate) } else { 0.0 });
                 if on {
                     hit(right - bw, ctrl_y(mid), right, ctrl_y(mid) + d(CTRL_H), Act::CheckUpdate);
+                }
+                // a cut status shows all of its text while hovered (drawn last: it lies
+                // over the card)
+                if let Some(cut) = &cut {
+                    let (a0, b0, a1, b1) = cut.rect;
+                    hit(a0, b0, a1, b1, Act::StatusTip);
+                    status_tip(c, t, sf, cut, st.amt(Act::StatusTip));
                 }
                 y += d(CARD_H + CARD_GAP);
             }
