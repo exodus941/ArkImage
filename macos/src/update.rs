@@ -138,9 +138,9 @@ fn reach_error(e: &ureq::Error) -> String {
                 .and_then(|t| t.checked_sub(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()))
                 .map(|s| s.div_ceil(60).max(1));
             return match mins {
-                Some(1) => "GitHub's limit of update checks is used up. Try again in 1 minute.".into(),
-                Some(m) => format!("GitHub's limit of update checks is used up. Try again in {m} minutes."),
-                None => "GitHub's limit of update checks is used up. Try again later.".into(),
+                Some(1) => "GitHub's check limit is used up. Try again in 1 minute.".into(),
+                Some(m) => format!("GitHub's check limit is used up. Try again in {m} minutes."),
+                None => "GitHub's check limit is used up. Try again later.".into(),
             };
         }
         return format!("GitHub answered with an error ({code}).");

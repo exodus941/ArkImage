@@ -55,39 +55,54 @@ pub(super) struct DrawState<'a> {
     pub upd: (&'a Upd, &'a Upd, f32, f32),
 }
 
-/// One state of the Version row, drawn at `a` opacity (0-1) from x, centred on `mid`.
-fn upd_status(c: &mut Canvas, t: &mut Text, x: f32, mid: f32, sf: f32, u: &Upd, a: f32, secs: f32, max_x: f32) {
+/// One update state, on the page under the Version card, drawn at `a` opacity (0-1).
+/// `x` is the card's text edge, `top` the first line's top, `max_x` the card's text end.
+/// The text wraps at word breaks; it is never cut. Idle draws nothing.
+fn upd_status(c: &mut Canvas, t: &mut Text, x: f32, top: f32, sf: f32, u: &Upd, a: f32, secs: f32, max_x: f32) {
     if a <= 0.0 {
         return;
     }
     let d = |v: f32| v * sf;
     let body = (d(BODY.0), d(BODY.1));
-    let col = |k: u32| lerp(PANEL2, k, a);
+    let col = |k: u32| lerp(PANEL, k, a);
     // icon 20 px, then 8 px, then the text
     let (icon, icol, deg, msg, tcol): (Option<Icon>, u32, u16, String, u32) = match u {
-        Upd::Idle => (None, 0, 0, format!("Version {}", env!("CARGO_PKG_VERSION")), SLATE200),
+        Upd::Idle => return,
         // one turn every 0.9 s, in 10 degree steps (36 cached masks)
-        Upd::Checking => (Some(Icon::Loader), SLATE300, (((secs / 0.9).fract() * 36.0) as u16) * 10, "Checking for updates...".into(), SLATE200),
-        Upd::Found(v) => (Some(Icon::Download), ACCENT, 0, format!("Downloading update {v}..."), SLATE200),
-        Upd::Latest => (Some(Icon::CircleCheck), GREEN, 0, "You are already on the latest version.".into(), SLATE200),
-        Upd::Failed(e) => (None, 0, 0, format!("Update check failed: {e}"), u::ROSE400),
+        Upd::Checking => (Some(Icon::Loader), SLATE300, (((secs / 0.9).fract() * 36.0) as u16) * 10, "Checking for updates…".into(), SLATE200),
+        Upd::Found(v) => (Some(Icon::Download), ACCENT, 0, format!("Downloading version {v}…"), SLATE200),
+        Upd::Latest => (Some(Icon::CircleCheck), GREEN, 0, "You are on the latest version.".into(), SLATE200),
+        Upd::Failed(e) => (None, 0, 0, format!("Update check failed. {e}"), u::ROSE400),
     };
+    let mid = top + body.1 / 2.0;
     let mut tx = x;
     if let Some(i) = icon {
         let s = d(20.0);
         crate::icons::draw_ex(c, i, x + s / 2.0, mid, s, icol, deg, a);
         tx += s + d(8.0);
     }
-    // end with an ellipsis rather than run under the button
-    let room = max_x - tx;
-    let mut msg = msg;
-    if u::width(t, Face::Regular, &msg, body.0) > room {
-        while !msg.is_empty() && u::width(t, Face::Regular, &format!("{msg}…"), body.0) > room {
-            msg.pop();
-        }
-        msg = format!("{}…", msg.trim_end());
+    for (i, l) in wrap(t, &msg, body.0, max_x - tx).iter().enumerate() {
+        text(c, t, Face::Regular, tx, mid + i as f32 * body.1, l, body, col(tcol));
     }
-    text(c, t, Face::Regular, tx, mid, &msg, body, col(tcol));
+}
+
+/// Split `s` into lines no wider than `room`, at spaces; a word wider than `room` gets a
+/// line of its own.
+fn wrap(t: &mut Text, s: &str, px: f32, room: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for w in s.split(' ') {
+        let next = if cur.is_empty() { w.to_string() } else { format!("{cur} {w}") };
+        if !cur.is_empty() && u::width(t, Face::Regular, &next, px) > room {
+            lines.push(std::mem::replace(&mut cur, w.to_string()));
+        } else {
+            cur = next;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 /// The page panel's rectangle (x, y, w, h), physical px.
@@ -396,9 +411,12 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                 let gx = right - bw - d(8.0) - gw;
                 button(c, t, gx, mid, gw, sf, "GitHub", false, true, st.amt(Act::GitHub));
                 hit(gx, ctrl_y(mid), gx + gw, ctrl_y(mid) + d(CTRL_H), Act::GitHub);
-                let max_x = gx - d(16.0);
-                upd_status(c, t, x0 + d(CARD_PAD), mid, sf, before, 1.0 - m, secs, max_x);
-                upd_status(c, t, x0 + d(CARD_PAD), mid, sf, now, m, secs, max_x);
+                text(c, t, Face::Regular, x0 + d(CARD_PAD), mid, &format!("Version {}", env!("CARGO_PKG_VERSION")), body, SLATE200);
+                // the update status sits on the page 12 px under the card, as wide as the
+                // card's text, so a long message wraps instead of running under the buttons
+                let top = y + d(CARD_H + 12.0);
+                upd_status(c, t, x0 + d(CARD_PAD), top, sf, before, 1.0 - m, secs, right);
+                upd_status(c, t, x0 + d(CARD_PAD), top, sf, now, m, secs, right);
                 button(c, t, right - bw, mid, bw, sf, verb, false, on, if on { st.amt(Act::CheckUpdate) } else { 0.0 });
                 if on {
                     hit(right - bw, ctrl_y(mid), right, ctrl_y(mid) + d(CTRL_H), Act::CheckUpdate);
