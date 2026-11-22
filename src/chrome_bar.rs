@@ -93,7 +93,7 @@ pub(super) fn draw_bottom(c: &mut Canvas, mut t: Option<&mut Text>, s: &State, h
     let r = (BAR_RADIUS * sf).min(bh / 2.0);
 
     // frosted glass: blur and a dark tint, no outline
-    c.blur(bx as i32, by as i32, bw as i32, bh as i32, (GLASS_BLUR * sf).round() as usize, crate::render::BLUR_BAR);
+    c.blur_rrect(bx, by, bw, bh, r, (GLASS_BLUR * sf).round() as usize, crate::render::BLUR_BAR);
     c.fill_rrect(bx, by, bw, bh, r, 0x101010, GLASS_BAR_A as f32 / 255.0);
     hits.push(Hit { x0: bx, y0: by, x1: bx + bw, y1: by + bh, id: "bar" });
 
@@ -279,7 +279,7 @@ pub fn draw_anim_row(c: &mut Canvas, t: &mut Text, s: &State, hits: &mut Vec<Hit
     let mid = py + ph / 2.0;
     // frosted glass, as the bar: blur, then a dark tint; the dropdown lightens on hover
     let pill = |c: &mut Canvas, x: f32, w: f32, hover: f32| {
-        c.blur(x as i32, py as i32, w as i32, ph as i32, (GLASS_BLUR * sf).round() as usize, crate::render::BLUR_BAR);
+        c.blur_rrect(x, py, w, ph, ph / 2.0, (GLASS_BLUR * sf).round() as usize, crate::render::BLUR_BAR);
         c.fill_rrect(x, py, w, ph, ph / 2.0, 0x101010, GLASS_BAR_A as f32 / 255.0);
         if hover > 0.0 {
             c.fill_rrect(x, py, w, ph, ph / 2.0, 0xFFFFFF, 0.12 * hover);

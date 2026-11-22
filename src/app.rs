@@ -90,7 +90,13 @@ fn cloak(w: &Window, on: bool) {
     unsafe { DwmSetWindowAttribute(h.hwnd.get(), 13, &v as *const i32 as _, 4) };
 }
 
-#[cfg(not(windows))]
+/// macOS: the window's alpha, 0 while it paints its first frame unseen, then 1.
+#[cfg(target_os = "macos")]
+fn cloak(w: &Window, on: bool) {
+    crate::mac::set_alpha(w, if on { 0.0 } else { 1.0 });
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn cloak(_w: &Window, _on: bool) {}
 
 /// Dark native title bar (Windows 10 2004+: DWMWA_USE_IMMERSIVE_DARK_MODE = 20).
@@ -289,6 +295,11 @@ pub(crate) fn menu_label(text: &str, key: &str) -> String {
     }
 }
 
+/// Hotkey text as the keyboard labels it: Cmd and Option on macOS, where `primary` reads Cmd.
+pub(crate) fn key_names(keys: &str) -> String {
+    if cfg!(target_os = "macos") { keys.replace("Ctrl+", "Cmd+").replace("Alt+", "Option+") } else { keys.to_string() }
+}
+
 fn build_menu(items: Vec<MenuEntry>) -> Vec<Box<dyn muda::IsMenuItem>> {
     items
         .into_iter()
@@ -399,7 +410,7 @@ const HELP: &[(&str, &str)] = &[
     ("Ctrl++  Ctrl+-", "Zoom 1%"),
     ("Ctrl+K", "Fix zoom"),
     ("Alt+Arrows", "Rotate CW / CCW / 180 / reset"),
-    ("Ctrl+F  Ctrl+M", "Flip vertical / mirror"),
+    ("Ctrl+Shift+F  Ctrl+Shift+M", "Flip vertical / mirror"),
     ("Ctrl+I  Ctrl+G", "Negative / gamma"),
     ("U  I  S", "No filter / soften / soften+sharpen"),
     ("Tab  Shift+Tab", "Info / file name"),
@@ -407,10 +418,10 @@ const HELP: &[(&str, &str)] = &[
     ("F2  Ctrl+O  F  F4", "Open file / open folder / close"),
     ("Ctrl+Enter", "Show in folder"),
     ("Del", "Delete"),
-    ("Ins  Shift+Ins  Ctrl+Ins", "Copy to photo folder 1 / 2, move to 1"),
+    ("\\  Shift+\\  Ctrl+\\", "Copy to photo folder 1 / 2, move to 1"),
     ("Ctrl+C  Ctrl+E", "Copy image / open in editor"),
     ("Alt+Enter  F11  Middle click", "Full screen"),
-    ("Ctrl+A", "Always on top"),
+    ("Ctrl+Shift+A", "Always on top"),
     ("F5  Shift+F5", "Settings / reload settings file"),
     ("`  ~", "Lock top menu / lock control bar"),
     ("F1  X  Esc", "This help / exit"),
@@ -1808,6 +1819,14 @@ impl App {
         }
     }
 
+    fn toggle_on_top(&mut self) {
+        self.on_top = !self.on_top;
+        if let Some(w) = &self.window {
+            w.set_window_level(if self.on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
+        }
+        self.msg(if self.on_top { "Always On Top: On" } else { "Always On Top: Off" });
+    }
+
     fn toggle_fullscreen(&mut self) {
         let Some(w) = self.window.clone() else { return };
         self.fullscreen = !self.fullscreen;
@@ -2982,7 +3001,7 @@ impl App {
         let ha = crate::ui::fade_amount(self.help_at, self.show_help);
         self.help_hit = None;
         if ha > 0.0 {
-            let rows: Vec<(String, String)> = HELP.iter().map(|(k, a)| (k.to_string(), a.to_string())).collect();
+            let rows: Vec<(String, String)> = HELP.iter().map(|(k, a)| (key_names(k), a.to_string())).collect();
             let close_hover = self.hover_fx.iter().find(|(k, _)| *k == "help_close").map_or(0.0, |(_, v)| *v);
             // 16 px clear of the title strip and of the bottom bar
             let band = ((chrome::TITLE_H + 16.0) * sf, ch - (chrome::BAR_H + chrome::BAR_GAP + 16.0) * sf);
@@ -3276,11 +3295,13 @@ impl App {
             K::F11 => self.toggle_fullscreen(),
             K::F2 => self.open_dialog(),
             K::KeyO if p => self.open_dialog(),
-            K::KeyF if p => {
+            // Ctrl/Cmd+Shift: Cmd+F (find), Cmd+M (minimize) and Cmd+A (select all) mean
+            // other things on macOS, so these three take Shift on both platforms.
+            K::KeyF if p && sh => {
                 self.view.flip_v = !self.view.flip_v;
                 self.invalidate();
             }
-            K::KeyF => self.open_folder_dialog(),
+            K::KeyF if !p => self.open_folder_dialog(),
             K::F4 => self.close(),
 
             K::KeyU => {
@@ -3306,7 +3327,7 @@ impl App {
                 self.view.gamma = !self.view.gamma;
                 self.invalidate();
             }
-            K::KeyM if p => {
+            K::KeyM if p && sh => {
                 self.view.flip_h = !self.view.flip_h;
                 self.invalidate();
             }
@@ -3336,9 +3357,10 @@ impl App {
             K::KeyC if p && sh => self.copy_info(),
             K::KeyC if p => self.copy_image(),
             K::Delete => self.delete_current(),
-            K::Insert if p => self.to_photo_folder(1, true),
-            K::Insert if sh => self.to_photo_folder(2, false),
-            K::Insert => self.to_photo_folder(1, false),
+            // \ rather than Insert: Mac keyboards have no Insert key
+            K::Backslash if p => self.to_photo_folder(1, true),
+            K::Backslash if sh => self.to_photo_folder(2, false),
+            K::Backslash => self.to_photo_folder(1, false),
             K::KeyE if p => self.open_editor(),
             K::F5 if sh => self.reload_config(),
             K::F5 => self.open_settings(el, 0),
@@ -3347,13 +3369,7 @@ impl App {
                 self.help_at = Instant::now();
                 self.request_redraw();
             }
-            K::KeyA if p => {
-                self.on_top = !self.on_top;
-                if let Some(w) = &self.window {
-                    w.set_window_level(if self.on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
-                }
-                self.msg(if self.on_top { "Always On Top: On" } else { "Always On Top: Off" });
-            }
+            K::KeyA if p && sh => self.toggle_on_top(),
             // ` locks the top menu, ~ (Shift+`) locks the bottom control bar, as in Honeyview.
             K::Backquote if sh => {
                 self.cfg.lock_bottom = !self.cfg.lock_bottom;
@@ -3603,9 +3619,9 @@ impl App {
                 I("editor".into(), "Open with Image Editor".into(), "Ctrl+E", has),
             ],
             "copyto" => vec![
-                I("copy1".into(), "Copy to Photo Folder 1".into(), "Insert", has),
-                I("move1".into(), "Move to Photo Folder 1".into(), "Ctrl+Insert", has),
-                I("copy2".into(), "Copy to Photo Folder 2".into(), "Shift+Insert", has),
+                I("copy1".into(), "Copy to Photo Folder 1".into(), "\\", has),
+                I("move1".into(), "Move to Photo Folder 1".into(), "Ctrl+\\", has),
+                I("copy2".into(), "Copy to Photo Folder 2".into(), "Shift+\\", has),
                 S,
                 I("pfset".into(), "Photo Folder Settings".into(), "", true),
                 I("pfopen".into(), "Open Photo Folder 1".into(), "", !cfg.photo_folder1.is_empty()),
@@ -3646,8 +3662,8 @@ impl App {
                 Sub("Image Effect".into(), vec![
                     C("neg".into(), "Reverse Image".into(), "Ctrl+I", v.negative),
                     C("gamma".into(), "Gamma Compensation".into(), "Ctrl+G", v.gamma),
-                    C("flipv".into(), "Flip Vertical".into(), "Ctrl+F", v.flip_v),
-                    C("fliph".into(), "Flip Horizontal".into(), "Ctrl+M", v.flip_h),
+                    C("flipv".into(), "Flip Vertical".into(), "Ctrl+Shift+F", v.flip_v),
+                    C("fliph".into(), "Flip Horizontal".into(), "Ctrl+Shift+M", v.flip_h),
                 ]),
                 Sub("Sort by".into(), vec![
                     C("sort0".into(), "Name".into(), "", cfg.sort == 0),
@@ -3673,19 +3689,32 @@ impl App {
                     C("rotr".into(), "Rotate 90° Clockwise".into(), "Alt+Right", v.rotation == 1),
                     C("rot180".into(), "Rotate 180°".into(), "Alt+Down", v.rotation == 2),
                     S,
-                    C("fliph".into(), "Flip Horizontal".into(), "Ctrl+M", v.flip_h),
-                    C("flipv".into(), "Flip Vertical".into(), "Ctrl+F", v.flip_v),
+                    C("fliph".into(), "Flip Horizontal".into(), "Ctrl+Shift+M", v.flip_h),
+                    C("flipv".into(), "Flip Vertical".into(), "Ctrl+Shift+F", v.flip_v),
                 ]),
                 // on: 250 ms; off: none
                 C("slide_toggle".into(), "Slide Animation".into(), "", cfg.slide_ms > 0),
                 S,
                 C("info".into(), "File/EXIF Information".into(), "Tab", self.show_info),
+                C("name".into(), "File Name".into(), "Shift+Tab", self.show_name),
+                I("copyinfo".into(), "Copy File Information".into(), "Ctrl+Shift+C", has),
                 I("delete".into(), "Delete".into(), "Del", has),
-                I("copy1".into(), "Copy to Photo Folder".into(), "Ins", has),
+                Sub("Copy to".into(), vec![
+                    I("copy1".into(), "Copy to Photo Folder 1".into(), "\\", has),
+                    I("move1".into(), "Move to Photo Folder 1".into(), "Ctrl+\\", has),
+                    I("copy2".into(), "Copy to Photo Folder 2".into(), "Shift+\\", has),
+                ]),
                 I("editor".into(), "Open with Image Editor".into(), "Ctrl+E", has),
                 I("clip".into(), "Copy to Clipboard".into(), "Ctrl+C", has),
                 S,
+                C("full".into(), "Full Screen".into(), "F11", self.fullscreen),
+                C("ontop".into(), "Always on Top".into(), "Ctrl+Shift+A", self.on_top),
+                C("locktop".into(), "Lock Top Menu".into(), "`", cfg.lock_top),
+                C("lockbar".into(), "Lock Control Bar".into(), "~", cfg.lock_bottom),
+                S,
                 I("config".into(), "Settings".into(), "F5", true),
+                I("reload".into(), "Reload Settings File".into(), "Shift+F5", true),
+                I("help".into(), "Hotkeys".into(), "F1", true),
                 I("closeall".into(), "Close All Instances".into(), "", true),
                 I("exit".into(), "Exit".into(), "X", true),
             ],
@@ -4460,6 +4489,27 @@ impl App {
             "rot180" => self.rotate(2),
             "info" => {
                 self.show_info = !self.show_info;
+                self.request_redraw();
+            }
+            "name" => {
+                self.show_name = !self.show_name;
+                self.request_redraw();
+            }
+            "copyinfo" => self.copy_info(),
+            "full" => self.toggle_fullscreen(),
+            "ontop" => self.toggle_on_top(),
+            "locktop" => {
+                self.cfg.lock_top = !self.cfg.lock_top;
+                self.request_redraw();
+            }
+            "lockbar" => {
+                self.cfg.lock_bottom = !self.cfg.lock_bottom;
+                self.request_redraw();
+            }
+            "reload" => self.reload_config(),
+            "help" => {
+                self.show_help = !self.show_help;
+                self.help_at = Instant::now();
                 self.request_redraw();
             }
             "delete" => self.delete_current(),
@@ -5446,6 +5496,19 @@ impl App {
         if !self.closed {
             self.store_geometry();
             self.cfg.save();
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_name_tests {
+    #[test]
+    fn mac_labels_cmd_and_option() {
+        let k = super::key_names("Ctrl+Alt+PgDn  Ctrl+Shift+F  Alt+Arrows  \\");
+        if cfg!(target_os = "macos") {
+            assert_eq!(k, "Cmd+Option+PgDn  Cmd+Shift+F  Option+Arrows  \\");
+        } else {
+            assert_eq!(k, "Ctrl+Alt+PgDn  Ctrl+Shift+F  Alt+Arrows  \\");
         }
     }
 }

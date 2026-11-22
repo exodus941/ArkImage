@@ -27,6 +27,40 @@ pub fn is_lottie_json(bytes: &[u8]) -> bool {
     s == Some(b'{') && has(b"\"layers\"") && has(b"\"fr\"")
 }
 
+/// rlottie takes a layer with no "ddd" key as 3D, and a 3D layer ignores its "r"
+/// rotation; the Lottie format says a missing "ddd" is 0. So each layer without "ddd"
+/// gets "ddd": 0 as its first key (rlottie reads keys in order). A spinner with no
+/// "ddd" played 80 identical frames. None when nothing changes.
+fn flat_layers(json: &[u8]) -> Option<Vec<u8>> {
+    use serde_json::{Map, Value};
+    let mut v: Value = serde_json::from_slice(json).ok()?;
+    fn fix(layers: Option<&mut Value>, n: &mut usize) {
+        let Some(Value::Array(ls)) = layers else { return };
+        for l in ls {
+            if let Value::Object(m) = l {
+                if !m.contains_key("ddd") {
+                    let mut out = Map::new();
+                    out.insert("ddd".into(), Value::from(0));
+                    out.extend(std::mem::take(m));
+                    *m = out;
+                    *n += 1;
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    fix(v.get_mut("layers"), &mut n);
+    if let Some(Value::Array(assets)) = v.get_mut("assets") {
+        for a in assets {
+            fix(a.get_mut("layers"), &mut n);
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    serde_json::to_vec(&v).ok()
+}
+
 /// The first animation JSON inside a .lottie (zip) file.
 fn from_dotlottie(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
@@ -75,6 +109,9 @@ impl Player {
     pub fn new(bytes: &[u8], ext: &str, gpu: bool) -> Result<Player, String> {
         let mut json = if ext == "lottie" || bytes.starts_with(b"PK") { from_dotlottie(bytes)? } else { bytes.to_vec() };
         json.retain(|&b| b != 0);
+        if let Some(j) = flat_layers(&json) {
+            json = j;
+        }
         json.push(0);
         // rlottie caches by key; a fresh key per decode keeps two files apart
         static N: AtomicU64 = AtomicU64::new(0);
@@ -156,6 +193,18 @@ impl Player {
 
 #[cfg(test)]
 mod tests {
+    /// The spin fixture with no "ddd" keys: rlottie took the layer as 3D and drew every
+    /// frame the same. Frame 15 (45 degrees) must differ from frame 0.
+    #[test]
+    fn layer_without_ddd_rotates() {
+        let b = std::fs::read("tests/fixtures/spin-no-ddd.json").unwrap();
+        let pl = super::Player::new(&b, "json", false).unwrap();
+        let (a, c) = (pl.frame(0).as_raw().clone(), pl.frame(15).as_raw().clone());
+        let p = |v: f32| ((v * 20.48) as usize * 2048 + (50.0 * 20.48) as usize) * 4 + 3;
+        // (50, 75): outside the square at 0 degrees, inside the diamond at 45
+        assert_eq!((a[p(75.0)], c[p(75.0)]), (0, 255));
+    }
+
     /// A 30-frame spinning square: 30 frames at 33 ms, a cyan centre, a clear corner.
     #[test]
     fn decodes_spin() {

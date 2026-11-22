@@ -187,6 +187,35 @@ impl Canvas<'_> {
     /// The rectangle is box-downsampled by BLUR_F first; at 4x a 3440x142 strip costs 1/16 per pass.
     /// `class`: the GPU blur class for hole pixels (see HOLE); the GPU blurs the image layer
     /// there, and only the interface's own pixels are blurred here.
+    /// `blur` inside a rounded rectangle of corner radius `rad`: the pixels outside its
+    /// corners keep their values. Blurring the whole rectangle showed square corners past
+    /// the bar's rounded ends where the image ends (GPU path: the image layer's hole
+    /// pixels were averaged into the background there).
+    pub fn blur_rrect(&mut self, x: f32, y: f32, w: f32, h: f32, rad: f32, r: usize, class: u32) {
+        let (x0, y0) = (x.floor().max(0.0) as usize, y.floor().max(0.0) as usize);
+        let (x1, y1) = (((x + w).ceil().max(0.0) as usize).min(self.w), ((y + h).ceil().max(0.0) as usize).min(self.h));
+        let k = rad.ceil() as usize + 1;
+        // the four corner squares, before the blur
+        let mut kept = Vec::new();
+        for py in y0..y1 {
+            for px in x0..x1 {
+                if (px < x0 + k || px + k >= x1) && (py < y0 + k || py + k >= y1) {
+                    kept.push((py * self.w + px, self.buf[py * self.w + px]));
+                }
+            }
+        }
+        self.blur(x as i32, y as i32, w as i32, h as i32, r, class);
+        for (i, orig) in kept {
+            let (px, py) = ((i % self.w) as f32 + 0.5, (i / self.w) as f32 + 0.5);
+            let cov = (0.5 - sd_rrect(px, py, x, y, w, h, rad)).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                self.buf[i] = orig;
+            } else if cov < 1.0 && !is_hole(orig) && !is_hole(self.buf[i]) && !is_glass(orig) && !is_glass(self.buf[i]) {
+                self.buf[i] = mix(orig, self.buf[i], (cov * 255.0) as u32);
+            }
+        }
+    }
+
     pub fn blur(&mut self, x: i32, y: i32, w: i32, h: i32, r: usize, class: u32) {
         let x0 = x.max(0) as usize;
         let y0 = y.max(0) as usize;

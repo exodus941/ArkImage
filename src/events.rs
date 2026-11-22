@@ -2,7 +2,7 @@
 //!
 //! It is always on (the trace is opt-in), so a restart the user saw can be explained
 //! afterwards. Lines go to `events.log` next to the config:
-//! "<date time> <pid> <message>" (local time on Windows, UTC elsewhere). Past MAX_BYTES
+//! "<date time> <pid> <message>" (local time on Windows and macOS, UTC elsewhere). Past MAX_BYTES
 //! the older half is cut.
 
 use std::io::Write;
@@ -59,13 +59,41 @@ fn now_text() -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", t.y, t.mo, t.d, t.h, t.mi, t.s)
 }
 
-#[cfg(not(windows))]
+/// macOS: the local time the user's clock shows, from localtime_r.
+#[cfg(target_os = "macos")]
+fn now_text() -> String {
+    #[repr(C)]
+    struct Tm {
+        sec: i32,
+        min: i32,
+        hour: i32,
+        mday: i32,
+        mon: i32,
+        year: i32,
+        _wday: i32,
+        _yday: i32,
+        _isdst: i32,
+        _gmtoff: i64,
+        _zone: *const i8,
+    }
+    extern "C" {
+        fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
+    }
+    let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let mut t = Tm { sec: 0, min: 0, hour: 0, mday: 0, mon: 0, year: 0, _wday: 0, _yday: 0, _isdst: 0, _gmtoff: 0, _zone: std::ptr::null() };
+    if unsafe { localtime_r(&s, &mut t) }.is_null() {
+        return stamp(std::time::SystemTime::now());
+    }
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", t.year + 1900, t.mon + 1, t.mday, t.hour, t.min, t.sec)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn now_text() -> String {
     stamp(std::time::SystemTime::now())
 }
 
 /// UTC: "2026-11-21 02:21:13Z"
-#[cfg_attr(windows, allow(dead_code))]
+#[allow(dead_code)]
 pub fn stamp(t: std::time::SystemTime) -> String {
     let s = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
     let (days, rem) = (s.div_euclid(86_400), s.rem_euclid(86_400));
