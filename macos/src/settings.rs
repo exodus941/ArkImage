@@ -296,6 +296,8 @@ pub enum Act {
     CheckUpdate,
     /// Open the GitHub page in the browser.
     GitHub,
+    /// Hover only: the update status was cut to 2 lines; hovering shows all of it.
+    StatusTip,
     Ok,
     /// Close without saving.
     Cancel,

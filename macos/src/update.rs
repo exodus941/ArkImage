@@ -153,6 +153,10 @@ fn run(on_found: &dyn Fn(&str)) -> Result<Outcome, String> {
     if let Some(v) = INSTALLED.lock().unwrap().clone() {
         return Ok(Outcome::Ready(v));
     }
+    // Test hook: ARKIMAGE_TEST_UPDATE_FAIL makes every check fail with that text
+    if let Ok(e) = std::env::var("ARKIMAGE_TEST_UPDATE_FAIL") {
+        return Err(e);
+    }
     let current = env!("CARGO_PKG_VERSION");
     let a = agent();
     let body = a.get(&api_url()).set("Accept", "application/vnd.github+json").call().map_err(|e| {
