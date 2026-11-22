@@ -139,6 +139,8 @@ pub fn display(key: &str) -> String {
     };
     let last = last.strip_prefix("Key").or_else(|| last.strip_prefix("Digit")).unwrap_or(last);
     let last = last.strip_prefix("Arrow").unwrap_or(last);
+    // macOS keyboards label Alt as Option
+    let mods = if cfg!(target_os = "macos") { mods.replace("Alt+", "Option+") } else { mods.to_string() };
     format!("{mods}{last}")
 }
 
