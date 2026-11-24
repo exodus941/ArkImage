@@ -30,6 +30,7 @@ mod master;
 mod picker;
 mod psd_fast;
 mod render;
+mod res2d;
 mod reveal;
 mod settings;
 mod source;

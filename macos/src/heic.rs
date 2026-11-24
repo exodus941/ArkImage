@@ -10,7 +10,8 @@ pub fn is_heif(bytes: &[u8]) -> bool {
     }
     let size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     let end = size.clamp(12, bytes.len().min(256));
-    const BRANDS: [&[u8; 4]; 8] = [b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1"];
+    // avif / avis: AVIF stills and sequences, also read by ImageIO
+    const BRANDS: [&[u8; 4]; 10] = [b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1", b"avif", b"avis"];
     // major brand at 8..12, compatible brands from 16 on
     std::iter::once(8)
         .chain((16..end).step_by(4))

@@ -697,6 +697,39 @@ mod tests {
         assert!(diff(&l4) > 0 && diff(&mi) > 0);
     }
 
+    /// Each new kernel (codes 7-16) gives its own result, and none is Lanczos3.
+    #[test]
+    fn new_kernels_are_distinct() {
+        let img = RgbaImage::from_fn(200, 200, |x, y| image::Rgba([((x * 7) ^ (y * 3)) as u8, (x * 5) as u8, (y * 11) as u8, 255]));
+        let mut outs = vec![resize(&img, 73, 73, 2).into_raw()];
+        for code in 7..=16u8 {
+            let o = resize(&img, 73, 73, code).into_raw();
+            assert!(!outs.contains(&o), "kernel {code} repeats an earlier result");
+            outs.push(o);
+        }
+        // enlarging too (Area enlarges as Bilinear, so it is left out)
+        let big: Vec<Vec<u8>> = (8..=16u8).map(|c| resize(&img, 331, 331, c).into_raw()).collect();
+        for i in 0..big.len() {
+            for j in 0..i {
+                assert_ne!(big[i], big[j], "kernels {} and {} enlarge the same", i + 8, j + 8);
+            }
+        }
+    }
+
+    /// A hard step resized with Lanczos3 rings past 0 and 255 (here: values between the
+    /// two plateaus' far sides); with Clamp Ringing every output stays inside the values
+    /// it reads.
+    #[test]
+    fn clamp_ringing_removes_overshoot() {
+        let img = RgbaImage::from_fn(64, 8, |x, _| if x < 32 { image::Rgba([40, 40, 40, 255]) } else { image::Rgba([200, 200, 200, 255]) });
+        let ring = resize_table(&img, 157, 8, 2);
+        let clamped = resize(&img, 157, 8, 2 | 0x80);
+        let span = |o: &RgbaImage| o.pixels().map(|p| p[0]).fold((255u8, 0u8), |(a, b), v| (a.min(v), b.max(v)));
+        let (lo, hi) = span(&ring);
+        assert!(lo < 40 && hi > 200, "Lanczos3 rings: {lo}..{hi}");
+        assert_eq!(span(&clamped), (40, 200));
+    }
+
     #[test]
     fn threshold_skips_small_steps() {
         let mut img = RgbaImage::from_fn(32, 8, |x, _| if x < 16 { image::Rgba([100, 100, 100, 255]) } else { image::Rgba([102, 102, 102, 255]) });
@@ -720,10 +753,245 @@ fn lanczos4(x: f64) -> f64 {
     if (-4.0..4.0).contains(&x) { sinc(x) * sinc(x / 4.0) } else { 0.0 }
 }
 
+fn ksinc(x: f64) -> f64 {
+    if x == 0.0 {
+        1.0
+    } else {
+        let p = x * std::f64::consts::PI;
+        p.sin() / p
+    }
+}
+
+/// Mitchell-Netravali cubic family, (B, C).
+fn bc(x: f64, b: f64, c: f64) -> f64 {
+    let a = x.abs();
+    if a < 1.0 {
+        ((12.0 - 9.0 * b - 6.0 * c) * a * a * a + (-18.0 + 12.0 * b + 6.0 * c) * a * a + (6.0 - 2.0 * b)) / 6.0
+    } else if a < 2.0 {
+        ((-b - 6.0 * c) * a * a * a + (6.0 * b + 30.0 * c) * a * a + (-12.0 * b - 48.0 * c) * a + (8.0 * b + 24.0 * c)) / 6.0
+    } else {
+        0.0
+    }
+}
+
+/// Modified Bessel function I0, by its series (Kaiser window).
+fn bessel_i0(x: f64) -> f64 {
+    let (mut sum, mut term, q) = (1.0, 1.0, x * x / 4.0);
+    for k in 1..40 {
+        term *= q / (k * k) as f64;
+        sum += term;
+        if term < 1e-12 * sum {
+            break;
+        }
+    }
+    sum
+}
+
+/// The convolution kernel and its support (radius in source px) for a `resize` code.
+/// Codes 7-16 follow GPUResize's filter reference: Area (a box; Bilinear when enlarging),
+/// Parzen (B 1, C 0), Bell (quadratic B-spline), Cubic (Hermite, B 0, C 0), Notch (B 1.5,
+/// C -0.25), Simon (B 0, C 0.75), Rifman (B 0, C 1), Lanczos radius 6, Kaiser (radius 3,
+/// beta 4.123) and Sinc radius 2 with no window.
+pub fn kernel(code: u8) -> (fn(f64) -> f64, f64) {
+    fn bilinear(x: f64) -> f64 {
+        (1.0 - x.abs()).max(0.0)
+    }
+    fn lanczos3(x: f64) -> f64 {
+        if x.abs() < 3.0 { ksinc(x) * ksinc(x / 3.0) } else { 0.0 }
+    }
+    fn lanczos4(x: f64) -> f64 {
+        if x.abs() < 4.0 { ksinc(x) * ksinc(x / 4.0) } else { 0.0 }
+    }
+    fn lanczos6(x: f64) -> f64 {
+        if x.abs() < 6.0 { ksinc(x) * ksinc(x / 6.0) } else { 0.0 }
+    }
+    fn catmull(x: f64) -> f64 {
+        bc(x, 0.0, 0.5)
+    }
+    fn mitchell(x: f64) -> f64 {
+        bc(x, 1.0 / 3.0, 1.0 / 3.0)
+    }
+    fn area(x: f64) -> f64 {
+        if x.abs() <= 0.5 { 1.0 } else { 0.0 }
+    }
+    fn parzen(x: f64) -> f64 {
+        bc(x, 1.0, 0.0)
+    }
+    fn bell(x: f64) -> f64 {
+        let a = x.abs();
+        if a < 0.5 {
+            0.75 - a * a
+        } else if a < 1.5 {
+            0.5 * (a - 1.5) * (a - 1.5)
+        } else {
+            0.0
+        }
+    }
+    fn hermite(x: f64) -> f64 {
+        bc(x, 0.0, 0.0)
+    }
+    fn notch(x: f64) -> f64 {
+        bc(x, 1.5, -0.25)
+    }
+    fn simon(x: f64) -> f64 {
+        bc(x, 0.0, 0.75)
+    }
+    fn rifman(x: f64) -> f64 {
+        bc(x, 0.0, 1.0)
+    }
+    fn kaiser(x: f64) -> f64 {
+        const BETA: f64 = 4.123;
+        let t = x / 3.0;
+        if t.abs() >= 1.0 {
+            return 0.0;
+        }
+        ksinc(x) * bessel_i0(BETA * (1.0 - t * t).sqrt()) / bessel_i0(BETA)
+    }
+    fn sinc2(x: f64) -> f64 {
+        if x.abs() < 2.0 { ksinc(x) } else { 0.0 }
+    }
+    match code & 0x7F {
+        1 => (bilinear, 1.0),
+        4 => (catmull, 2.0),
+        5 => (lanczos4, 4.0),
+        6 => (mitchell, 2.0),
+        7 => (area, 0.5),
+        8 => (parzen, 2.0),
+        9 => (bell, 1.5),
+        10 => (hermite, 1.0),
+        11 => (notch, 2.0),
+        12 => (simon, 2.0),
+        13 => (rifman, 2.0),
+        14 => (lanczos6, 6.0),
+        15 => (kaiser, 3.0),
+        16 => (sinc2, 2.0),
+        _ => (lanczos3, 3.0),
+    }
+}
+
+/// Codes `resize` hands to its own table convolution: the new kernels, and any code with
+/// bit 7 set (Clamp Ringing).
+fn uses_table(code: u8) -> bool {
+    code & 0x80 != 0 || (7..=16).contains(&code)
+}
+
+/// The weight-table resize (the GPU's `resample_i`, on the processor): vertical pass, then
+/// horizontal, i16 weights at the table's precision. Bit 7 of `code` clamps each output to
+/// the lowest and highest value of the pixels it reads, so a sharp kernel adds no halo.
+/// Colour is premultiplied by alpha for the passes, as fast_image_resize does.
+/// Run `f(row index, row)` over every `row`-byte row of `out`, split across the cores.
+fn par_rows(out: &mut [u8], row: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
+    let n = out.len() / row.max(1);
+    let k = std::thread::available_parallelism().map_or(4, |v| v.get()).min(n.max(1));
+    let per = n.div_ceil(k.max(1)).max(1);
+    std::thread::scope(|s| {
+        for (ci, chunk) in out.chunks_mut(per * row).enumerate() {
+            let f = &f;
+            s.spawn(move || {
+                for (j, r) in chunk.chunks_mut(row).enumerate() {
+                    f(ci * per + j, r);
+                }
+            });
+        }
+    });
+}
+
+pub fn resize_table(img: &RgbaImage, w: u32, h: u32, code: u8) -> RgbaImage {
+    let clamp = code & 0x80 != 0;
+    let (sw, sh) = img.dimensions();
+    let alpha = img.pixels().any(|p| p[3] < 255);
+    let mut cur: Vec<u8> = img.as_raw().clone();
+    if alpha {
+        for p in cur.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+    let conv = |src: &[u8], stride_in: usize, taps: &[i32], prec: u32, start: i32, size: i32, off: i32, at: &dyn Fn(i32) -> usize| -> [u8; 4] {
+        let half = if prec > 0 { 1i64 << (prec - 1) } else { 0 };
+        let mut s = [half; 4];
+        let (mut mn, mut mx) = ([255u8; 4], [0u8; 4]);
+        for k in 0..size {
+            let i = at(start + k);
+            let wgt = taps[(off + k) as usize] as i64;
+            for c in 0..4 {
+                let v = src[i + c];
+                s[c] += v as i64 * wgt;
+                if clamp && wgt != 0 {
+                    mn[c] = mn[c].min(v);
+                    mx[c] = mx[c].max(v);
+                }
+            }
+        }
+        let _ = stride_in;
+        let mut o = [0u8; 4];
+        for c in 0..4 {
+            let mut r = (s[c] >> prec).clamp(0, 255) as u8;
+            if clamp && size > 0 {
+                r = r.clamp(mn[c], mx[c]);
+            }
+            o[c] = r;
+        }
+        o
+    };
+    let (mut cw, mut ch) = (sw, sh);
+    // vertical
+    if h != sh {
+        let (t, prec) = crate::gpu::fir_table(sh, h, code, true);
+        let row = cw as usize * 4;
+        let mut out = vec![0u8; row * h as usize];
+        par_rows(&mut out, row, |y, orow| {
+            let (start, size, off) = (t[y * 3], t[y * 3 + 1], t[y * 3 + 2]);
+            for x in 0..cw as usize {
+                let p = conv(&cur, row, &t, prec, start, size, off, &|i| i as usize * row + x * 4);
+                orow[x * 4..x * 4 + 4].copy_from_slice(&p);
+            }
+        });
+        cur = out;
+        ch = h;
+    }
+    // horizontal
+    if w != cw {
+        let (t, prec) = crate::gpu::fir_table(cw, w, code, false);
+        let (rin, rout) = (cw as usize * 4, w as usize * 4);
+        let mut out = vec![0u8; rout * ch as usize];
+        par_rows(&mut out, rout, |y, orow| {
+            for x in 0..w as usize {
+                let (start, size, off) = (t[x * 3], t[x * 3 + 1], t[x * 3 + 2]);
+                let p = conv(&cur, rin, &t, prec, start, size, off, &|i| y * rin + i as usize * 4);
+                orow[x * 4..x * 4 + 4].copy_from_slice(&p);
+            }
+        });
+        cur = out;
+        cw = w;
+    }
+    if alpha {
+        for p in cur.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            if a > 0 {
+                for c in &mut p[..3] {
+                    *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
+    }
+    RgbaImage::from_raw(cw, ch, cur).expect("resize_table size")
+}
+
 pub fn resize(img: &RgbaImage, w: u32, h: u32, filter: u8) -> RgbaImage {
     use fast_image_resize as fr;
     let w = w.max(1);
     let h = h.max(1);
+    if img.width() > 0 && img.height() > 0 {
+        if let Some(o) = crate::res2d::resize(img, w, h, filter) {
+            return o;
+        }
+    }
+    if uses_table(filter) && img.width() > 0 && img.height() > 0 {
+        return resize_table(img, w, h, filter);
+    }
     let fallback = || image::imageops::resize(img, w, h, image::imageops::FilterType::Triangle);
     let alg = match filter {
         0 => fr::ResizeAlg::Nearest,

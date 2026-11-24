@@ -32,6 +32,9 @@ pub struct Config {
     pub install_offered: bool,
     /// Check GitHub for updates at each start, and when the last check ran (unix seconds).
     pub auto_update: bool,
+    /// Acrylic (frosted) background while one window is open, drawn on the processor.
+    /// Off: every window is opaque and uses the GPU, as with several windows open.
+    pub acrylic: bool,
     pub update_checked: u64,
     /// Disk thumbnail cache cap in MB; 0 turns it off.
     pub thumb_cache_mb: u64,
@@ -83,6 +86,7 @@ impl Default for Config {
             last_folder: String::new(),
             install_offered: false,
             auto_update: true,
+            acrylic: true,
             update_checked: 0,
             thumb_cache_mb: 2048,
             align_top: false,
@@ -405,6 +409,7 @@ impl Config {
             "last_folder" => self.last_folder = v.to_string(),
             "install_offered" => self.install_offered = b(v),
             "auto_update" => self.auto_update = b(v),
+            "acrylic" => self.acrylic = b(v),
             "update_checked" => self.update_checked = n().unwrap_or(0),
             "thumb_cache_mb" => self.thumb_cache_mb = n().unwrap_or(2048),
             "align_top" => self.align_top = b(v),
@@ -521,7 +526,9 @@ impl Config {
             s.push_str(&format!("key{} = {}\n", i + 1, b.format(true)));
         }
         s.push_str("; your filter presets: name|kernel|amount|radius|threshold\n");
-        s.push_str("; kernel 1 none, 2 bilinear, 3 bicubic, 4 Lanczos3, 5 Lanczos4, 6 Mitchell;\n");
+        s.push_str("; kernel 1 none, 2 bilinear, 3 bicubic, 4 Lanczos3, 5 Lanczos4, 6 Mitchell, 7 Area, 8 Parzen, 9 Bell,\n");
+        s.push_str("; 10 Cubic, 11 Notch, 12 Simon, 13 Rifman, 14 Lanczos6, 15 Kaiser, 16 Sinc, 17 Content-Aware;\n");
+        s.push_str("; a 6th field of 1 turns on Clamp Ringing;\n");
         s.push_str("; amount and radius in hundredths (60 = 0.60); threshold 0-64\n");
         for p in &self.filter_presets {
             s.push_str(&format!("filter_preset = {}\n", p.format()));
@@ -537,6 +544,9 @@ install_offered = {}
 auto_update = {}
 update_checked = {}
 ", self.auto_update as u8, self.update_checked));
+        s.push_str(&format!("; acrylic background for a single window (off: opaque, GPU)
+acrylic = {}
+", self.acrylic as u8));
         let _ = fs::write(Self::path(), s);
     }
 }

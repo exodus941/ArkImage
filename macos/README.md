@@ -44,7 +44,7 @@ macOS 11 or later on Apple Silicon.
 - One process serves every window: images open in a shared cache and are never decoded twice.
 - Preloads the next images in the direction you browse.
 - Thumbnail grid with a disk cache.
-- Filter presets: resize kernels (bilinear to Lanczos4 and Mitchell) and an adjustable sharpen.
+- Filter presets: 21 resize kernels (Nearest to Lanczos6, Mitchell, Area, Kaiser, FSR 1 EASU, EWA LanczosSharp, Scale2x and Eagle), Clamp Ringing and an adjustable sharpen.
 - Zoom to a rectangle: drag over the image, or hold the right button and drag when zoomed in.
 - Touchpad: pinch to zoom, swipe sideways with two fingers for the previous or next image.
 - Double-click the image at fit or 100% to go full screen.
@@ -60,7 +60,7 @@ You need Rust and, for HEIC and Lottie, libheif and rlottie from
 `VCPKG_ROOT` at your vcpkg folder, then build:
 
 ```bash
-vcpkg install "libheif[core,libde265]:x64-windows-static-md" rlottie:x64-windows-static-md
+vcpkg install "libheif[core,libde265,dav1d]:x64-windows-static-md" rlottie:x64-windows-static-md
 ```
 
 ```bash
@@ -96,7 +96,7 @@ cargo test
 MIT; see [LICENSE](LICENSE).
 
 libheif and libde265 are LGPL-3.0 and linked statically. ArkImage's source is open, so you
-can rebuild it against other versions of them. rlottie is MIT.
+can rebuild it against other versions of them. dav1d (AVIF decoding) is BSD-2-Clause. rlottie is MIT.
 
 ## Credits
 
@@ -104,3 +104,5 @@ can rebuild it against other versions of them. rlottie is MIT.
 - [Figtree](https://github.com/erikdkennedy/figtree) by Erik Kennedy, SIL Open Font License 1.1 (`assets/fonts/OFL-Figtree.txt`).
 - [Tabler Icons](https://github.com/tabler/tabler-icons) by Paweł Kuna, v3.52.0, MIT License (`assets/icons/LICENSE-tabler.txt`).
 - [rlottie](https://github.com/Samsung/rlottie) by Samsung, MIT License.
+- [dav1d](https://code.videolan.org/videolan/dav1d) by VideoLAN, BSD-2-Clause, through libheif.
+- The FSR 1 EASU filter follows [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR), MIT License.

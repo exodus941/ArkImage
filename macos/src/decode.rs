@@ -158,7 +158,7 @@ fn decode_frames(bytes: &[u8], ext: &str) -> Result<(Vec<Frame>, String), String
     if matches!(ext, "svg" | "svgz") {
         return Ok((single(svg(bytes)?), "SVG".into()));
     }
-    if crate::heic::is_heif(bytes) || matches!(ext, "heic" | "heif" | "hif") {
+    if crate::heic::is_heif(bytes) || matches!(ext, "heic" | "heif" | "hif" | "heics" | "heifs" | "avif" | "avifs") {
         return Ok((single(crate::heic::decode(bytes)?), "HEIF".into()));
     }
     match image::guess_format(bytes).ok() {

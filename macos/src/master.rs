@@ -133,7 +133,8 @@ impl Master {
     /// the solid colour, and the last one left fades back to glass. A new window starts
     /// in its state at once.
     fn update_glass(&mut self) {
-        let one = self.windows.len() == 1;
+        // Settings > View > Acrylic background off: opaque and on the GPU, as with two windows
+        let one = self.windows.len() == 1 && self.cfg.acrylic;
         let n = self.windows.len();
         for (i, w) in self.windows.iter_mut().enumerate() {
             w.set_glass(one, i + 1 == n && w.is_new());
@@ -162,6 +163,7 @@ impl Master {
                     w.set_config(self.cfg.clone());
                 }
             }
+            self.update_glass();
         }
     }
 

@@ -50,6 +50,8 @@ pub struct Gpu {
     sharp_v_pl: wgpu::RenderPipeline,
     sharp_bgl: wgpu::BindGroupLayout,
     resi_pl: wgpu::RenderPipeline,
+    /// res2d's filters (codes 18-21) in one pass, on resi_bgl
+    res2_pl: wgpu::RenderPipeline,
     resi_bgl: wgpu::BindGroupLayout,
     layer_bgl: wgpu::BindGroupLayout,
     comp_bgl: wgpu::BindGroupLayout,
@@ -314,6 +316,8 @@ fn resample_i(v: VOut) -> @location(0) vec4<f32> {
     let size = co[h + 1];
     let off = co[h + 2];
     var s = vec4<i32>(0);
+    var mn = vec4<i32>(255);
+    var mx = vec4<i32>(0);
     if (ri.prec > 0u) { s = vec4<i32>(1 << (ri.prec - 1u)); }
     for (var k = 0; k < size; k++) {
         let i = start + k;
@@ -323,10 +327,202 @@ fn resample_i(v: VOut) -> @location(0) vec4<f32> {
             // decode::transform's Gamma/Negative table, at `lut` in the same buffer
             px = vec4<i32>(co[ri.lut + u32(px.r)], co[ri.lut + u32(px.g)], co[ri.lut + u32(px.b)], px.a);
         }
-        s += px * co[off + k];
+        let wk = co[off + k];
+        s += px * wk;
+        if (wk != 0) {
+            mn = min(mn, px);
+            mx = max(mx, px);
+        }
     }
-    let r = clamp(s >> vec4<u32>(ri.prec), vec4<i32>(0), vec4<i32>(255));
+    var r = clamp(s >> vec4<u32>(ri.prec), vec4<i32>(0), vec4<i32>(255));
+    // Clamp Ringing: no output past the lowest and highest pixel it reads
+    if (ri.p1 == 1u && size > 0) {
+        r = clamp(r, mn, mx);
+    }
     return vec4<f32>(r) / 255.0;
+}
+
+// res2d.rs on the GPU, one pass, for codes 18 EASU, 19 EWA LanczosSharp, 20 Scale2x,
+// 21 Eagle; keep the two in step. Premultiplied while filtering, as there.
+struct R2 { mode: u32, lut: u32, clamp: u32, ow: u32, oh: u32, p0: u32, p1: u32, p2: u32 };
+@group(0) @binding(2) var<uniform> r2: R2;
+
+fn t2(x: i32, y: i32) -> vec4<f32> {
+    let d = vec2<i32>(textureDimensions(src));
+    var v = textureLoad(src, clamp(vec2<i32>(x, y), vec2<i32>(0), d - vec2<i32>(1)), 0);
+    if (r2.lut > 0u) {
+        let iv = vec3<u32>(round(v.rgb * 255.0));
+        v = vec4<f32>(f32(co[r2.lut + iv.r]) / 255.0, f32(co[r2.lut + iv.g]) / 255.0, f32(co[r2.lut + iv.b]) / 255.0, v.a);
+    }
+    return vec4<f32>(v.rgb * v.a, v.a);
+}
+// res2d::exact: the source pixel and the fraction past it, in integers so both paths
+// pick the same pixel on an edge; centred measures from pixel centres (EASU)
+fn e_exact(o: u32, inn: u32, outn: u32, centred: bool) -> vec2<f32> {
+    let num = i32((2u * o + 1u) * inn) - select(0, i32(outn), centred);
+    let den = i32(2u * outn);
+    var q = num / den;
+    var r = num - q * den;
+    if (r < 0) { q -= 1; r += den; }
+    return vec2<f32>(f32(q), f32(r) / f32(den));
+}
+fn e_luma(p: vec4<f32>) -> f32 { return 0.5 * p.b + p.g + 0.5 * p.r; }
+fn e_j1(x: f32) -> f32 {
+    let ax = abs(x);
+    if (ax < 8.0) {
+        let y = x * x;
+        let a1 = x * (72362614232.0 + y * (-7895059235.0 + y * (242396853.1 + y * (-2972611.439 + y * (15704.48260 + y * (-30.16036606))))));
+        let a2 = 144725228442.0 + y * (2300535178.0 + y * (18583304.74 + y * (99447.43394 + y * (376.9991397 + y))));
+        return a1 / a2;
+    }
+    let z = 8.0 / ax;
+    let y = z * z;
+    let xx = ax - 2.356194491;
+    let a1 = 1.0 + y * (0.183105e-2 + y * (-0.3516396496e-4 + y * (0.2457520174e-5 + y * (-0.240337019e-6))));
+    let a2 = 0.04687499995 + y * (-0.2002690873e-3 + y * (0.8449199096e-5 + y * (-0.88228987e-6 + y * 0.105787412e-6)));
+    let r = sqrt(0.636619772 / ax) * (cos(xx) * a1 - z * sin(xx) * a2);
+    return select(r, -r, x < 0.0);
+}
+fn e_jinc(x: f32) -> f32 {
+    if (abs(x) < 1e-4) { return 1.0; }
+    let p = 3.14159265 * x;
+    return 2.0 * e_j1(p) / p;
+}
+fn e_ewa_w(r: f32) -> f32 {
+    let x = r / 0.98125056;
+    if (x >= 3.2383155) { return 0.0; }
+    return e_jinc(x) * e_jinc(x * 1.2196699 / 3.2383155);
+}
+fn e_same(a: vec4<f32>, b: vec4<f32>) -> bool {
+    let d = abs(a - b);
+    return d.r + d.g + d.b + d.a <= 0.1;
+}
+// EASU's direction and length from one corner: weight w, luma up, left, centre, right, down
+fn e_set(w: f32, a: f32, b: f32, c: f32, d: f32, e: f32) -> vec3<f32> {
+    let lx0 = max(abs(d - c), abs(c - b));
+    let dx = d - b;
+    var lx = 0.0;
+    if (lx0 > 0.0) { lx = clamp(abs(dx) / lx0, 0.0, 1.0); }
+    let ly0 = max(abs(e - c), abs(c - a));
+    let dy = e - a;
+    var ly = 0.0;
+    if (ly0 > 0.0) { ly = clamp(abs(dy) / ly0, 0.0, 1.0); }
+    return vec3<f32>(dx * w, dy * w, (lx * lx + ly * ly) * w);
+}
+
+@fragment
+fn resample2d(v: VOut) -> @location(0) vec4<f32> {
+    let p = vec2<f32>(floor(v.pos.xy));
+    let d = vec2<f32>(textureDimensions(src));
+    let sc = d / vec2<f32>(f32(r2.ow), f32(r2.oh));
+    let pos = (p + 0.5) * sc;
+    var o = vec4<f32>(0.0);
+    let up = vec2<u32>(p);
+    let ud = vec2<u32>(textureDimensions(src));
+    if (r2.mode == 18u) {
+        let ex = e_exact(up.x, ud.x, r2.ow, true);
+        let ey = e_exact(up.y, ud.y, r2.oh, true);
+        let x = ex.y;
+        let y = ey.y;
+        let ix = i32(ex.x);
+        let iy = i32(ey.x);
+        var offs = array<vec2<i32>, 12>(vec2<i32>(0, -1), vec2<i32>(1, -1), vec2<i32>(-1, 0), vec2<i32>(0, 0), vec2<i32>(1, 0), vec2<i32>(2, 0), vec2<i32>(-1, 1), vec2<i32>(0, 1), vec2<i32>(1, 1), vec2<i32>(2, 1), vec2<i32>(0, 2), vec2<i32>(1, 2));
+        var t: array<vec4<f32>, 12>;
+        var l: array<f32, 12>;
+        for (var k = 0; k < 12; k++) {
+            t[k] = t2(ix + offs[k].x, iy + offs[k].y);
+            l[k] = e_luma(t[k]);
+        }
+        let s = e_set((1.0 - x) * (1.0 - y), l[0], l[2], l[3], l[4], l[7])
+            + e_set(x * (1.0 - y), l[1], l[3], l[4], l[5], l[8])
+            + e_set((1.0 - x) * y, l[3], l[6], l[7], l[8], l[10])
+            + e_set(x * y, l[4], l[7], l[8], l[9], l[11]);
+        let dr = s.x * s.x + s.y * s.y;
+        var dx = 1.0;
+        var dy = 0.0;
+        if (dr >= 1.0 / 32768.0) { dx = s.x / sqrt(dr); dy = s.y / sqrt(dr); }
+        let len = (s.z * 0.5) * (s.z * 0.5);
+        let stretch = (dx * dx + dy * dy) / max(abs(dx), abs(dy));
+        let l2 = vec2<f32>(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+        let lob = 0.5 + (1.0 / 4.0 - 0.04 - 0.5) * len;
+        let clp = 1.0 / lob;
+        var ac = vec4<f32>(0.0);
+        var aw = 0.0;
+        for (var k = 0; k < 12; k++) {
+            let off = vec2<f32>(f32(offs[k].x) - x, f32(offs[k].y) - y);
+            let vx = (off.x * dx + off.y * dy) * l2.x;
+            let vy = (off.x * -dy + off.y * dx) * l2.y;
+            let d2 = min(vx * vx + vy * vy, clp);
+            let wb0 = 2.0 / 5.0 * d2 - 1.0;
+            let wa = lob * d2 - 1.0;
+            let wb = 25.0 / 16.0 * wb0 * wb0 - (25.0 / 16.0 - 1.0);
+            let w = wb * wa * wa;
+            ac += t[k] * w;
+            aw += w;
+        }
+        let mn = min(min(t[3], t[4]), min(t[7], t[8]));
+        let mx = max(max(t[3], t[4]), max(t[7], t[8]));
+        if (aw != 0.0) { o = clamp(ac / aw, mn, mx); } else { o = t[3]; }
+    } else if (r2.mode == 19u) {
+        let f = max(sc, vec2<f32>(1.0));
+        let rad = 3.2383155 * 0.98125056 * f;
+        let x0 = i32(floor(pos.x - rad.x));
+        let x1 = i32(ceil(pos.x + rad.x));
+        let y0 = i32(floor(pos.y - rad.y));
+        let y1 = i32(ceil(pos.y + rad.y));
+        var ac = vec4<f32>(0.0);
+        var aw = 0.0;
+        var mn = vec4<f32>(1.0);
+        var mx = vec4<f32>(0.0);
+        for (var yy = y0; yy <= y1; yy++) {
+            for (var xx = x0; xx <= x1; xx++) {
+                let q = (vec2<f32>(f32(xx), f32(yy)) + 0.5 - pos) / f;
+                let w = e_ewa_w(length(q));
+                if (w == 0.0) { continue; }
+                let c = t2(xx, yy);
+                ac += c * w;
+                aw += w;
+                mn = min(mn, c);
+                mx = max(mx, c);
+            }
+        }
+        var vv = vec4<f32>(0.0);
+        if (aw != 0.0) { vv = ac / aw; }
+        if (r2.clamp == 1u) { o = clamp(vv, mn, mx); } else { o = clamp(vv, vec4<f32>(0.0), vec4<f32>(1.0)); }
+    } else {
+        let ex = e_exact(up.x, ud.x, r2.ow, false);
+        let ey = e_exact(up.y, ud.y, r2.oh, false);
+        let ix = i32(ex.x);
+        let iy = i32(ey.x);
+        let left = ex.y < 0.5;
+        let top = ey.y < 0.5;
+        let a = t2(ix - 1, iy - 1);
+        let b = t2(ix, iy - 1);
+        let c = t2(ix + 1, iy - 1);
+        let dd = t2(ix - 1, iy);
+        let e = t2(ix, iy);
+        let f = t2(ix + 1, iy);
+        let g = t2(ix - 1, iy + 1);
+        let h = t2(ix, iy + 1);
+        let i = t2(ix + 1, iy + 1);
+        o = e;
+        if (r2.mode == 21u) {
+            if (top && left && e_same(a, b) && e_same(b, dd)) { o = a; }
+            if (top && !left && e_same(b, c) && e_same(c, f)) { o = c; }
+            if (!top && left && e_same(dd, g) && e_same(g, h)) { o = g; }
+            if (!top && !left && e_same(f, i) && e_same(i, h)) { o = i; }
+        } else {
+            if (top && left && e_same(b, dd) && !e_same(b, f) && !e_same(dd, h)) { o = dd; }
+            if (top && !left && e_same(b, f) && !e_same(b, dd) && !e_same(f, h)) { o = f; }
+            if (!top && left && e_same(dd, h) && !e_same(dd, b) && !e_same(h, f)) { o = dd; }
+            if (!top && !left && e_same(h, f) && !e_same(dd, h) && !e_same(b, f)) { o = f; }
+        }
+    }
+    let a = clamp(o.a, 0.0, 1.0);
+    if (a <= 0.0) { return vec4<f32>(0.0); }
+    // the 8-bit rounding the processor does, so both paths give the same bytes
+    let rgb = round(clamp(o.rgb / a, vec3<f32>(0.0), vec3<f32>(1.0)) * 255.0) / 255.0;
+    return vec4<f32>(rgb, round(a * 255.0) / 255.0);
 }
 
 struct S { amount: f32, thr: f32, r: f32, p: f32, k: array<vec4<f32>, 5> };
@@ -552,6 +748,7 @@ impl Gpu {
             ],
         });
         let resi_pl = pipe(&resi_bgl, "resample_i", LAYER_FMT);
+        let res2_pl = pipe(&resi_bgl, "resample2d", LAYER_FMT);
         let sharp_h_pl = pipe(&tex_bgl, "sharp_h", wgpu::TextureFormat::Rgba32Float);
         let sharp_v_pl = pipe(&sharp_bgl, "sharp_v", LAYER_FMT);
         let linear = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -580,6 +777,7 @@ impl Gpu {
             sharp_v_pl,
             sharp_bgl,
             resi_pl,
+            res2_pl,
             resi_bgl,
             layer_bgl,
             comp_bgl,
@@ -780,7 +978,12 @@ fn fir_filter(code: u8) -> (fn(f64) -> f64, f64) {
 
 /// One axis's table for `resample_i`: per output pixel [start, size, offset], then the
 /// i16 weights; and the precision. Nearest (code 0) is one weight of 1 at precision 0.
-fn fir_table(in_size: u32, out_size: u32, code: u8, vertical: bool) -> (Vec<i32>, u32) {
+pub(crate) fn fir_table(in_size: u32, out_size: u32, code: u8, vertical: bool) -> (Vec<i32>, u32) {
+    // bit 7 is Clamp Ringing, read by the shader; Area enlarges as Bilinear
+    let code = match code & 0x7F {
+        7 if out_size > in_size => 1,
+        c => c,
+    };
     let n = out_size as usize;
     let mut table = vec![0i32; n * 3];
     let scale = in_size as f64 / out_size as f64;
@@ -803,7 +1006,8 @@ fn fir_table(in_size: u32, out_size: u32, code: u8, vertical: bool) -> (Vec<i32>
         table.extend(std::iter::repeat_n(1, n));
         return (table, 0);
     }
-    let (filter, support) = fir_filter(code);
+    // codes 1-6: the library's own formulas, so both paths match bit for bit
+    let (filter, support) = if code >= 7 { crate::render::kernel(code) } else { fir_filter(code) };
     let filter_scale = scale.max(1.0);
     let radius = support * filter_scale;
     let window = radius.ceil() as usize * 2 + 1;
@@ -1287,7 +1491,7 @@ impl GpuWin {
         }
         let g = self.gpu.clone();
         let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
-        let support = match q.kernel {
+        let support = match q.kernel & 0x7F {
             1 => 1.0,
             4 | 6 => 2.0,
             5 => 4.0,
@@ -1296,10 +1500,11 @@ impl GpuWin {
         let _ = support;
         let src = t.tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: 0, mip_level_count: Some(1), ..Default::default() });
         let mut enc = g.device.create_command_encoder(&Default::default());
+        let axis_code = if (18..=21).contains(&(q.kernel & 0x7F)) { 7 | (q.kernel & 0x80) } else { q.kernel };
         // the library's order for 8-bit images: vertical first, then horizontal; an axis
         // that keeps its size is skipped, as there
         let axis = |enc: &mut wgpu::CommandEncoder, from: &wgpu::TextureView, horiz: bool, in_size: u32, out_size: u32, w: u32, h: u32, lut: Option<Vec<i32>>| {
-            let (mut table, precision) = fir_table(in_size, out_size, q.kernel, !horiz);
+            let (mut table, precision) = fir_table(in_size, out_size, axis_code, !horiz);
             let lut_at = match lut {
                 Some(t) => {
                     let at = table.len() as u32;
@@ -1316,7 +1521,8 @@ impl GpuWin {
                 mapped_at_creation: false,
             });
             g.queue.write_buffer(&sb, 0, &bytes);
-            let u = g.uniform(&[horiz as u32, precision, lut_at, 0].iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>());
+            let clamp = (q.kernel & 0x80 != 0) as u32;
+            let u = g.uniform(&[horiz as u32, precision, lut_at, clamp].iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>());
             let dst = g.texture(w, h, 1, LAYER_FMT, usage);
             let dv = dst.create_view(&Default::default());
             let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1337,13 +1543,24 @@ impl GpuWin {
         let (uw, uh) = if q.xf.swaps() { (q.h, q.w) } else { (q.w, q.h) };
         let lut = q.xf.toned().then(|| q.xf.lut());
         let first_horiz = q.xf.swaps();
-        let (n1, n2) = if first_horiz { ((t.w, uw), (t.h, uh)) } else { ((t.h, uh), (t.w, uw)) };
+        // res2d's filters: one 2D pass. EASU and the pixel rules shrink as Area; EWA past
+        // 2x reduction gets an Area pass to twice the target first (as res2d::resize)
+        let mode = q.kernel & 0x7F;
+        let two_d = (18..=21).contains(&mode) && (mode == 19 || (uw >= t.w && uh >= t.h));
+        let (aw, ah) = if !two_d {
+            (uw, uh)
+        } else if mode == 19 && (t.w > 2 * uw || t.h > 2 * uh) {
+            ((2 * uw).min(t.w), (2 * uh).min(t.h))
+        } else {
+            (t.w, t.h)
+        };
+        let (n1, n2) = if first_horiz { ((t.w, aw), (t.h, ah)) } else { ((t.h, ah), (t.w, aw)) };
         let (mut cur_v, mut cur_w, mut cur_h) = (None::<(wgpu::Texture, wgpu::TextureView)>, t.w, t.h);
         let mut lut_left = lut;
         for (k, (in_size, out_size)) in [n1, n2].into_iter().enumerate() {
             let horiz = (k == 0) == first_horiz;
             // an axis that keeps its size is skipped, unless the tone table must still run
-            if in_size == out_size && lut_left.is_none() {
+            if in_size == out_size && (lut_left.is_none() || two_d) {
                 continue;
             }
             let (w, h) = if horiz { (out_size, cur_h) } else { (cur_w, out_size) };
@@ -1352,6 +1569,35 @@ impl GpuWin {
             cur_w = w;
             cur_h = h;
             cur_v = Some(next);
+        }
+        if two_d {
+            let from = cur_v.as_ref().map(|c| &c.1).unwrap_or(&src);
+            let mut table: Vec<i32> = vec![0];
+            let lut_at = match lut_left.take() {
+                Some(lt) => {
+                    table.extend(lt);
+                    1u32
+                }
+                None => 0,
+            };
+            let bytes: Vec<u8> = table.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let sb = g.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes.len() as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            g.queue.write_buffer(&sb, 0, &bytes);
+            let clamp = (q.kernel & 0x80 != 0) as u32;
+            let u = g.uniform(&[mode as u32, lut_at, clamp, uw, uh, 0, 0, 0].iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>());
+            let dst = g.texture(uw, uh, 1, LAYER_FMT, usage);
+            let dv = dst.create_view(&Default::default());
+            let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &g.resi_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(from) },
+                    wgpu::BindGroupEntry { binding: 1, resource: sb.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: u.as_entire_binding() },
+                ],
+            });
+            g.pass(&mut enc, &g.res2_pl, &bg, &dv);
+            cur_v = Some((dst, dv));
         }
         let (out, out_v) = cur_v.unwrap_or_else(|| {
             let d = g.texture(uw, uh, 1, LAYER_FMT, usage | wgpu::TextureUsages::COPY_DST);
