@@ -14,7 +14,7 @@ use crate::text::Text;
 
 #[path = "settings_draw.rs"]
 mod drawing;
-use drawing::{draw, DrawState};
+use drawing::{draw, dropdown, DrawState};
 
 pub const W: f64 = 880.0;
 pub const H: f64 = 600.0;
@@ -39,6 +39,9 @@ pub enum BoolF {
     SortDesc,
     AutoUpdate,
     Gpu,
+    /// Clamp Ringing of the selected filter preset.
+    Clamp,
+    Acrylic,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -97,7 +100,13 @@ impl BoolF {
             BoolF::SortDesc => c.sort_desc,
             BoolF::AutoUpdate => c.auto_update,
             BoolF::Gpu => c.gpu,
+            BoolF::Clamp => crate::filters::get(&c.filter_presets, c.filter).clamp,
+            BoolF::Acrylic => c.acrylic,
         }
+    }
+    /// False for a switch the user may not change now (a built-in preset's Clamp Ringing).
+    pub fn editable(self, c: &Config) -> bool {
+        self != BoolF::Clamp || !preset_locked(c)
     }
     pub fn toggle(self, c: &mut Config) {
         let v = !self.get(c);
@@ -115,6 +124,12 @@ impl BoolF {
             BoolF::SortDesc => c.sort_desc = v,
             BoolF::AutoUpdate => c.auto_update = v,
             BoolF::Gpu => c.gpu = v,
+            BoolF::Acrylic => c.acrylic = v,
+            BoolF::Clamp => {
+                if let Some(p) = user_preset(c) {
+                    p.clamp = v;
+                }
+            }
         }
     }
 }
@@ -133,6 +148,13 @@ impl ChoiceF {
             ChoiceF::Sort => s(&["Name", "Date modified", "Size", "Type"]),
             // index 0 ("Interpolation setting") is not offered: the list starts at 1
             ChoiceF::Kernel => s(&crate::filters::KERNELS[1..]),
+        }
+    }
+    /// The hover description of option `i`, if this list has them (the resize kernels).
+    pub fn info(self, i: usize) -> Option<&'static str> {
+        match self {
+            ChoiceF::Kernel => crate::filters::KERNEL_INFO.get(i + 1).copied().filter(|s| !s.is_empty()),
+            _ => None,
         }
     }
     pub fn get(self, c: &Config) -> u8 {
@@ -327,6 +349,7 @@ fn page(i: usize) -> Vec<Ctl> {
             Check("Keep the bottom control bar visible (Lock, hotkey ~)", BoolF::LockBottom),
             Check("Show the top of the image if the image is bigger than window", BoolF::AlignTop),
             Check("Stretch Small Images", BoolF::StretchSmall),
+            Check("Acrylic background (if supported) for single instances", BoolF::Acrylic),
             Gap,
             Choice("Default view:", ChoiceF::ViewMode),
             Swatches("Background Color:"),
@@ -348,6 +371,7 @@ fn page(i: usize) -> Vec<Ctl> {
             Num("Sharpen amount:", NumF::Amount),
             Num("Sharpen radius:", NumF::Radius),
             Num("Sharpen threshold:", NumF::Threshold),
+            Check("Clamp ringing (no halos from sharp kernels)", BoolF::Clamp),
             Gap,
             Note("Built-in presets are read-only. Make a copy to change one."),
             Note("Click a name or a value to type it. Enter or a click elsewhere keeps it; Esc undoes."),
@@ -388,6 +412,37 @@ pub struct Hit {
     pub act: Act,
 }
 
+/// An open dropdown, drawn by ArkImage (not the system menu) so each option can show a
+/// description on hover. Physical px.
+pub struct Drop {
+    pub f: ChoiceF,
+    /// The choice box: left, bottom edge, width, and its top (to open upwards).
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub top: f32,
+    /// First option shown (the list scrolls by whole rows), and the hovered option.
+    pub first: usize,
+    pub hover: Option<usize>,
+    /// The option hovered before, whose tooltip fades out, and when the hover changed.
+    pub old: Option<usize>,
+    pub hover_at: std::time::Instant,
+    /// As last drawn: each shown option (index, x0, y0, x1, y1), the list's rectangle and
+    /// how many rows fit.
+    pub rows: Vec<(usize, f32, f32, f32, f32)>,
+    pub rect: (f32, f32, f32, f32),
+    pub fit: usize,
+    /// The scroll bar as last drawn: its grab area (x0, x1), track (top, height), handle
+    /// (top, height); None when nothing scrolls. Hovered, and the drag's grab offset.
+    pub bar: Option<(f32, f32, f32, f32, f32, f32)>,
+    pub bar_hot: bool,
+    pub bar_drag: Option<f32>,
+    /// When it opened, and when it began to close: the list fades in and out over 125 ms.
+    /// A closing list takes no input and is dropped once faded.
+    pub opened_at: std::time::Instant,
+    pub closing: Option<std::time::Instant>,
+}
+
 pub struct Dialog {
     pub window: Arc<Window>,
     _ctx: softbuffer::Context<Arc<Window>>,
@@ -421,6 +476,8 @@ pub struct Dialog {
     upd_prev: Upd,
     upd_at: std::time::Instant,
     hits: Vec<Hit>,
+    /// The open dropdown, if any.
+    pub drop: Option<Drop>,
 }
 
 /// What the Version row in Settings > General shows.
@@ -453,7 +510,7 @@ impl Dialog {
     pub fn new(window: Arc<Window>, snapshot: Config, tab: usize) -> Option<Self> {
         let ctx = softbuffer::Context::new(window.clone()).ok()?;
         let surface = softbuffer::Surface::new(&ctx, window.clone()).ok()?;
-        Some(Self { window, _ctx: ctx, surface, tab, snapshot, cursor: (0.0, 0.0), hover: None, hover_fx: Vec::new(), hover_at: std::time::Instant::now(), capturing: None, renaming: false, num_edit: None, scroll: 0.0, scroll_max: 0.0, mica: false, card: None, card_hits: Vec::new(), card_hover: None, card_at: None, upd: Upd::Idle, upd_prev: Upd::Idle, upd_at: std::time::Instant::now(), hits: Vec::new() })
+        Some(Self { window, _ctx: ctx, surface, tab, snapshot, cursor: (0.0, 0.0), hover: None, hover_fx: Vec::new(), hover_at: std::time::Instant::now(), capturing: None, renaming: false, num_edit: None, scroll: 0.0, scroll_max: 0.0, mica: false, card: None, card_hits: Vec::new(), card_hover: None, card_at: None, upd: Upd::Idle, upd_prev: Upd::Idle, upd_at: std::time::Instant::now(), hits: Vec::new(), drop: None })
     }
 
     /// Scroll the page by `dy` design px.
@@ -519,6 +576,31 @@ impl Dialog {
         let mut text = text;
         self.scroll_max = draw(&mut c, text.as_deref_mut(), cfg, &st, sf, &mut hits);
         self.scroll = self.scroll.min(self.scroll_max);
+        if self.drop.as_ref().and_then(|d| d.closing).is_some_and(|t| t.elapsed().as_secs_f32() >= 0.125) {
+            self.drop = None;
+        }
+        if let (Some(d), Some(t)) = (self.drop.as_mut(), text.as_deref_mut()) {
+            // the list and its tooltips, mixed with what they cover at the list's fade
+            let a = match d.closing {
+                Some(at) => 1.0 - at.elapsed().as_secs_f32() / 0.125,
+                None => d.opened_at.elapsed().as_secs_f32() / 0.125,
+            }
+            .clamp(0.0, 1.0);
+            let under = (a < 1.0).then(|| c.buf.to_vec());
+            let moving = dropdown(&mut c, t, cfg, d, sf);
+            if let Some(under) = under {
+                let m = (a * 255.0) as u32;
+                for (p, u0) in c.buf.iter_mut().zip(under) {
+                    if *p != u0 {
+                        *p = crate::render::mix(u0, *p, m);
+                    }
+                }
+            }
+            if moving || a < 1.0 || d.closing.is_some() {
+                self.window.request_redraw();
+            }
+        }
+
         if let (Some(card), Some(t)) = (&self.card, text) {
             let (title, body, buttons) = card.content();
             let at = *self.card_at.get_or_insert_with(std::time::Instant::now);
@@ -541,3 +623,26 @@ impl Dialog {
     }
 }
 
+
+impl Drop {
+    /// The cursor is in the scroll bar's grab area.
+    pub fn on_bar(&self, x: f32, y: f32) -> bool {
+        self.bar.is_some_and(|(x0, x1, tt, th, _, _)| x >= x0 && x < x1 && y >= tt && y < tt + th)
+    }
+    /// Scroll so the handle's top is at `top`; `n` options.
+    pub fn drag_to(&mut self, top: f32, n: usize) {
+        if let Some((_, _, tt, th, _, bh)) = self.bar {
+            let room = (th - bh).max(1.0);
+            let max = n.saturating_sub(self.fit);
+            self.first = (((top - tt) / room).clamp(0.0, 1.0) * max as f32).round() as usize;
+        }
+    }
+    /// Hover option `h`: the old tooltip fades out as the new one fades in.
+    pub fn set_hover(&mut self, h: Option<usize>) {
+        if h != self.hover {
+            self.old = self.hover;
+            self.hover = h;
+            self.hover_at = std::time::Instant::now();
+        }
+    }
+}

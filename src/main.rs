@@ -32,6 +32,7 @@ mod picker;
 mod popup_win;
 mod psd_fast;
 mod render;
+mod res2d;
 mod reveal;
 mod settings;
 mod source;

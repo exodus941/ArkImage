@@ -12,7 +12,7 @@ use std::{
 
 pub const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "webp", "bmp", "dib", "tif", "tiff",
-    "tga", "dds", "ico", "pnm", "pbm", "pgm", "ppm", "pam", "hdr", "exr", "qoi", "psd", "psb", "heic", "heif", "hif",
+    "tga", "dds", "ico", "pnm", "pbm", "pgm", "ppm", "pam", "hdr", "exr", "qoi", "psd", "psb", "heic", "heif", "hif", "avif", "heics", "heifs", "avifs",
     "svg", "svgz", "lottie", "json",
 ];
 /// Extensions the app opens but never registers for: other programs own them.
@@ -395,6 +395,19 @@ static KEEP: Mutex<Vec<Arc<Vec<Entry>>>> = Mutex::new(Vec::new());
 
 /// As `remove`, from another thread: the new list stays alive until the master hands it
 /// to the windows (send `UserEvent::Polled`).
+/// `remove` for many entries at once: one new list, however many go.
+pub fn remove_many(dir: &Path, gone: &std::collections::HashSet<Entry>) -> Option<Arc<Vec<Entry>>> {
+    let slot = slot(dir);
+    let mut s = slot.lock().unwrap();
+    let l = s.list.upgrade()?;
+    let l = Arc::new(l.iter().filter(|x| !gone.contains(*x)).cloned().collect::<Vec<_>>());
+    s.gen += 1;
+    s.pos = Arc::new(build_pos(&l));
+    s.list = Arc::downgrade(&l);
+    CHANGED.lock().unwrap().push(dir.to_path_buf());
+    Some(l)
+}
+
 pub fn remove_polled(dir: &Path, e: &Entry) {
     if let Some(l) = remove(dir, e) {
         KEEP.lock().unwrap().push(l);
@@ -581,6 +594,31 @@ pub fn sibling(container: &Path, forward: bool, sort: u8, desc: bool, archives: 
         }
     }
     None
+}
+
+#[cfg(test)]
+mod index_tests {
+    /// Every extension the image library reads is in the folder index. AVIF opened from
+    /// Explorer but was left out of the list, so it never showed in the grid or on the
+    /// arrow keys.
+    #[test]
+    fn index_lists_every_readable_extension() {
+        let mut missing = Vec::new();
+        for f in image::ImageFormat::all().filter(|f| f.reading_enabled()) {
+            for e in f.extensions_str() {
+                if !super::IMAGE_EXTS.contains(e) {
+                    missing.push(format!("{f:?}: {e}"));
+                }
+            }
+        }
+        // decoded outside the image library: HEIF and AVIF (libheif), PSD, SVG, Lottie
+        for e in ["avif", "avifs", "heic", "heics", "heif", "heifs", "hif", "psd", "psb", "svg", "svgz", "lottie", "json"] {
+            if !super::IMAGE_EXTS.contains(&e) {
+                missing.push(e.to_string());
+            }
+        }
+        assert!(missing.is_empty(), "readable but not indexed: {missing:?}");
+    }
 }
 
 #[cfg(test)]

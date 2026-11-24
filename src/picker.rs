@@ -36,6 +36,39 @@ const BOTTOM: f32 = 16.0;
 /// Close button: a 32 px square, 10 px from the panel's top and right edges, centred on the header.
 const CLOSE: f32 = 32.0;
 const CLOSE_INSET: f32 = 10.0;
+/// Multi-select: a 20 px checkbox 12 px inside the cell's top-left corner, clicked within
+/// a 32 px square around it; the bottom strip is as tall as the header.
+const CHECK: f32 = 20.0;
+const CHECK_INSET: f32 = 12.0;
+const CHECK_HIT: f32 = 32.0;
+const STRIP: f32 = 52.0;
+/// Strip buttons: 32 px tall, 12 px side padding, 8 px apart, a 16 px icon 8 px before the label.
+const BTN_H: f32 = 32.0;
+const BTN_PAD: f32 = 12.0;
+const BTN_GAP: f32 = 8.0;
+const BTN_ICON: f32 = 16.0;
+/// Strip buttons: id, label, icon. The three file actions are off with nothing chosen.
+pub const STRIP_BTNS: [(&str, &str, Option<crate::icons::Icon>); 5] = [
+    ("ms_all", "Select All", Some(crate::icons::Icon::SelectAll)),
+    ("ms_none", "Unselect All", Some(crate::icons::Icon::Deselect)),
+    ("ms_move", "Move to...", Some(crate::icons::Icon::FolderOpen)),
+    ("ms_copy", "Copy to...", Some(crate::icons::Icon::Copy)),
+    ("ms_delete", "Delete", Some(crate::icons::Icon::Trash)),
+];
+
+/// 340071 as "340,071", as the page label writes counts.
+fn grouped(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Thumbnails kept in memory (160 px RGBA is about 100 KB each).
 const CACHE_MAX: usize = 900;
 
@@ -146,6 +179,15 @@ pub struct Picker {
     pub bar_hot_at: Option<std::time::Instant>,
     /// True while the handle's colour is still fading: the window keeps drawing.
     pub bar_anim: bool,
+    /// Multi-select mode: a cell click toggles it, and the bottom strip shows.
+    pub multi: bool,
+    /// The chosen images.
+    pub chosen: HashSet<Entry>,
+    /// The cursor is on the hovered cell's checkbox.
+    pub check_hover: bool,
+    /// Strip button under the cursor, and the buttons as last drawn (id, x0, y0, x1, y1).
+    pub strip_hover: Option<&'static str>,
+    pub strip_hits: Vec<(&'static str, f32, f32, f32, f32)>,
 }
 
 /// Scroll handle, a slim column scrollbar: a 4 px
@@ -217,7 +259,24 @@ impl Picker {
         let cols = (((pw - 2.0 * SIDE * sf) / cw).floor() as usize).max(1);
         let x0 = (px + (pw - cols as f32 * cw) / 2.0).round();
         let top = py + TOP * sf;
-        Grid { cols, cw, ch, x0, top, view_h: (py + ph - BOTTOM * sf - top).max(1.0) }
+        // multi-select: the strip takes the bottom padding's place
+        let bottom = if self.multi { STRIP } else { BOTTOM };
+        Grid { cols, cw, ch, x0, top, view_h: (py + ph - bottom * sf - top).max(1.0) }
+    }
+
+    /// Checkbox of cell `i` (x, y, size), and its click area (x0, y0, x1, y1).
+    pub fn check_rect(&self, g: &Grid, i: usize, sf: f32) -> ((f32, f32, f32), (f32, f32, f32, f32)) {
+        let cx = g.x0 + (i % g.cols) as f32 * g.cw;
+        let cy = g.top + (i / g.cols) as f32 * g.ch - self.scroll;
+        let (x, y, s) = ((cx + CHECK_INSET * sf).round(), (cy + CHECK_INSET * sf).round(), (CHECK * sf).round());
+        let o = ((CHECK_HIT - CHECK) / 2.0 * sf).round();
+        ((x, y, s), (x - o, y - o, x + s + o, y + s + o))
+    }
+
+    /// The cursor at (x, y) is on cell `i`'s checkbox.
+    pub fn on_check(&self, g: &Grid, i: usize, x: f32, y: f32, sf: f32) -> bool {
+        let (_, (x0, y0, x1, y1)) = self.check_rect(g, i, sf);
+        x >= x0 && x < x1 && y >= y0 && y < y1
     }
 
     /// The scroll handle for `n` entries in a w x h window; None when nothing scrolls.
@@ -337,9 +396,11 @@ impl Picker {
             let cx = g.x0 + col as f32 * g.cw;
             let cy = g.top + row as f32 * g.ch - self.scroll;
             let (bx, by, bs) = (cx + (g.cw - THUMB * sf) / 2.0, cy + 8.0 * sf, THUMB * sf);
-            // cell background and selection
-            let sel = i == self.sel;
-            if sel || self.hover == Some(i) {
+            // cell background and selection; in multi-select the chosen cells take the
+            // selection colour and the keyboard cursor the hover grey
+            let chosen = self.multi && self.chosen.contains(e);
+            let sel = if self.multi { chosen } else { i == self.sel };
+            if sel || self.hover == Some(i) || (self.multi && i == self.sel) {
                 let col = if sel { 0x2B6CB0 } else { 0x3A3A3A };
                 c.fill_rrect(cx + 4.0 * sf, cy + 4.0 * sf, g.cw - 8.0 * sf, g.ch - 8.0 * sf, 8.0 * sf, col, if sel { 0.55 } else { 0.6 });
             }
@@ -375,6 +436,20 @@ impl Picker {
                 None => {
                     let col = if self.failed.contains(e) { 0x4A2020 } else { 0x262626 };
                     c.fill_rrect(bx + 12.0 * sf, by + 12.0 * sf, bs - 24.0 * sf, bs - 24.0 * sf, 4.0 * sf, col, 1.0);
+                }
+            }
+            // checkbox: on the hovered cell, and on every cell in multi-select. Clear: a
+            // dark plate with a light 2 px outline; chosen: the accent fill and a Tabler check.
+            if self.multi || self.hover == Some(i) {
+                let ((kx, ky, ks), _) = self.check_rect(&g, i, sf);
+                let r = (4.0 * sf).round();
+                if chosen {
+                    c.fill_rrect(kx, ky, ks, ks, r, crate::ui::ACCENT_FILL, 1.0);
+                    crate::icons::draw(c, crate::icons::Icon::Check, kx + ks / 2.0, ky + ks / 2.0, (16.0 * sf).round(), 0xFFFFFF);
+                } else {
+                    let hot = self.hover == Some(i) && self.check_hover;
+                    c.fill_rrect(kx, ky, ks, ks, r, 0x101010, 0.72);
+                    c.stroke_rrect(kx, ky, ks, ks, r, (2.0 * sf).round(), if hot { 0xFFFFFF } else { 0xC8C8C8 }, 1.0);
                 }
             }
             if let Some(t) = t.as_deref_mut() {
@@ -458,6 +533,55 @@ impl Picker {
             let hw = t.width(hint, hpx);
             // 16 px clear of the close button
             t.draw_base(c, (x0 - 16.0 * sf - hw).round(), base, hint, hpx, 0x9A9A9A);
+            t.face(prev);
+        }
+        // multi-select strip: the header's mirror along the panel's bottom edge, a hairline
+        // above it, the count on the title's side and the buttons on the close button's side
+        self.strip_hits.clear();
+        if let (true, Some(t)) = (self.multi, t.as_deref_mut()) {
+            let sy = py + ph - STRIP * sf;
+            c.rect_alpha(px as i32, sy as i32, pw as i32, sf.max(1.0) as i32, 0xFFFFFF, 20);
+            let smid = sy + STRIP * sf / 2.0;
+            let prev = t.face(Face::Regular);
+            let fpx = 14.0 * sf;
+            let base = (smid + t.cap_height(fpx) / 2.0).round();
+            let count = format!("{} of {} images selected", grouped(self.chosen.len()), grouped(n));
+            t.draw_base(c, (px + SIDE * sf).round(), base, &count, fpx, 0xF0F0F0);
+            let bpx = 12.0 * sf;
+            let bbase = (smid + t.cap_height(bpx) / 2.0).round();
+            let (bh, pad, gap, isz) = ((BTN_H * sf).round(), (BTN_PAD * sf).round(), (BTN_GAP * sf).round(), (BTN_ICON * sf).round());
+            let widths: Vec<f32> = STRIP_BTNS
+                .iter()
+                // width rounded up to the 4 px grid
+                .map(|(_, l, ic)| ((t.width(l, bpx) + 2.0 * pad + if ic.is_some() { isz + gap } else { 0.0 }) / (4.0 * sf)).ceil() * 4.0 * sf)
+                .collect();
+            let total = widths.iter().sum::<f32>() + gap * (widths.len() - 1) as f32;
+            // the buttons end where the close button ends above them
+            let (_, _, cx1, _) = close_rect(c.w as f32, c.h as f32, sf);
+            let mut bx = (cx1 - total).round();
+            let by = (smid - bh / 2.0).round();
+            for ((id, label, icon), w) in STRIP_BTNS.iter().zip(widths) {
+                let on = self.chosen.len() > 0 || matches!(*id, "ms_all" | "ms_none");
+                let hot = on && self.strip_hover == Some(*id);
+                c.fill_rrect(bx, by, w, bh, 8.0 * sf, 0xFFFFFF, if hot { 0.12 } else { 0.06 });
+                let col = if !on {
+                    0x5A5A5A
+                } else if *id == "ms_delete" {
+                    crate::ui::ROSE400
+                } else if hot {
+                    0xFFFFFF
+                } else {
+                    0xC8C8C8
+                };
+                let mut lx = bx + pad;
+                if let Some(ic) = icon {
+                    crate::icons::draw(c, *ic, lx + isz / 2.0, smid, isz, col);
+                    lx += isz + gap;
+                }
+                t.draw_base(c, lx.round(), bbase, label, bpx, col);
+                self.strip_hits.push((id, bx, by, bx + w, by + bh));
+                bx += w + gap;
+            }
             t.face(prev);
         }
         // scrollbar: rounded on the inner side only. Drawn twice as wide with its radius,

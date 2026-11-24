@@ -253,7 +253,10 @@ fn acrylic(w: &Window, on: bool, bg: u32) -> bool {
     // flags 0: no system tint. Its tint darkened far past its alpha (a 33% grey tint
     // gave #1A310C over lime); the 33% grey is drawn in our own pixels instead.
     let _ = bg;
-    let acc = Accent { state: if on { 4 } else { 0 }, flags: 0, color: 0, anim: 0 };
+    // Windows 10 (this path; Windows 11 takes `backdrop` above) draws no blur at all when
+    // the tint's alpha is 0: a Windows 10 user saw the desktop sharp behind the grey. A
+    // black tint at alpha 1/255 (flags 2 applies it) keeps the blur and adds no visible tint.
+    let acc = Accent { state: if on { 4 } else { 0 }, flags: 2, color: 0x0100_0000, anim: 0 };
     let d = Data { attr: 19, data: &acc, size: std::mem::size_of::<Accent>() };
     unsafe { set(h.hwnd.get(), &d) != 0 }
 }
@@ -2339,12 +2342,13 @@ impl App {
         let mut presets = crate::filters::builtins();
         presets.append(&mut user);
         // every kernel, with and without sharpening
-        for k in 2..=6u8 {
-            presets.push(crate::filters::Preset { name: format!("kernel {k}"), kernel: k, amount: 0, radius: 100, threshold: 0 });
-            presets.push(crate::filters::Preset { name: format!("kernel {k} sharp"), kernel: k, amount: 150, radius: 150, threshold: 3 });
+        for k in 2..=21u8 {
+            presets.push(crate::filters::Preset { name: format!("kernel {k}"), kernel: k, amount: 0, radius: 100, threshold: 0, clamp: false });
+            presets.push(crate::filters::Preset { name: format!("kernel {k} sharp"), kernel: k, amount: 150, radius: 150, threshold: 3, clamp: false });
+            presets.push(crate::filters::Preset { name: format!("kernel {k} clamp"), kernel: k, amount: 0, radius: 100, threshold: 0, clamp: true });
         }
         let interp = self.cfg.interp;
-        for z in [0.29f64, 0.5, 0.11] {
+        for z in [0.29f64, 0.5, 0.11, 1.7] {
             let (sw, sh) = (((bw as f64 * z).round() as u32).max(1), ((bh as f64 * z).round() as u32).max(1));
             for (i, p) in presets.iter().enumerate() {
                 let t0 = Instant::now();
@@ -2786,7 +2790,7 @@ impl App {
             self.gpu_img = Some((l.ox + dx_new, l.oy, l.z, smooth));
             // settled: the full-quality shrink (and sharpening), as the processor does it
             let preset = self.preset();
-            let up_sharp = preset.amount > 0 && preset.smooth() && l.z <= 4.0 && l.sw * l.sh <= 40e6;
+            let up_sharp = (preset.amount > 0 || preset.enlarges(self.cfg.interp)) && preset.smooth() && l.z <= 4.0 && l.sw * l.sh <= 40e6;
             // a playing animation draws its frames from their mipmaps: the full-quality
             // shrink for every frame cost 38% CPU on a 30 fps Lottie
             let playing = self.next_frame_at.is_some();
@@ -2839,7 +2843,7 @@ impl App {
             } else {
             // Enlarged images go through the resize path too when the preset sharpens,
             // up to 4x and 40 MP; past that, per-pixel sampling (no sharpening).
-            let up_sharp = preset.amount > 0 && preset.smooth() && l.z <= 4.0 && l.sw * l.sh <= 40e6;
+            let up_sharp = (preset.amount > 0 || preset.enlarges(self.cfg.interp)) && preset.smooth() && l.z <= 4.0 && l.sw * l.sh <= 40e6;
             if self.pinch_at.is_none() && (l.z < 0.999 || (l.z > 1.001 && up_sharp)) {
                 let sw = (l.sw.round() as u32).max(1);
                 let sh = (l.sh.round() as u32).max(1);
@@ -3818,7 +3822,9 @@ impl App {
 
     /// For the ARKIMAGE_TEST_SETTINGS hook.
     pub fn test_open_settings(&mut self, el: &ActiveEventLoop) {
-        self.open_settings(el, 0);
+        // ARKIMAGE_TEST_SETTINGS=<n> opens tab n (a value that is not a number: General)
+        let tab = std::env::var("ARKIMAGE_TEST_SETTINGS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(settings::TABS.len() - 1);
+        self.open_settings(el, tab);
     }
 
     /// For the ARKIMAGE_TEST_CHOICE hook: open the first dropdown in Settings.
@@ -3919,6 +3925,114 @@ impl App {
                 }
                 WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } | WindowEvent::KeyboardInput { .. } => return,
                 _ => {}
+            }
+        }
+        // an open dropdown takes the mouse and keyboard: a click on an option picks it, a
+        // click anywhere else, Esc or a right click closes it
+        if self.settings.as_ref().is_some_and(|s| s.drop.as_ref().is_some_and(|d| d.closing.is_none())) {
+            let mut pick = None;
+            let mut close = false;
+            if let Some(s) = self.settings.as_mut() {
+                let Some(d) = s.drop.as_mut() else { return };
+                let n = d.f.options(&self.cfg).len();
+                let row_at = |d: &settings::Drop, x: f32, y: f32| d.rows.iter().find(|r| x >= r.1 && x < r.3 && y >= r.2 && y < r.4).map(|r| r.0);
+                match &ev {
+                    WindowEvent::CursorMoved { position, .. } => {
+                        s.cursor = (position.x as f32, position.y as f32);
+                        // dragging the scroll bar: keep the grab point under the cursor
+                        if let Some(g) = d.bar_drag {
+                            d.drag_to(s.cursor.1 - g, n);
+                            s.window.request_redraw();
+                            return;
+                        }
+                        let hot = d.on_bar(s.cursor.0, s.cursor.1);
+                        if hot != d.bar_hot {
+                            d.bar_hot = hot;
+                            s.window.request_redraw();
+                        }
+                        if hot {
+                            return;
+                        }
+                        let h = row_at(d, s.cursor.0, s.cursor.1);
+                        if h.is_some() && h != d.hover {
+                            d.set_hover(h);
+                            s.window.request_redraw();
+                        }
+                        return;
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        let rows = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => -y.round() as i64 * 3,
+                            MouseScrollDelta::PixelDelta(p) => -(p.y / 32.0).round() as i64,
+                        };
+                        d.first = (d.first as i64 + rows).clamp(0, n.saturating_sub(d.fit) as i64) as usize;
+                        s.window.request_redraw();
+                        return;
+                    }
+                    // the scroll bar: grab the handle where pressed, or centre it on a track click
+                    WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } if d.on_bar(s.cursor.0, s.cursor.1) => {
+                        let (y, (_, _, _, _, by, bh)) = (s.cursor.1, d.bar.unwrap_or_default());
+                        let g = if y >= by && y < by + bh { y - by } else { bh / 2.0 };
+                        d.drag_to(y - g, n);
+                        d.bar_drag = Some(g);
+                        s.window.request_redraw();
+                        return;
+                    }
+                    WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                        if d.bar_drag.take().is_some() {
+                            s.window.request_redraw();
+                        }
+                        return;
+                    }
+                    WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => match row_at(d, s.cursor.0, s.cursor.1) {
+                        Some(i) => pick = Some((d.f, i)),
+                        None => close = true,
+                    },
+                    WindowEvent::MouseInput { state: ElementState::Pressed, .. } => close = true,
+                    WindowEvent::MouseInput { .. } => return,
+                    WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                        let h = d.hover.unwrap_or(0);
+                        match event.physical_key {
+                            PhysicalKey::Code(KeyCode::Escape) => close = true,
+                            PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) => pick = Some((d.f, h)),
+                            PhysicalKey::Code(KeyCode::ArrowDown) | PhysicalKey::Code(KeyCode::ArrowUp) => {
+                                let down = event.physical_key == PhysicalKey::Code(KeyCode::ArrowDown);
+                                let h = if down { (h + 1).min(n - 1) } else { h.saturating_sub(1) };
+                                d.set_hover(Some(h));
+                                // keep it in view
+                                if h < d.first {
+                                    d.first = h;
+                                } else if d.fit > 0 && h >= d.first + d.fit {
+                                    d.first = h + 1 - d.fit;
+                                }
+                                s.window.request_redraw();
+                            }
+                            _ => {}
+                        }
+                        if pick.is_none() && !close {
+                            return;
+                        }
+                    }
+                    WindowEvent::KeyboardInput { .. } => return,
+                    _ => {}
+                }
+                if pick.is_some() || close {
+                    // fades out over 125 ms, then render drops it
+                    if let Some(d) = s.drop.as_mut() {
+                        d.closing = Some(Instant::now());
+                    }
+                    s.hover = s.hit(s.cursor.0, s.cursor.1);
+                    s.window.request_redraw();
+                }
+            }
+            if let Some((f, i)) = pick {
+                let before = self.cfg.clone();
+                f.set(&mut self.cfg, i as u8);
+                self.apply_settings(&before);
+                self.settings_redraw();
+            }
+            if pick.is_some() || close {
+                return;
             }
         }
         match ev {
@@ -4109,19 +4223,15 @@ impl App {
             Act::Swatch(c) => self.cfg.bg_color = c,
             Act::Clear(f) => f.set(&mut self.cfg, String::new()),
             Act::Choice(f) => {
-                let Some((x, y, w)) = self.settings.as_ref().and_then(|s| s.anchor(a).map(|(x, y, bw)| (x, y, bw, s.window.clone()))).map(|(x, y, bw, w)| {
-                    self.below_w = Some(bw as f64);
-                    (x, y, w)
-                }) else { return };
-                let cur = f.get(&self.cfg);
-                let items = f
-                    .options(&self.cfg)
-                    .iter()
-                    .enumerate()
-                    .map(|(i, o)| MenuEntry::Check(format!("cfgopt:{i}"), o.to_string(), "", i as u8 == cur))
-                    .collect();
-                self.pending_choice = Some(f);
-                self.popup(el, &w, items, x, y, &format!("{a:?}"));
+                // ArkImage's own dropdown (settings::Drop), so an option can describe itself
+                // on hover; the current option starts in view
+                let cur = f.get(&self.cfg) as usize;
+                if let Some(s) = self.settings.as_mut() {
+                    let Some((x, y, w)) = s.anchor(a) else { return };
+                    let top = y - (32.0 * s.window.scale_factor()) as f32;
+                    s.drop = Some(settings::Drop { f, x, y, w, top, first: cur.saturating_sub(3), hover: Some(cur), old: None, hover_at: Instant::now(), rows: Vec::new(), rect: (0.0, 0.0, 0.0, 0.0), fit: 0, bar: None, bar_hot: false, bar_drag: None, opened_at: Instant::now(), closing: None });
+                    s.hover = None;
+                }
                 self.settings_redraw();
                 return;
             }
@@ -4560,6 +4670,7 @@ impl App {
 
     fn close_picker(&mut self) {
         self.picker.open = false;
+        self.picker_multi_off();
         // drop queued thumbnail work and the cached background
         self.picker.bg.clear();
         self.thumb_jobs.clear();
@@ -4586,6 +4697,173 @@ impl App {
         self.picker.index_at(&g, self.cursor.0 as f32, self.cursor.1 as f32, self.len())
     }
 
+    fn picker_multi_off(&mut self) {
+        self.picker.multi = false;
+        self.picker.chosen.clear();
+        self.picker.strip_hover = None;
+        self.picker.strip_hits.clear();
+        self.request_redraw();
+    }
+
+    /// Toggle cell `i` in the chosen set; the first toggle starts multi-select.
+    fn picker_toggle(&mut self, i: usize) {
+        let Some(e) = self.playlist.as_ref().and_then(|pl| pl.get(i).cloned()) else { return };
+        self.picker.multi = true;
+        self.picker.sel = i;
+        if !self.picker.chosen.remove(&e) {
+            self.picker.chosen.insert(e);
+        }
+        self.request_redraw();
+    }
+
+    /// The chosen images in list order.
+    fn picker_chosen(&self) -> Vec<Entry> {
+        let Some(pl) = &self.playlist else { return Vec::new() };
+        pl.iter().filter(|e| self.picker.chosen.contains(*e)).cloned().collect()
+    }
+
+    fn picker_strip(&mut self, id: &str) {
+        match id {
+            "ms_all" => {
+                if let Some(pl) = &self.playlist {
+                    self.picker.chosen = pl.iter().cloned().collect();
+                }
+                self.request_redraw();
+            }
+            "ms_none" => self.picker_multi_off(),
+            "ms_move" => self.picker_transfer(true),
+            "ms_copy" => self.picker_transfer(false),
+            "ms_delete" => self.picker_delete(),
+            _ => {}
+        }
+    }
+
+    /// Copy or move the chosen images into a folder the user picks.
+    fn picker_transfer(&mut self, mv: bool) {
+        let list = self.picker_chosen();
+        if list.is_empty() {
+            return;
+        }
+        let n = list.len();
+        let mut d = rfd::FileDialog::new().set_title(format!("{} {} image{} to", if mv { "Move" } else { "Copy" }, n, if n == 1 { "" } else { "s" }));
+        if let Some(w) = &self.window {
+            d = d.set_parent(&**w);
+        }
+        // test hook: ARKIMAGE_TEST_FOLDER=<path> stands in for the folder dialog
+        let Some(dir) = std::env::var_os("ARKIMAGE_TEST_FOLDER").map(PathBuf::from).or_else(|| d.pick_folder()) else { return };
+        let (mut done, mut there, mut failed, mut inzip) = (0usize, 0usize, 0usize, 0usize);
+        let mut gone = std::collections::HashSet::new();
+        for e in &list {
+            let dst = dir.join(e.name());
+            if dst.exists() {
+                there += 1;
+                continue;
+            }
+            let r = match (e, mv) {
+                (Entry::File(p), true) => std::fs::rename(p, &dst).or_else(|_| std::fs::copy(p, &dst).and_then(|_| std::fs::remove_file(p))),
+                (Entry::File(p), false) => std::fs::copy(p, &dst).map(|_| ()),
+                (Entry::Zip { .. }, true) => {
+                    inzip += 1;
+                    continue;
+                }
+                (Entry::Zip { .. }, false) => e.read_bytes().and_then(|b| std::fs::write(&dst, b)),
+            };
+            match r {
+                Ok(()) => {
+                    done += 1;
+                    if mv {
+                        gone.insert(e.clone());
+                    }
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        let mut m = format!("{} {} image{} to {}", if mv { "Moved" } else { "Copied" }, done, if done == 1 { "" } else { "s" }, dir.display());
+        if there > 0 {
+            m += &format!("; {there} already there");
+        }
+        if inzip > 0 {
+            m += &format!("; {inzip} inside a compressed file");
+        }
+        if failed > 0 {
+            m += &format!("; {failed} failed");
+        }
+        self.msg(m);
+        if !gone.is_empty() {
+            self.remove_from_list(&gone);
+        }
+    }
+
+    /// Send the chosen images to the Recycle Bin (Trash), after asking.
+    fn picker_delete(&mut self) {
+        let files: Vec<(Entry, PathBuf)> = self
+            .picker_chosen()
+            .into_iter()
+            .filter_map(|e| if let Entry::File(p) = &e { Some((e.clone(), p.clone())) } else { None })
+            .collect();
+        if files.is_empty() {
+            if !self.picker.chosen.is_empty() {
+                self.msg("Images inside a compressed file can't be deleted alone.");
+            }
+            return;
+        }
+        let n = files.len();
+        let bin = if cfg!(target_os = "macos") { "Trash" } else { "Recycle Bin" };
+        let text = if n == 1 {
+            format!("Are you sure you want to move this file to the {bin}?\n\n{}", files[0].1.display())
+        } else {
+            format!("Are you sure you want to move these {n} files to the {bin}?")
+        };
+        // test hook: ARKIMAGE_TEST_CONFIRM=1 answers Yes without the dialog
+        let yes = std::env::var_os("ARKIMAGE_TEST_CONFIRM").is_some();
+        if !yes && !crate::dialog::ask(self.window.as_deref(), "ArkImage", &text, crate::dialog::Kind::Warn) {
+            return;
+        }
+        let r = trash::delete_all(files.iter().map(|(_, p)| p));
+        // whatever the result, drop the files that are gone from disk
+        let gone: std::collections::HashSet<Entry> = files.iter().filter(|(_, p)| !p.exists()).map(|(e, _)| e.clone()).collect();
+        match r {
+            Ok(()) => self.msg(format!("Deleted {} image{}", gone.len(), if gone.len() == 1 { "" } else { "s" })),
+            Err(err) => self.msg(format!("Deleted {} of {n}; {err}", gone.len())),
+        }
+        if !gone.is_empty() {
+            self.remove_from_list(&gone);
+        }
+    }
+
+    /// Take `gone` out of the list; the shown image stays, or the next one left takes its place.
+    fn remove_from_list(&mut self, gone: &std::collections::HashSet<Entry>) {
+        let (keep, len) = {
+            let Some(pl) = &mut self.playlist else { return };
+            // the first entry at or after the shown one that stays, else the last that stays
+            let n = pl.entries.len();
+            let keep = (pl.index..n).chain((0..pl.index.min(n)).rev()).find_map(|i| pl.get(i).filter(|e| !gone.contains(*e)).cloned());
+            let l = source::remove_many(&pl.container, gone).unwrap_or_else(|| Arc::new(pl.entries.iter().filter(|e| !gone.contains(*e)).cloned().collect()));
+            pl.entries = l;
+            (keep, pl.entries.len())
+        };
+        {
+            let mut c = self.cache.borrow_mut();
+            for e in gone {
+                c.remove(e);
+            }
+        }
+        for e in gone {
+            self.picker.chosen.remove(e);
+        }
+        if len == 0 {
+            self.close();
+            return;
+        }
+        let Some(pl) = &self.playlist else { return };
+        self.pos_map = source::pos_map(&pl.entries);
+        let at = keep.and_then(|e| self.pos_map.get(&e).copied()).unwrap_or(0);
+        let idx = pl.flip(at);
+        self.picker.sel = self.picker.sel.min(len - 1);
+        self.go_to(idx);
+        self.slide = None;
+    }
+
     fn picker_key(&mut self, code: KeyCode) {
         let Some(g) = self.picker_grid() else { return };
         let n = self.len() as isize;
@@ -4594,6 +4872,7 @@ impl App {
         let s = self.picker.sel as isize;
         let t = match code {
             KeyCode::Escape | KeyCode::Backspace => return self.close_picker(),
+            KeyCode::Space if self.picker.multi => return self.picker_toggle(self.picker.sel),
             KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => {
                 let i = self.picker.sel;
                 self.go_to(i);
@@ -5010,11 +5289,18 @@ impl App {
                     }
                     return;
                 }
-                let h = self.picker_index_at_cursor();
+                let sh = self.picker.strip_hits.iter().find(|r| cx >= r.1 && cx < r.3 && cy >= r.2 && cy < r.4).map(|r| r.0);
+                let h = if sh.is_some() { None } else { self.picker_index_at_cursor() };
                 let ch = self.picker_close_at_cursor().0;
-                if h != self.picker.hover || ch != self.picker.close_hover {
+                let kh = match (h, self.picker_grid()) {
+                    (Some(i), Some(g)) => self.picker.on_check(&g, i, cx, cy, self.sf()),
+                    _ => false,
+                };
+                if h != self.picker.hover || ch != self.picker.close_hover || kh != self.picker.check_hover || sh != self.picker.strip_hover {
                     self.picker.hover = h;
                     self.picker.close_hover = ch;
+                    self.picker.check_hover = kh;
+                    self.picker.strip_hover = sh;
                     self.request_redraw();
                 }
             }
@@ -5072,11 +5358,19 @@ impl App {
                         self.picker.scroll = b.scroll_for(y - grab);
                         self.picker.bar_drag = Some(grab);
                         self.request_redraw();
+                    } else if let Some(id) = self.picker.strip_hits.iter().find(|r| x >= r.1 && x < r.3 && y >= r.2 && y < r.4).map(|r| r.0) {
+                        self.picker_strip(id);
                     } else if on_close || outside {
                         self.close_picker();
                     } else if let Some(i) = self.picker_index_at_cursor() {
-                        self.go_to(i);
-                        self.close_picker();
+                        // the checkbox, or any cell in multi-select, toggles the cell
+                        let on_box = self.picker_grid().is_some_and(|g| self.picker.on_check(&g, i, x, y, self.sf()));
+                        if on_box || self.picker.multi {
+                            self.picker_toggle(i);
+                        } else {
+                            self.go_to(i);
+                            self.close_picker();
+                        }
                     }
                 }
                 (MouseButton::Left, ElementState::Released) if self.picker.open => {
@@ -5143,7 +5437,14 @@ impl App {
                     let pannable = self.layout.is_some_and(|l| l.sw > l.ww + 0.5 || l.sh > l.wh + 0.5);
                     self.drag_rect = self.right_down || !pannable;
                 }
-                (MouseButton::Right, ElementState::Pressed) if self.picker.open => self.close_picker(),
+                // right click: leaves multi-select inside the panel, else closes the grid
+                (MouseButton::Right, ElementState::Pressed) if self.picker.open => {
+                    if self.picker.multi && !self.picker_close_at_cursor().1 {
+                        self.picker_multi_off();
+                    } else {
+                        self.close_picker();
+                    }
+                }
                 (MouseButton::Right, ElementState::Pressed) => {
                     // the right button's action waits for its release: held, it turns a
                     // left drag into a zoom rectangle

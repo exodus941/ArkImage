@@ -204,6 +204,128 @@ impl DrawState<'_> {
     }
 }
 
+/// Dropdown list: 4 px inside a FIELD box with a LINE edge, radius 4, rows 32 px, the
+/// current option's Tabler check 16 px centred 16 px in, labels at 32 px, the hovered row
+/// PANEL2. It opens 4 px under the box, or above it when fewer than 5 rows fit below, and
+/// scrolls by whole rows. A hovered option with a description shows it in the status
+/// tooltip's style, 240 px wide, 8 px left of the list (right of it when the left has no
+/// room), its top on the row's top.
+const DROP_ROW: f32 = 32.0;
+const DROP_PAD: f32 = 4.0;
+const DROP_TIP_W: f32 = 240.0;
+
+/// Draws the open dropdown; true while a tooltip still fades.
+pub(super) fn dropdown(c: &mut Canvas, t: &mut Text, cfg: &Config, dr: &mut super::Drop, sf: f32) -> bool {
+    let d = |v: f32| v * sf;
+    let opts = dr.f.options(cfg);
+    let cur = dr.f.get(cfg) as usize;
+    let n = opts.len();
+    let (row, pad, edge) = (d(DROP_ROW).round(), d(DROP_PAD).round(), d(16.0));
+    let ch = c.h as f32;
+    let below = ((ch - edge - dr.y - d(4.0) - 2.0 * pad) / row).floor().max(0.0) as usize;
+    let above = ((dr.top - d(4.0) - edge - 2.0 * pad) / row).floor().max(0.0) as usize;
+    let up = below < n.min(5) && above > below;
+    let fit = (if up { above } else { below }).min(n).max(1);
+    dr.fit = fit;
+    dr.first = dr.first.min(n - fit);
+    let h = fit as f32 * row + 2.0 * pad;
+    let (x, w) = (dr.x.round(), dr.w.round());
+    let y = if up { (dr.top - d(4.0) - h).round() } else { (dr.y + d(4.0)).round() };
+    boxed(c, x, y, w, h, d(4.0), FIELD, LINE, sf);
+    dr.rect = (x, y, x + w, y + h);
+    dr.rows.clear();
+    let body = (d(BODY.0), d(BODY.1));
+    let mut tip_row = None;
+    for (k, i) in (dr.first..dr.first + fit).enumerate() {
+        let ry = y + pad + k as f32 * row;
+        let (rx0, rx1) = (x + pad, x + w - pad);
+        if dr.hover == Some(i) {
+            c.fill_rrect(rx0, ry, rx1 - rx0, row, d(4.0), PANEL2, 1.0);
+            tip_row = Some((i, ry));
+        }
+        let mid = ry + row / 2.0;
+        if i == cur {
+            crate::icons::draw(c, Icon::Check, x + d(16.0), mid, d(16.0), ACCENT);
+        }
+        // a label too long for the row ends in "…"
+        let room = rx1 - d(8.0) - (x + d(32.0));
+        let mut s = opts[i].clone();
+        if u::width(t, Face::Regular, &s, body.0) > room {
+            while s.chars().count() > 2 && u::width(t, Face::Regular, &format!("{s}…"), body.0) > room {
+                s.pop();
+            }
+            s.push('…');
+        }
+        text(c, t, Face::Regular, x + d(32.0), mid, &s, body, SLATE200);
+        dr.rows.push((i, rx0, ry, rx1, ry + row));
+    }
+    // more above or below: a 2 px accent bar on the list's inner edge, as a scroll hint
+    if n > fit {
+        let track = h - 2.0 * pad;
+        let bh = (track * fit as f32 / n as f32).max(d(16.0));
+        let by = y + pad + (track - bh) * dr.first as f32 / (n - fit) as f32;
+        // solid, in the 4 px gap between the rows and the border (a rounded 2 px bar drew only its ends);
+        // slate 600 at rest, slate 500 hovered or dragged. Grab area: 16 px from the border inwards
+        let col = if dr.bar_hot || dr.bar_drag.is_some() { SLATE500 } else { u::SLATE600 };
+        c.rect_alpha((x + w - pad + d(1.0)).round() as i32, by.round() as i32, d(2.0).round().max(1.0) as i32, bh.round() as i32, col, 255);
+        dr.bar = Some((x + w - d(16.0), x + w, y + pad, track, by, bh));
+    } else {
+        dr.bar = None;
+    }
+    // tooltips fade over DROP_FADE: the one leaving out, the one arriving in
+    let k = (dr.hover_at.elapsed().as_secs_f32() / DROP_FADE).min(1.0);
+    let row_y = |i: usize| dr.rows.iter().find(|r| r.0 == i).map(|r| r.2);
+    if let Some((i, ry)) = dr.old.and_then(|i| row_y(i).map(|ry| (i, ry))) {
+        drop_tip(c, t, dr.f, &opts[i], i, ry, (x, w), 1.0 - k, sf);
+    }
+    if let Some((i, ry)) = tip_row {
+        drop_tip(c, t, dr.f, &opts[i], i, ry, (x, w), k, sf);
+    }
+    k < 1.0
+}
+
+/// Tooltip fade in and out, seconds.
+const DROP_FADE: f32 = 0.125;
+
+/// One option's description beside the list (`list` = its x and width), at `a` opacity:
+/// drawn whole, then mixed with the pixels it covered, so the text fades with the box.
+fn drop_tip(c: &mut Canvas, t: &mut Text, f: ChoiceF, name: &str, i: usize, ry: f32, list: (f32, f32), a: f32, sf: f32) {
+    let Some(info) = f.info(i) else { return };
+    if a <= 0.0 {
+        return;
+    }
+    let d = |v: f32| v * sf;
+    let (x, w) = list;
+    let (edge, ch) = (d(16.0), c.h as f32);
+    let small = (d(SMALL.0), d(SMALL.1));
+    let tw = d(DROP_TIP_W);
+    let tpad = d(8.0);
+    let mut lines = vec![name.to_string()];
+    lines.extend(wrap(t, info, small.0, tw - 2.0 * tpad));
+    let th = (lines.len() as f32 * small.1 + 2.0 * tpad).round();
+    let tx = (if x - d(8.0) - tw >= edge { x - d(8.0) - tw } else { x + w + d(8.0) }).round();
+    let ty = ry.min(ch - edge - th).max(edge).round();
+    let (x0, y0) = (tx.max(0.0) as usize, ty.max(0.0) as usize);
+    let (x1, y1) = (((tx + tw).ceil() as usize).min(c.w), ((ty + th).ceil() as usize).min(c.h));
+    let under: Vec<u32> = (y0..y1).flat_map(|yy| c.buf[yy * c.w + x0..yy * c.w + x1].to_vec()).collect();
+    // opaque with a LINE edge: at 92% the card text behind it showed through
+    boxed(c, tx, ty, tw, th, d(8.0), 0x101010, LINE, sf);
+    for (k, l) in lines.iter().enumerate() {
+        let face = if k == 0 { Face::Medium } else { Face::Regular };
+        text(c, t, face, tx + tpad, ty + tpad + (k as f32 + 0.5) * small.1, l, small, if k == 0 { SLATE100 } else { SLATE200 });
+    }
+    if a < 1.0 {
+        let m = (a * 255.0) as u32;
+        let rw = x1 - x0;
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let p = &mut c.buf[yy * c.w + xx];
+                *p = crate::render::mix(under[(yy - y0) * rw + xx - x0], *p, m);
+            }
+        }
+    }
+}
+
 /// Colour `t` of the way from `a` to `b`.
 fn lerp(a: u32, b: u32, t: f32) -> u32 {
     crate::render::mix(a, b, (t.clamp(0.0, 1.0) * 255.0) as u32)
@@ -358,8 +480,11 @@ pub(super) fn draw(c: &mut Canvas, t: Option<&mut Text>, cfg: &Config, st: &Draw
                 let word = if on { "On" } else { "Off" };
                 let ww = u::width(t, Face::Regular, word, body.0);
                 text(c, t, Face::Regular, sx - d(12.0) - ww, mid, word, body, SLATE400);
-                switch(c, sx, mid, sf, on, st.amt(Act::Toggle(f)));
-                hit(x0, y, x0 + card_w, y + d(CARD_H), Act::Toggle(f));
+                let ed = f.editable(cfg);
+                switch(c, sx, mid, sf, on, if ed { st.amt(Act::Toggle(f)) } else { 0.0 });
+                if ed {
+                    hit(x0, y, x0 + card_w, y + d(CARD_H), Act::Toggle(f));
+                }
                 y += d(CARD_H + CARD_GAP);
             }
             Ctl::Choice(label, f) => {
