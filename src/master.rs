@@ -172,16 +172,16 @@ impl Master {
         let budget = crate::config::cache_mb() * 1024 * 1024;
         let mut cache = self.sh.cache.borrow_mut();
         let mut total: u64 = cache.values().map(|d| d.bytes()).sum();
-        if total <= budget {
-            return;
-        }
         let mut by_dist: Vec<(i64, _)> = cache
             .keys()
             .map(|e| (self.windows.iter().map(|w| w.distance(e)).min().unwrap_or(i64::MAX), e.clone()))
             .collect();
         by_dist.sort_by(|a, b| b.0.cmp(&a.0));
         for (d, e) in by_dist {
-            if total <= budget || d == 0 {
+            // an image no window wants goes at once, under the budget too. Why: each new
+            // window looks ahead while focused, and its neighbours stayed after focus
+            // moved on (60 windows: 334 image textures for 60 shown, 2,911 MB)
+            if d != i64::MAX && (total <= budget || d == 0) {
                 break;
             }
             if let Some(x) = cache.remove(&e) {
@@ -417,6 +417,10 @@ impl ApplicationHandler<UserEvent> for Master {
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, ev: WindowEvent) {
         #[cfg(windows)]
         crate::stackdump::beat();
+        // a window took focus: every other window stops looking ahead
+        if matches!(ev, WindowEvent::Focused(true)) {
+            self.windows.iter_mut().filter(|w| !w.owns(id)).for_each(|w| w.lose_look_ahead());
+        }
         if let Some(w) = self.windows.iter_mut().find(|w| w.owns(id)) {
             w.window_event(el, id, ev);
         }
@@ -436,6 +440,11 @@ impl ApplicationHandler<UserEvent> for Master {
         }
         // a window found its file gone and read the folder again
         self.adopt_lists();
+        // the focused window set its look-ahead: keep what both share, drop the rest
+        if self.windows.iter().any(|w| w.focus_moved) {
+            self.windows.iter_mut().for_each(|w| w.focus_moved = false);
+            self.evict();
+        }
         if self.speed_menu_at.is_some_and(|t| Instant::now() >= t) {
             self.speed_menu_at = None;
             if std::env::var("ARKIMAGE_TEST_FULLSCREEN").as_deref() == Ok("3") {
