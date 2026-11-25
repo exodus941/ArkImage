@@ -543,6 +543,9 @@ pub struct App {
     pub closed: bool,
     /// Set by the menu; the master selects every open image in this folder.
     pub reveal_all: bool,
+    /// Set by the menu; the master closes every window that shows a file another
+    /// window already shows.
+    pub close_dups: bool,
     /// Set when the focused window set its look-ahead; the master evicts what nobody wants.
     pub focus_moved: bool,
     /// This window looks ahead: it took focus last (see neighbours_wanted).
@@ -874,6 +877,7 @@ impl App {
             id,
             closed: false,
             reveal_all: false,
+            close_dups: false,
             focus_moved: false,
             look_ahead: false,
             proxy: sh.proxy.clone(),
@@ -1025,7 +1029,7 @@ impl App {
         self.request_redraw();
     }
 
-    fn cur_entry(&self) -> Option<Entry> {
+    pub fn cur_entry(&self) -> Option<Entry> {
         self.playlist.as_ref().and_then(|p| p.get(p.index).cloned())
     }
 
@@ -3771,6 +3775,7 @@ impl App {
                 I("config".into(), "Settings".into(), "F5", true),
                 I("reload".into(), "Reload Settings File".into(), "Shift+F5", true),
                 I("help".into(), "Hotkeys".into(), "F1", true),
+                I("closedup".into(), "Close Duplicates".into(), "", true),
                 I("closeall".into(), "Close All Instances".into(), "", true),
                 I("exit".into(), "Exit".into(), "X", true),
             ],
@@ -3877,6 +3882,12 @@ impl App {
         // ARKIMAGE_TEST_SETTINGS=<n> opens tab n (a value that is not a number: General)
         let tab = std::env::var("ARKIMAGE_TEST_SETTINGS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(settings::TABS.len() - 1);
         self.open_settings(el, tab);
+    }
+
+    /// For the ARKIMAGE_TEST_ACTION hook: run a right-click menu entry by its id, as the
+    /// menu does.
+    pub fn test_action(&mut self, el: &ActiveEventLoop, id: &str) {
+        self.menu_action(el, id);
     }
 
     /// For the ARKIMAGE_TEST_CHOICE hook: open the first dropdown in Settings.
@@ -4575,6 +4586,7 @@ impl App {
             "close" => self.close(),
             "reveal" => self.reveal(),
             "reveal_all" => self.reveal_all = true,
+            "closedup" => self.close_dups = true,
             "fedit" => self.open_settings(el, settings::FILTERS_TAB),
             _ if id.starts_with('f') && id[1..].parse::<u8>().is_ok() => {
                 let i = id[1..].parse::<u8>().unwrap();

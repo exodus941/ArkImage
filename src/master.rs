@@ -207,6 +207,30 @@ impl Master {
         crate::reveal::select_in_folder(&dir, &files);
     }
 
+    /// Close Duplicates: of the windows that show one file, keep one and close the rest.
+    /// The window that asked keeps its file; otherwise the oldest window does.
+    fn close_duplicates(&mut self, el: &ActiveEventLoop) {
+        let Some(asker) = self.windows.iter().position(|w| w.close_dups) else { return };
+        self.windows.iter_mut().for_each(|w| w.close_dups = false);
+        let mut kept: std::collections::HashSet<crate::source::Entry> = std::collections::HashSet::new();
+        if let Some(e) = self.windows[asker].cur_entry() {
+            kept.insert(e);
+        }
+        let mut closed = 0;
+        for (i, w) in self.windows.iter_mut().enumerate() {
+            if i == asker {
+                continue;
+            }
+            let Some(e) = w.cur_entry() else { continue };
+            if !kept.insert(e) {
+                w.exit(el);
+                closed += 1;
+            }
+        }
+        crate::trace(&format!("close duplicates: {closed} windows closed"));
+        crate::events::log(&format!("close duplicates: {closed} windows closed"));
+    }
+
     /// Drop closed windows; quit after the last one.
     fn reap(&mut self, el: &ActiveEventLoop) {
         let before = self.windows.len();
@@ -438,6 +462,20 @@ impl ApplicationHandler<UserEvent> for Master {
         if std::env::var_os("ARKIMAGE_TEST_STALL").is_some() && self.started && !STALLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(5));
         }
+        // Test hook: ARKIMAGE_TEST_ACTION=<menu id>:<n> runs that menu entry once in the
+        // newest window, when n windows show an image
+        static ACTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if let Ok(v) = std::env::var("ARKIMAGE_TEST_ACTION") {
+            if let Some((id, n)) = v.split_once(':') {
+                let n: usize = n.parse().unwrap_or(usize::MAX);
+                if !ACTED.load(std::sync::atomic::Ordering::Relaxed) && self.windows.iter().filter(|w| w.cur_entry().is_some()).count() >= n {
+                    ACTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(w) = self.windows.last_mut() {
+                        w.test_action(el, id);
+                    }
+                }
+            }
+        }
         // a window found its file gone and read the folder again
         self.adopt_lists();
         // the focused window set its look-ahead: keep what both share, drop the rest
@@ -496,6 +534,7 @@ impl ApplicationHandler<UserEvent> for Master {
         let mut dl: Option<Instant> = self.windows.iter_mut().filter_map(|w| w.about_to_wait()).min();
         self.sync_config();
         self.reveal_all();
+        self.close_duplicates(el);
         self.reap(el);
         if let Some(t) = self.crash_at {
             if Instant::now() >= t {
