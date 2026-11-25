@@ -280,6 +280,27 @@ pub fn orient(i: &RgbaImage, o: u32) -> RgbaImage {
     }
 }
 
+/// A RAM decode as shared textures with RAM thumbnails, for a window on the GPU. None
+/// when nothing changes (already on the GPU, a Lottie, past the texture limit, GPU off).
+/// Why: images decoded while a lone window drew on the processor stayed in RAM, and each
+/// GPU window then uploaded its own texture beside the RAM copy (5 windows, 24 MP: 92 MB
+/// RAM + 130 MB texture per image).
+pub fn to_shared(d: &Decoded) -> Option<Decoded> {
+    if d.lottie.is_some() || d.frames.iter().any(|f| f.gpu.is_some()) {
+        return None;
+    }
+    let lim = crate::gpu::get()?.max_tex();
+    if d.orig_w > lim || d.orig_h > lim {
+        return None;
+    }
+    let mut frames = Vec::with_capacity(d.frames.len());
+    for f in &d.frames {
+        let t = crate::gpu::upload_shared(&f.img)?;
+        frames.push(Frame { img: Arc::new(thumb(&f.img)), delay_ms: f.delay_ms, gpu: Some(t) });
+    }
+    Some(Decoded { frames, format: d.format.clone(), file_size: d.file_size, modified: d.modified, exif: d.exif.clone(), orig_w: d.orig_w, orig_h: d.orig_h, orient: d.orient, lottie: None })
+}
+
 /// `to_gpu`: upload each frame as a shared texture and keep only a thumbnail in RAM (when
 /// the GPU path is on; the thumbnail workers pass false).
 pub fn decode(e: &Entry, exif_rotate: bool, to_gpu: bool) -> Result<Decoded, String> {
@@ -371,7 +392,9 @@ fn decode_inner(e: &Entry, exif_rotate: bool, to_gpu: bool) -> Result<Decoded, S
     }
     let (orig_w, orig_h) = (frames[0].img.width(), frames[0].img.height());
     // past the texture limit: the window draws it with the processor, so it stays in RAM
-    let lim = crate::gpu::get().map(|g| g.max_tex()).unwrap_or(u32::MAX);
+    // Only on the GPU path: asking the limit starts the GPU device, and that added 270 MB
+    // to a lone processor-drawn window (24 MP photo: 458 MB private, 92 MB of it the image).
+    let lim = if to_gpu { crate::gpu::get().map(|g| g.max_tex()).unwrap_or(u32::MAX) } else { u32::MAX };
     if to_gpu && lottie.is_none() && orig_w <= lim && orig_h <= lim {
         for f in &mut frames {
             if let Some(t) = crate::gpu::upload_shared(&f.img) {

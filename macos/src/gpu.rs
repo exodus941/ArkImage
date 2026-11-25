@@ -663,6 +663,9 @@ impl Gpu {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("arkimage"),
                 required_limits: wgpu::Limits { max_texture_dimension_2d: limits.max_texture_dimension_2d, ..wgpu::Limits::downlevel_defaults() },
+                // The default (Performance) reserves large blocks: each 24 MP texture cost
+                // 261 MB private, 122 MB of it the image; this hint: 130 MB.
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
                 ..Default::default()
             })
             .await
@@ -1671,6 +1674,46 @@ impl GpuWin {
             }
             l.evict.insert(k);
             total -= b;
+        }
+    }
+
+    /// Another window took focus: give back the frame layers (layer, settled, quarter
+    /// blurs, interface, slide smear). The swap chain still shows the last frame, and the
+    /// image and its sharp copy stay, so focus redraws without an upload. Why: 60 windows
+    /// kept about 880 MB of these layers for frames only the focused window draws.
+    /// Returns true when the swap chain was rebuilt: the caller redraws, as a rebuilt
+    /// swap chain loses its picture.
+    pub fn idle(&mut self) -> bool {
+        // one frame in flight: two swap chain buffers instead of three (60 windows: about
+        // 260 MB). A background window draws seldom, so the halved rate does not show.
+        let mut rebuilt = false;
+        if self.config.desired_maximum_frame_latency != 1 {
+            self.config.desired_maximum_frame_latency = 1;
+            if let Some(s) = &self.surface {
+                self.configured = configure(s, &self.gpu.device, &self.config);
+                rebuilt = true;
+            }
+        }
+        if self.layer.is_none() {
+            return rebuilt;
+        }
+        self.layer = None;
+        self.settled = None;
+        self.quarter = None;
+        self.moved = None;
+        self.moved2 = None;
+        self.ui = None;
+        self.prev_ui = Vec::new();
+        self.row_classes = Vec::new();
+        crate::trace("gpu: frame layers released (window in the background)");
+        rebuilt
+    }
+
+    /// Focus: two frames in flight again (the next frame rebuilds the swap chain).
+    pub fn focus(&mut self) {
+        if self.config.desired_maximum_frame_latency != 2 {
+            self.config.desired_maximum_frame_latency = 2;
+            self.configured = false;
         }
     }
 

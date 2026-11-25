@@ -543,6 +543,13 @@ pub struct App {
     pub closed: bool,
     /// Set by the menu; the master selects every open image in this folder.
     pub reveal_all: bool,
+    /// Set by the menu; the master closes every window that shows a file another
+    /// window already shows.
+    pub close_dups: bool,
+    /// Set when the focused window set its look-ahead; the master evicts what nobody wants.
+    pub focus_moved: bool,
+    /// This window looks ahead: it took focus last (see neighbours_wanted).
+    look_ahead: bool,
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
     _context: Option<softbuffer::Context<Arc<Window>>>,
@@ -870,6 +877,9 @@ impl App {
             id,
             closed: false,
             reveal_all: false,
+            close_dups: false,
+            focus_moved: false,
+            look_ahead: false,
             proxy: sh.proxy.clone(),
             window: None,
             _context: None,
@@ -1019,7 +1029,7 @@ impl App {
         self.request_redraw();
     }
 
-    fn cur_entry(&self) -> Option<Entry> {
+    pub fn cur_entry(&self) -> Option<Entry> {
         self.playlist.as_ref().and_then(|p| p.get(p.index).cloned())
     }
 
@@ -1292,6 +1302,12 @@ impl App {
             return;
         }
         let Some(pl) = &self.playlist else { return };
+        // The focused window's look-ahead is known now: the master evicts what no window
+        // wants. (At the focus event a new window had no list yet; its shared neighbours
+        // went and were decoded again.)
+        if self.neighbours_wanted() {
+            self.focus_moved = true;
+        }
         let i = pl.index as isize;
         // Look 6 ahead in the direction of travel and 1 behind: at 30 flips/s from a cold
         // 7200 rpm disk, 3 ahead missed 6 of 40 images.
@@ -1561,7 +1577,21 @@ impl App {
         if self.base.is_some() {
             return;
         }
-        let Some((_, cur)) = self.current.clone() else { return };
+        let Some((ce, mut cur)) = self.current.clone() else { return };
+        // on the GPU: a RAM decode becomes one shared texture, and the cache keeps that
+        // instead, so other windows share it and the full RAM copy goes. (A new window
+        // takes its GPU after its image arrived, so set_current is too early for this.)
+        if self.gpu.is_some() {
+            if let Some(s) = decode::to_shared(&cur) {
+                let s = Arc::new(s);
+                if let Some(c) = self.cache.borrow_mut().get_mut(&ce) {
+                    *c = s.clone();
+                }
+                crate::trace("current: RAM copy moved to a shared texture");
+                self.current = Some((ce, s.clone()));
+                cur = s;
+            }
+        }
         let fi = self.frame_idx.min(cur.frame_count() - 1);
         // a Lottie: GPU mode replays its frame textures (each drawn once); the processor
         // draws the frame now
@@ -1596,8 +1626,25 @@ impl App {
 
     /// Neighbour images are preloaded and kept for this window: always on the processor
     /// path; in GPU mode only for the focused window.
+    /// Only the focused window looks ahead, on the GPU and on the processor. Why: on the
+    /// processor every window kept its neighbours (60 windows: 457 images, 3,049 MB).
+    /// A neighbour decodes in 11-18 ms (2 MB PNG), 150 ms at 20 MB.
+    /// The last focused window keeps it until another window takes focus, so the gap
+    /// between one window's focus loss and the next one's gain drops nothing.
     fn neighbours_wanted(&self) -> bool {
-        self.gpu.is_none() || self.window.as_ref().is_some_and(|w| w.has_focus())
+        self.look_ahead
+    }
+
+    /// Another window took focus: stop looking ahead (the master then evicts what only
+    /// this window wanted).
+    pub fn lose_look_ahead(&mut self) {
+        if self.look_ahead {
+            self.look_ahead = false;
+            self.update_wanted();
+        }
+        if self.gpu.as_mut().is_some_and(|g| g.idle()) {
+            self.request_redraw();
+        }
     }
 
     /// GPU path: keep only the screen-sized copy (and the thumbnail): give back the full
@@ -2611,7 +2658,15 @@ impl App {
             })
         });
         drop(frame);
-        self.gpu_buf = buf;
+        // a background window redrew (a decode arrived, a sharp copy finished): give the
+        // frame layers back again. Without this, 60 windows crept from 1,797 MB to 2,309 MB.
+        if !self.look_ahead {
+            if self.gpu.as_mut().is_some_and(|g| g.idle()) {
+                self.request_redraw();
+            }
+        }
+        // the interface buffer too, in RAM (one window-sized u32 buffer each)
+        self.gpu_buf = if self.look_ahead { buf } else { Vec::new() };
         match res {
             Some(Ok(())) => {
                 self.unpainted = None;
@@ -3720,6 +3775,7 @@ impl App {
                 I("config".into(), "Settings".into(), "F5", true),
                 I("reload".into(), "Reload Settings File".into(), "Shift+F5", true),
                 I("help".into(), "Hotkeys".into(), "F1", true),
+                I("closedup".into(), "Close Duplicates".into(), "", true),
                 I("closeall".into(), "Close All Instances".into(), "", true),
                 I("exit".into(), "Exit".into(), "X", true),
             ],
@@ -3826,6 +3882,12 @@ impl App {
         // ARKIMAGE_TEST_SETTINGS=<n> opens tab n (a value that is not a number: General)
         let tab = std::env::var("ARKIMAGE_TEST_SETTINGS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(settings::TABS.len() - 1);
         self.open_settings(el, tab);
+    }
+
+    /// For the ARKIMAGE_TEST_ACTION hook: run a right-click menu entry by its id, as the
+    /// menu does.
+    pub fn test_action(&mut self, el: &ActiveEventLoop, id: &str) {
+        self.menu_action(el, id);
     }
 
     /// For the ARKIMAGE_TEST_CHOICE hook: open the first dropdown in Settings.
@@ -4524,6 +4586,7 @@ impl App {
             "close" => self.close(),
             "reveal" => self.reveal(),
             "reveal_all" => self.reveal_all = true,
+            "closedup" => self.close_dups = true,
             "fedit" => self.open_settings(el, settings::FILTERS_TAB),
             _ if id.starts_with('f') && id[1..].parse::<u8>().is_ok() => {
                 let i = id[1..].parse::<u8>().unwrap();
@@ -5241,7 +5304,12 @@ impl App {
                 // a focused window is in front: draw it now, not at the next covered check
                 self.set_covered(false);
                 self.unstrip();
-                // the focused window preloads its neighbours (GPU mode)
+                // the focused window preloads its neighbours; preload then has the master
+                // drop the last window's neighbours this one does not share
+                self.look_ahead = true;
+                if let Some(g) = &mut self.gpu {
+                    g.focus();
+                }
                 self.update_wanted();
                 self.preload();
             }

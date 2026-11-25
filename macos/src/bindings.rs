@@ -43,6 +43,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("pageselect", "Select Image"),
     ("reveal", "Show in Explorer"),
     ("reveal_all", "Select Open Images from Same Folder in Explorer"),
+    ("closedup", "Close Duplicates"),
 ];
 
 pub fn label(id: &str) -> &'static str {
@@ -159,8 +160,10 @@ mod tests {
         assert_eq!(display("ArrowLeft"), "Left");
         assert_eq!(display(""), "None");
         assert_eq!(label("next10"), "Next 10th Image");
-        // 37: the two double-page actions are gone (a saved slot naming one loads as none)
-        assert_eq!(ACTIONS.len(), 37);
+        // 37: the two double-page actions are gone (a saved slot naming one loads as none);
+        // 38 with Close Duplicates
+        assert_eq!(ACTIONS.len(), 38);
+        assert_eq!(label("closedup"), "Close Duplicates");
         assert_eq!(label("next1"), "Do nothing");
     }
 }
